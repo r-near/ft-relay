@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.3](https://github.com/r-near/ft-relay/compare/v0.1.2...v0.1.3) (2025-10-03)
+
+
+### Bug Fixes
+
+* auto dispatch docker publish ([fd3b05a](https://github.com/r-near/ft-relay/commit/fd3b05ac47348ef6a67d9130d3ad67722eae165b))
+* enable release automation token ([a4dfb31](https://github.com/r-near/ft-relay/commit/a4dfb31d8334f87acf6170919f393e477d659920))
+* rely on release events for docker ([ddfa5da](https://github.com/r-near/ft-relay/commit/ddfa5dae9c8959354c53d4d70757b6d8857b5381))
+* simplify docker workflow triggers ([9cb3901](https://github.com/r-near/ft-relay/commit/9cb3901133cd4c9e005e449f786e5527b993fa12))
+
 ## [0.1.2](https://github.com/r-near/ft-relay/compare/v0.1.1...v0.1.2) (2025-10-03)
 
 
