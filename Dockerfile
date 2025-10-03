@@ -2,6 +2,11 @@
 FROM rust:1.86 as build
 WORKDIR /app
 
+# System deps needed for near-api bindings
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libudev-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Leverage caching by compiling dependencies first
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
