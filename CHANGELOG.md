@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/r-near/ft-relay/compare/v0.1.0...v0.1.1) (2025-10-03)
+
+
+### Bug Fixes
+
+* install libudev in builder image ([3f6418c](https://github.com/r-near/ft-relay/commit/3f6418cac2ec85ce4a437ecfb4731253bcc69d35))
+
 ## 0.1.0 (2025-10-03)
 
 
