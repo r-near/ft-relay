@@ -28,7 +28,7 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
 
 ## Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) 1.76 or newer (Rust 1.86 used in CI).
+- [Rust](https://www.rust-lang.org/tools/install) 1.86 (pinned in CI).
 - `near-sandbox` dependencies (the integration tests download and run it automatically).
 
 ---
