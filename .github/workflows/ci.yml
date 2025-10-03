@@ -43,3 +43,9 @@ jobs:
 
       - name: Cargo test
         run: cargo test --all --locked
+
+      - name: Cargo test (ignored suites)
+        env:
+          RUST_LOG: info,ft_relay=info,near_api=warn,tracing::span=warn
+          RUST_BACKTRACE: 1
+        run: cargo test --all --locked -- --ignored --nocapture
