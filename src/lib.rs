@@ -258,7 +258,7 @@ async fn transfer_batch(
         (MAX_TOTAL_PREPAID_GAS / FT_TRANSFER_GAS_PER_ACTION) as usize,
     );
 
-    for (_chunk_idx, chunk) in batch.chunks(max_actions_per_tx).enumerate() {
+    for (chunk_idx, chunk) in batch.chunks(max_actions_per_tx).enumerate() {
         let mut actions = Vec::with_capacity(chunk.len());
         for r in chunk {
             let args = json!({
@@ -284,8 +284,9 @@ async fn transfer_batch(
             .await?;
 
         info!(
-            "tx submitted: {} (actions={})",
+            "tx submitted: {} (chunk={} actions={})",
             tx.transaction_outcome.id,
+            chunk_idx + 1,
             chunk.len()
         );
     }

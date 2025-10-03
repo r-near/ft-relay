@@ -434,7 +434,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     let ft_owner = GenesisAccount::generate_with_name("ft.sandbox".parse()?);
 
     // Create a modest receiver set for predictable distribution
-    let receiver_count = 20;
+    let receiver_count: usize = 20;
     let mut receivers = Vec::new();
     println!("Generating {} receiver accounts...", receiver_count);
     for i in 0..receiver_count {
@@ -554,7 +554,6 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     for worker_id in 0..concurrent_workers {
         let client = client.clone();
         let receivers = receivers.clone();
-        let receiver_count = receiver_count;
         let start_idx = worker_id * batch_size;
         let end_idx = if worker_id == concurrent_workers - 1 {
             total_requests
