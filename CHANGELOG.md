@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/r-near/ft-relay/compare/v0.1.1...v0.1.2) (2025-10-03)
+
+
+### Bug Fixes
+
+* trigger docker build on releases ([53cd18e](https://github.com/r-near/ft-relay/commit/53cd18e689195594e91d7c8655b229c7dac29e23))
+
 ## [0.1.1](https://github.com/r-near/ft-relay/compare/v0.1.0...v0.1.1) (2025-10-03)
 
 
