@@ -1,0 +1,22 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  semver_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Generate release PR or tag
+        uses: google-github-actions/release-please-action@v4
+        with:
+          release-type: rust
+          package-name: ft-relay
+          include-component-in-tag: false
