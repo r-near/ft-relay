@@ -23,6 +23,7 @@ jobs:
         with:
           release-type: rust
           include-component-in-tag: false
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
   trigger_docker_publish:
     needs: semver_release
@@ -32,4 +33,4 @@ jobs:
       - name: Dispatch Docker publish workflow
         run: gh workflow run "Publish Docker Image" --ref ${{ needs.semver_release.outputs.release_tag }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
