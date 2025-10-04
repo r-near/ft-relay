@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/r-near/ft-relay/compare/v0.1.3...v0.2.0) (2025-10-04)
+
+
+### Features
+
+* add Redis-backed durability and transfer status tracking ([#5](https://github.com/r-near/ft-relay/issues/5)) ([9b78528](https://github.com/r-near/ft-relay/commit/9b785288f8a778a4d574b91976a3dd521f9333b8))
+
 ## [0.1.3](https://github.com/r-near/ft-relay/compare/v0.1.2...v0.1.3) (2025-10-03)
 
 
