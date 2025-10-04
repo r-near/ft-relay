@@ -61,9 +61,10 @@ jobs:
           REDIS_URL: redis://localhost:6379
         run: cargo test --all --locked -- --test-threads=1
 
-      - name: Cargo test (ignored sandbox suites)
+      - name: Cargo test (ignored integration and testnet suites)
         env:
           REDIS_URL: redis://localhost:6379
+          TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
           RUST_LOG: info,ft_relay=info,near_api=warn,tracing::span=warn
           RUST_BACKTRACE: 1
-        run: cargo test --test integrated_benchmark --locked -- --ignored --nocapture --test-threads=1
+        run: cargo test --all --locked -- --ignored --nocapture --test-threads=1

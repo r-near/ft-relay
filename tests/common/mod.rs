@@ -93,7 +93,8 @@ impl TestnetHarness {
         }
 
         // Load .env file if present (for local development)
-        dotenv::dotenv().ok();
+        // This is OK to fail in CI where env vars are set directly
+        let _ = dotenv::dotenv();
 
         let rpc_url = std::env::var("TESTNET_RPC_URL")
             .or_else(|_| std::env::var("RPC_URL"))
