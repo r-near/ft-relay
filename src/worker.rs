@@ -16,7 +16,7 @@ use crate::{
 };
 
 const REDIS_CLAIM_MIN_IDLE_MS: u64 = 1;
-const MAX_RETRY_ATTEMPTS: u32 = 5;
+const MAX_RETRY_ATTEMPTS: u32 = 10;
 
 #[derive(Clone)]
 pub struct WorkerContext {
@@ -119,17 +119,27 @@ async fn process_chunk(mut chunk: Vec<StreamMessage>, ctx: WorkerContext) -> Res
                 let reached_limit = attempts >= MAX_RETRY_ATTEMPTS;
 
                 if reached_limit {
+                    warn!(
+                        "transfer {} reached max retries ({}/{}), marking as terminal",
+                        msg.transfer.transfer_id, attempts, MAX_RETRY_ATTEMPTS
+                    );
                     terminal_ids.push(msg.redis_id);
                 } else {
+                    log::debug!(
+                        "transfer {} will retry (attempt {}/{})",
+                        msg.transfer.transfer_id, attempts, MAX_RETRY_ATTEMPTS
+                    );
                     retryable.push(msg);
                 }
             }
 
             if !terminal_ids.is_empty() {
+                info!("acking {} terminal transfer(s)", terminal_ids.len());
                 ctx.redis.ack(&terminal_ids).await?;
             }
 
             if !retryable.is_empty() {
+                info!("requeuing {} transfer(s) for retry", retryable.len());
                 ctx.redis.requeue(retryable).await?;
             }
         }
@@ -179,20 +189,67 @@ async fn transfer_batch(
             })));
         }
 
-        let tx = Transaction::construct(signer_account.clone(), token.clone())
-            .add_actions(actions)
-            .with_signer(signer.clone())
-            .send_to(network)
-            .await?;
+        // Retry loop for nonce issues
+        const MAX_NONCE_RETRIES: u32 = 3;
+        let mut nonce_retry = 0;
 
-        last_tx_hash = tx.transaction_outcome.id.to_string();
+        loop {
+            let result = Transaction::construct(signer_account.clone(), token.clone())
+                .add_actions(actions.clone())
+                .with_signer(signer.clone())
+                .send_to(network)
+                .await;
 
-        info!(
-            "tx submitted: {} (chunk={} actions={})",
-            last_tx_hash,
-            chunk_idx + 1,
-            chunk.len()
-        );
+            match result {
+                Ok(tx) => {
+                    last_tx_hash = tx.transaction_outcome.id.to_string();
+                    info!(
+                        "tx submitted: {} (chunk={} actions={})",
+                        last_tx_hash,
+                        chunk_idx + 1,
+                        chunk.len()
+                    );
+                    break;
+                }
+                Err(err) => {
+                    let err_str = err.to_string();
+
+                    // Check if it's an InvalidNonce error
+                    if err_str.contains("InvalidNonce") && nonce_retry < MAX_NONCE_RETRIES {
+                        nonce_retry += 1;
+                        warn!(
+                            "InvalidNonce detected (retry {}/{}), forcing nonce resync from chain",
+                            nonce_retry, MAX_NONCE_RETRIES
+                        );
+
+                        // Force nonce resync by calling fetch_tx_nonce
+                        // This will fetch current nonce from chain and update internal cache with fetch_max
+                        match signer.get_public_key().await {
+                            Ok(public_key) => {
+                                if let Err(fetch_err) = signer
+                                    .fetch_tx_nonce(signer_account.clone(), public_key, network)
+                                    .await
+                                {
+                                    warn!("failed to resync nonce: {fetch_err:?}");
+                                } else {
+                                    info!("nonce resync successful, retrying transaction");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("failed to get public key for nonce resync: {e:?}");
+                            }
+                        }
+
+                        // Small delay before retry
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+
+                    // Not a nonce issue or retries exhausted
+                    return Err(err.into());
+                }
+            }
+        }
     }
 
     Ok(last_tx_hash)

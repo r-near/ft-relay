@@ -114,68 +114,79 @@ impl TestnetHarness {
             ..NetworkConfig::testnet()
         };
 
-        // For high-volume tests, request a second faucet account and transfer its balance
-        // to the owner to increase available funds (faucet limit is 5 accounts)
-        if config.receiver_count >= 5 {
-            println!("Requesting additional faucet account for extra funds...");
-            let donor_id_str = format!("dev-{now_ms}-{pid}-donor-{}.testnet", seq);
-            let donor_id: AccountId = donor_id_str.parse()?;
-            let donor_secret_key = near_api::signer::generate_secret_key()?;
-            let donor_public_key = donor_secret_key.public_key();
+        // For high-volume tests, request additional faucet accounts and transfer their balance
+        // to the owner to increase available funds (faucet limit is 5 accounts, ~10N each)
+        let donor_count = if config.receiver_count >= 5 { 2 } else { 0 };
 
-            request_faucet_account(&donor_id_str, &donor_public_key.to_string()).await?;
-            tokio::time::sleep(config.faucet_wait).await;
+        if donor_count > 0 {
+            println!("Requesting {} additional faucet account(s) for extra funds...", donor_count);
 
-            // Transfer all funds from donor to owner, then delete donor
-            let donor_signer = Signer::new(Signer::from_secret_key(donor_secret_key.clone()))?;
+            for donor_idx in 0..donor_count {
+                let donor_id_str = format!("dev-{now_ms}-{pid}-donor{}-{}.testnet", donor_idx, seq);
+                let donor_id: AccountId = donor_id_str.parse()?;
+                let donor_secret_key = near_api::signer::generate_secret_key()?;
+                let donor_public_key = donor_secret_key.public_key();
 
-            // Get donor balance to determine transfer amount
-            let donor_state = near_api::Account(donor_id.clone())
-                .view()
-                .fetch_from(&network)
-                .await?;
+                request_faucet_account(&donor_id_str, &donor_public_key.to_string()).await?;
+                tokio::time::sleep(config.faucet_wait).await;
 
-            // Transfer almost all balance (leave 0.1N for transaction fees)
-            let donor_balance_yocto = donor_state.data.amount;
-            let reserve_yocto = NearToken::from_millinear(100).as_yoctonear();
-            let transfer_amount_yocto = donor_balance_yocto.saturating_sub(reserve_yocto);
+                // Transfer all funds from donor to owner, then delete donor
+                let donor_signer = Signer::new(Signer::from_secret_key(donor_secret_key.clone()))?;
 
-            if transfer_amount_yocto > 0 {
-                let transfer_action = Action::Transfer(TransferAction {
-                    deposit: transfer_amount_yocto,
-                });
-
-                Transaction::construct(donor_id.clone(), owner_id.clone())
-                    .add_action(transfer_action)
-                    .with_signer(donor_signer.clone())
-                    .send_to(&network)
+                // Get donor balance to determine transfer amount
+                let donor_state = near_api::Account(donor_id.clone())
+                    .view()
+                    .fetch_from(&network)
                     .await?;
 
-                let transfer_near = NearToken::from_yoctonear(transfer_amount_yocto);
-                println!("✅ Transferred {} NEAR from donor to owner", transfer_near.as_near());
+                // Transfer almost all balance (leave 0.1N for transaction fees)
+                let donor_balance_yocto = donor_state.data.amount;
+                let reserve_yocto = NearToken::from_millinear(100).as_yoctonear();
+                let transfer_amount_yocto = donor_balance_yocto.saturating_sub(reserve_yocto);
 
-                // Delete donor account (send remaining funds to owner)
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let _ = delete_account(&network, &donor_id, &donor_secret_key, owner_id.clone()).await;
+                if transfer_amount_yocto > 0 {
+                    let transfer_action = Action::Transfer(TransferAction {
+                        deposit: transfer_amount_yocto,
+                    });
+
+                    Transaction::construct(donor_id.clone(), owner_id.clone())
+                        .add_action(transfer_action)
+                        .with_signer(donor_signer.clone())
+                        .send_to(&network)
+                        .await?;
+
+                    let transfer_near = NearToken::from_yoctonear(transfer_amount_yocto);
+                    println!("✅ Transferred {} NEAR from donor{} to owner", transfer_near.as_near(), donor_idx);
+
+                    // Delete donor account (send remaining funds to owner)
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = delete_account(&network, &donor_id, &donor_secret_key, owner_id.clone()).await;
+                }
             }
         }
 
         let owner_signer = Signer::new(Signer::from_secret_key(owner_secret_key.clone()))?;
         deploy_ft_contract(&network, &owner_signer, &owner_id).await?;
 
-        // Create receiver accounts and register storage
-        let mut receivers = Vec::with_capacity(config.receiver_count);
+        // Create receiver accounts and register storage (parallelized)
+        println!("Creating {} receiver account(s) in parallel...", config.receiver_count);
+        let mut tasks = Vec::with_capacity(config.receiver_count);
         for idx in 0..config.receiver_count {
-            let receiver = create_receiver_account(
-                &network,
-                &owner_signer,
-                &owner_id,
-                idx,
-                config.receiver_deposit,
-            )
-            .await?;
-            register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
-            receivers.push(receiver);
+            let network = network.clone();
+            let owner_signer = owner_signer.clone();
+            let owner_id = owner_id.clone();
+            let deposit = config.receiver_deposit;
+
+            tasks.push(tokio::spawn(async move {
+                let receiver = create_receiver_account(&network, &owner_signer, &owner_id, idx, deposit).await?;
+                register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
+                Ok::<_, anyhow::Error>(receiver)
+            }));
+        }
+
+        let mut receivers = Vec::with_capacity(config.receiver_count);
+        for task in tasks {
+            receivers.push(task.await??);
         }
 
         // Prepare signer pool (primary key + optional extra keys)

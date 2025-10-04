@@ -9,7 +9,7 @@ pub use redis_queue::RedisContext;
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use log::{info, warn};
 use near_api::{NetworkConfig, RPCEndpoint, Signer};
 use tokio::{signal, sync::Semaphore};
@@ -23,18 +23,6 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         ..NetworkConfig::testnet()
     };
 
-    let first_key = secret_keys
-        .first()
-        .ok_or_else(|| anyhow!("No secret keys configured"))?;
-    let signer = Signer::new(Signer::from_secret_key(first_key.parse()?))?;
-
-    for key_str in secret_keys.iter().skip(1) {
-        let key_signer = Signer::from_secret_key(key_str.parse()?);
-        signer.add_signer_to_pool(key_signer).await?;
-    }
-
-    info!("Initialized signer with {} keys in pool", secret_keys.len());
-
     let redis = Arc::new(RedisContext::new(&config.redis).await?);
     let router = http::build_router(redis.clone());
 
@@ -47,15 +35,58 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(config.max_inflight_batches));
     let worker_count = std::cmp::max(1, std::cmp::min(config.max_workers, secret_keys.len()));
+
+    // Calculate keys per worker (distribute evenly)
+    let keys_per_worker = secret_keys.len() / worker_count;
+    let mut extra_keys = secret_keys.len() % worker_count;
+
     info!(
-        "spawning {} worker(s) with {} access key(s) in pool",
+        "spawning {} worker(s), distributing {} access key(s) (~{} keys per worker)",
         worker_count,
-        secret_keys.len()
+        secret_keys.len(),
+        keys_per_worker
     );
+
+    let mut key_offset = 0;
     for idx in 0..worker_count {
+        // Distribute extra keys to first workers
+        let keys_for_this_worker = if extra_keys > 0 {
+            extra_keys -= 1;
+            keys_per_worker + 1
+        } else {
+            keys_per_worker
+        };
+
+        // Create a dedicated signer for this worker with its subset of keys
+        let worker_keys: Vec<String> = secret_keys
+            .iter()
+            .skip(key_offset)
+            .take(keys_for_this_worker)
+            .cloned()
+            .collect();
+        key_offset += keys_for_this_worker;
+
+        if worker_keys.is_empty() {
+            warn!("worker {idx} has no keys, skipping");
+            continue;
+        }
+
+        let first_key = worker_keys[0].parse()?;
+        let worker_signer = Signer::new(Signer::from_secret_key(first_key))?;
+
+        for key_str in worker_keys.iter().skip(1) {
+            let key_signer = Signer::from_secret_key(key_str.parse()?);
+            worker_signer.add_signer_to_pool(key_signer).await?;
+        }
+
+        info!(
+            "worker {idx} initialized with {} key(s) and independent nonce cache",
+            worker_keys.len()
+        );
+
         let worker_ctx = worker::WorkerContext {
             redis: redis.clone(),
-            signer: signer.clone(),
+            signer: worker_signer,
             signer_account: account_id.clone(),
             token: config.token.clone(),
             network: network.clone(),
