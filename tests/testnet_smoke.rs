@@ -293,12 +293,12 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     //   - Owner gets 10N from faucet + ~9N from donor = ~19N
     //   - 5 receivers × 0.2N = 1N
     //   - Leaves ~18N for gas to handle 60k transfers
-    // Use 3 access keys (more than 3 can overwhelm the RPC)
+    // Use 50 access keys with max_workers=3 to avoid RPC overload while maintaining nonce headroom
     let harness = TestnetHarness::new(HarnessConfig {
         label: "60k",
         receiver_count: 5,
         receiver_deposit: NearToken::from_millinear(200), // 0.2N per receiver
-        signer_pool_size: 3,                              // 3 keys is the sweet spot for RPC limits
+        signer_pool_size: 50,                             // Large key pool, limited by max_workers=3
         faucet_wait: default_faucet_wait(),
     })
     .await?;
@@ -306,7 +306,7 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     println!("✅ Testnet harness initialized");
     println!("   Owner: {}", harness.owner.account_id);
     println!("   Receivers: {}", harness.receivers.len());
-    println!("   Signer pool size: 3\n");
+    println!("   Signer pool size: 50 (max_workers: 3)\n");
 
     let result = run_60k_benchmark(&harness).await;
     let teardown = harness.teardown().await;
