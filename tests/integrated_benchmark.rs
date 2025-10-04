@@ -430,21 +430,12 @@ async fn test_integrated_load() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  Success rate:   {:.2}%", success_rate);
 
-    // Assert at least 90% of transactions succeeded
+    // Assert 100% of transactions succeeded
     assert!(
-        success_rate >= 90.0,
-        "At least 90% of transactions should succeed on-chain. Got {:.2}%",
+        success_rate >= 100.0,
+        "All transactions should succeed on-chain. Got {:.2}%",
         success_rate
     );
-
-    // If less than 95%, print warning
-    if success_rate < 95.0 {
-        println!(
-            "\nWarning: Success rate is {:.2}%, expected >=95%",
-            success_rate
-        );
-        println!("  Some transactions may have failed due to concurrent load");
-    }
 
     println!("\nLoad test complete!");
     println!(
@@ -816,8 +807,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     );
 
     assert!(
-        final_success_rate >= 80.0,
-        "❌ Failed: Only {:.2}% of transactions confirmed on-chain",
+        final_success_rate >= 100.0,
+        "❌ Failed: Only {:.2}% of transactions confirmed on-chain (expected 100%)",
         final_success_rate
     );
 

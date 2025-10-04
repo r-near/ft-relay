@@ -183,25 +183,14 @@ impl TestnetHarness {
         let owner_signer = Signer::new(Signer::from_secret_key(owner_secret_key.clone()))?;
         deploy_ft_contract(&network, &owner_signer, &owner_id).await?;
 
-        // Create receiver accounts and register storage (parallelized)
-        println!("Creating {} receiver account(s) in parallel...", config.receiver_count);
-        let mut tasks = Vec::with_capacity(config.receiver_count);
-        for idx in 0..config.receiver_count {
-            let network = network.clone();
-            let owner_signer = owner_signer.clone();
-            let owner_id = owner_id.clone();
-            let deposit = config.receiver_deposit;
-
-            tasks.push(tokio::spawn(async move {
-                let receiver = create_receiver_account(&network, &owner_signer, &owner_id, idx, deposit).await?;
-                register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
-                Ok::<_, anyhow::Error>(receiver)
-            }));
-        }
-
+        // Create receiver accounts and register storage
+        // Note: Done serially to avoid nonce conflicts with testnet RPC
+        println!("Creating {} receiver account(s)...", config.receiver_count);
         let mut receivers = Vec::with_capacity(config.receiver_count);
-        for task in tasks {
-            receivers.push(task.await??);
+        for idx in 0..config.receiver_count {
+            let receiver = create_receiver_account(&network, &owner_signer, &owner_id, idx, config.receiver_deposit).await?;
+            register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
+            receivers.push(receiver);
         }
 
         // Prepare signer pool (primary key + optional extra keys)

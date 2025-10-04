@@ -537,8 +537,8 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     }
 
     ensure!(
-        on_chain_success_pct >= 99.0,
-        "On-chain success rate {:.2}% below 99% minimum (polling should reach 100%)",
+        on_chain_success_pct >= 100.0,
+        "On-chain success rate {:.2}% below 100% (expected all transfers to succeed)",
         on_chain_success_pct
     );
 
