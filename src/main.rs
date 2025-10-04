@@ -10,8 +10,8 @@ async fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("info,near_api=warn,tracing::span=warn"),
     );
 
-    let args = CliArgs::parse();
-    let config = RelayConfig::from_env_and_args(args)?;
+    let cli = CliArgs::parse();
+    let config = RelayConfig::load_with_cli(&cli)?;
 
     ft_relay::run(config).await
 }

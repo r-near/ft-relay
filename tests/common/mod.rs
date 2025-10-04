@@ -85,9 +85,7 @@ impl TestnetHarness {
             println!("Flushing Redis at {}...", redis_url);
             let client = redis::Client::open(redis_url)?;
             let mut conn = client.get_multiplexed_async_connection().await?;
-            redis::cmd("FLUSHALL")
-                .query_async::<()>(&mut conn)
-                .await?;
+            redis::cmd("FLUSHALL").query_async::<()>(&mut conn).await?;
             println!("✅ Redis flushed");
         }
 
@@ -133,7 +131,10 @@ impl TestnetHarness {
         let donor_count = if config.receiver_count >= 5 { 2 } else { 0 };
 
         if donor_count > 0 {
-            println!("Requesting {} additional faucet account(s) for extra funds...", donor_count);
+            println!(
+                "Requesting {} additional faucet account(s) for extra funds...",
+                donor_count
+            );
 
             for donor_idx in 0..donor_count {
                 let donor_id_str = format!("dev-{now_ms}-{pid}-donor{}-{}.testnet", donor_idx, seq);
@@ -170,11 +171,17 @@ impl TestnetHarness {
                         .await?;
 
                     let transfer_near = NearToken::from_yoctonear(transfer_amount_yocto);
-                    println!("✅ Transferred {} NEAR from donor{} to owner", transfer_near.as_near(), donor_idx);
+                    println!(
+                        "✅ Transferred {} NEAR from donor{} to owner",
+                        transfer_near.as_near(),
+                        donor_idx
+                    );
 
                     // Delete donor account (send remaining funds to owner)
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    let _ = delete_account(&network, &donor_id, &donor_secret_key, owner_id.clone()).await;
+                    let _ =
+                        delete_account(&network, &donor_id, &donor_secret_key, owner_id.clone())
+                            .await;
                 }
             }
         }
@@ -187,7 +194,14 @@ impl TestnetHarness {
         println!("Creating {} receiver account(s)...", config.receiver_count);
         let mut receivers = Vec::with_capacity(config.receiver_count);
         for idx in 0..config.receiver_count {
-            let receiver = create_receiver_account(&network, &owner_signer, &owner_id, idx, config.receiver_deposit).await?;
+            let receiver = create_receiver_account(
+                &network,
+                &owner_signer,
+                &owner_id,
+                idx,
+                config.receiver_deposit,
+            )
+            .await?;
             register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
             receivers.push(receiver);
         }
@@ -228,7 +242,6 @@ impl TestnetHarness {
             .map(|k| k.to_string())
             .collect()
     }
-
 
     pub async fn fetch_balance(&self, receiver_id: &AccountId) -> Result<String> {
         let args = json!({ "account_id": receiver_id });
@@ -517,7 +530,6 @@ async fn delete_account(
     println!("Account {} deleted", account_id);
     Ok(())
 }
-
 
 pub fn default_faucet_wait() -> Duration {
     DEFAULT_FAUCET_WAIT
