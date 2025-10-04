@@ -188,8 +188,7 @@ cargo test --all --locked -- --ignored --nocapture --test-threads=1
 
 ## Roadmap & Caveats
 
-- No finality tracking – we optimistically submit and rely on NEAR RPC to process transactions.
-- Idempotency and retry logic are minimal; upstream callers should implement their own safeguards.
-- Redis availability is required; if Redis is down the relay rejects new transfers.
+- **Redis is required** – If Redis is down, the relay rejects new transfers with HTTP 500. No fallback queue exists.
+- **No idempotency** – Duplicate requests create separate transfers. Callers must implement deduplication if needed.
 
 Contributions and issue reports are welcome!
