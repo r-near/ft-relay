@@ -163,6 +163,29 @@ Status records are stored in Redis for 24 hours after completion.
 
 ---
 
+## Testing
+
+The project includes comprehensive test suites:
+
+**Run all tests serially** (required to avoid Redis conflicts):
+```bash
+cargo test --all --locked -- --test-threads=1 --nocapture
+```
+
+**Run ignored integration/benchmark tests serially**:
+```bash
+cargo test --all --locked -- --ignored --nocapture --test-threads=1
+```
+
+**Test types**:
+- **Unit tests** – Fast, in-memory validation
+- **Integration tests** – Sandbox-based with real NEAR nodes
+- **Testnet tests** – Live testnet benchmarks (require `TESTNET_RPC_URL` in `.env`)
+
+> ⚠️ Always use `--test-threads=1` to run tests serially and avoid Redis/sandbox conflicts.
+
+---
+
 ## Roadmap & Caveats
 
 - No finality tracking – we optimistically submit and rely on NEAR RPC to process transactions.
