@@ -547,9 +547,6 @@ async fn delete_account(
     Ok(())
 }
 
-pub fn default_receiver_deposit() -> NearToken {
-    DEFAULT_RECEIVER_DEPOSIT
-}
 
 pub fn default_faucet_wait() -> Duration {
     DEFAULT_FAUCET_WAIT
