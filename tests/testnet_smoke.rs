@@ -293,7 +293,7 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     //   - Owner gets 10N from faucet + ~9N from donor = ~19N
     //   - 5 receivers × 0.2N = 1N
     //   - Leaves ~18N for gas to handle 60k transfers
-    // Use 50 access keys with max_workers=3 to avoid RPC overload while maintaining nonce headroom
+    // Use 50 access keys for excellent nonce headroom (~1,200 nonces per key)
     let harness = TestnetHarness::new(HarnessConfig {
         label: "60k",
         receiver_count: 5,
