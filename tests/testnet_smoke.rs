@@ -314,6 +314,17 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     println!("   ║  All requirements satisfied!                               ║");
     println!("   ╚════════════════════════════════════════════════════════════╝");
 
+    // Emit benchmark results in parseable format for CI
+    println!("\n--- BENCHMARK RESULTS (TESTNET) ---");
+    println!("test_name: sixty_k_benchmark_test");
+    println!("transfers: {}", MEGA_BENCH_REQUESTS);
+    println!("duration_secs: {:.2}", elapsed.as_secs_f64());
+    println!("throughput_req_per_sec: {:.2}", throughput);
+    println!("http_success_rate: {:.2}", http_success_pct);
+    println!("onchain_success_rate: {:.2}", on_chain_success_pct);
+    println!("status: PASSED");
+    println!("--- END BENCHMARK RESULTS ---");
+
     relay_handle.abort();
     let _ = relay_handle.await;
 
