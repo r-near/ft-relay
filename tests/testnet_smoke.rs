@@ -4,6 +4,7 @@ use anyhow::{ensure, Result};
 use dotenv::dotenv;
 use ft_relay::{RedisConfig, RelayConfig};
 use futures::stream::{self, StreamExt};
+use near_api_types::NearToken;
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -275,12 +276,14 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
     // Use fewer receivers due to 10N testnet faucet limit
-    // Each receiver needs ~0.5N, owner needs ~2N for storage + gas
-    // 10N budget = 1 owner (~2N) + 10 receivers (~5N) + 3N buffer
+    // For 60k transfers, use just 5 receivers to spread out the load
+    // Each receiver gets 60k/5 = 12k transfers = 12k tokens
+    // Need more deposit per receiver to handle the volume
+    // 10N budget = 1 owner (~8N for gas) + 5 receivers (~1N total) + 1N buffer
     let harness = TestnetHarness::new(HarnessConfig {
         label: "60k",
-        receiver_count: 10,
-        receiver_deposit: default_receiver_deposit(), // 0.5N per receiver
+        receiver_count: 5,
+        receiver_deposit: NearToken::from_millinear(200), // 0.2N per receiver
         signer_pool_size: 3,
         faucet_wait: default_faucet_wait(),
     })
