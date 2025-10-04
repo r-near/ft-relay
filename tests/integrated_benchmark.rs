@@ -17,6 +17,19 @@ use std::time::{Duration, Instant};
 
 const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
 
+/// Flush Redis before test
+async fn flush_redis() -> Result<(), Box<dyn std::error::Error>> {
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    println!("Flushing Redis at {}...", redis_url);
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    redis::cmd("FLUSHALL")
+        .query_async::<()>(&mut redis_conn)
+        .await?;
+    println!("✅ Redis flushed");
+    Ok(())
+}
+
 /// Deploy and initialize the FT contract
 async fn setup_ft_contract(
     sandbox: &Sandbox,
@@ -112,13 +125,7 @@ async fn register_accounts(
 #[ignore] // Run with: cargo test --test integrated_benchmark basic -- --ignored --nocapture
 async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::try_init().ok();
-
-    // Flush Redis before test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
-    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
-    redis::cmd("FLUSHALL")
-        .query_async::<()>(&mut redis_conn)
-        .await?;
+    flush_redis().await?;
 
     println!("\nIntegrated Test: Basic FT Transfer");
     println!("====================================");
@@ -247,13 +254,7 @@ async fn test_integrated_load() -> Result<(), Box<dyn std::error::Error>> {
     .is_test(true)
     .try_init()
     .ok();
-
-    // Flush Redis before test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
-    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
-    redis::cmd("FLUSHALL")
-        .query_async::<()>(&mut redis_conn)
-        .await?;
+    flush_redis().await?;
 
     println!("\nIntegrated Load Test: 1000 FT Transfers");
     println!("=========================================");
@@ -465,13 +466,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     .is_test(true)
     .try_init()
     .ok();
-
-    // Flush Redis before test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
-    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
-    redis::cmd("FLUSHALL")
-        .query_async::<()>(&mut redis_conn)
-        .await?;
+    flush_redis().await?;
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  BOUNTY REQUIREMENT TEST: 60,000 Transfers in 10 Minutes  ║");

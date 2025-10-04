@@ -92,6 +92,9 @@ impl TestnetHarness {
             println!("✅ Redis flushed");
         }
 
+        // Load .env file if present (for local development)
+        dotenv::dotenv().ok();
+
         let rpc_url = std::env::var("TESTNET_RPC_URL")
             .or_else(|_| std::env::var("RPC_URL"))
             .context(
