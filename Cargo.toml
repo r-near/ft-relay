@@ -11,9 +11,12 @@ dotenv = "0.15.0"
 env_logger = "0.11.8"
 futures = "0.3.31"
 log = "0.4.28"
+config = "0.14.1"
+redis = { version = "0.32.7", features = ["aio", "tokio-comp", "connection-manager"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.47.1", features = ["full"] }
+uuid = { version = "1.10.0", features = ["v4"] }
 
 # NEAR API
 near-api = "0.6.1"
@@ -21,5 +24,6 @@ near-api-types = "0.6.1"
 near-primitives = "0.30.3"
 
 [dev-dependencies]
+near-crypto = "0.30.3"
 near-sandbox = { version = "0.2.0", features = ["generate"] }
 reqwest = { version = "0.12.23", features = ["json"] }

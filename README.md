@@ -6,10 +6,11 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
 
 ## Features
 
-- **Single endpoint** – `POST /v1/transfer` accepts `receiver_id`, `amount`, and an optional `memo`.
+- **Transfer endpoints** – `POST /v1/transfer` to queue transfers, `GET /v1/transfer/:id` to check status and get tx_hash.
 - **Signer pool** – rotate across multiple function-call access keys to avoid nonce contention.
 - **Micro-batching** – pack up to `BATCH_SIZE` transfers into a single transaction while respecting the 300 TGas ceiling.
 - **Async pipeline** – bounded queue + semaphore to backpressure inflight batches.
+- **Durable queue** – Redis Streams persist every transfer until the worker acknowledges it.
 - **Sandbox-friendly** – integration suites spin up `near-sandbox`, deploy the FT contract, and verify final balances.
 - **Docker-ready** – minimal two-stage container for production deployment.
 
@@ -19,8 +20,8 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
 
 ![ft-relay architecture diagram](docs/diagrams/architecture.svg)
 
-- The HTTP handler pushes requests onto a Tokio MPSC channel.
-- The batcher drains the channel, groups requests, and submits one or more transactions for each batch chunk.
+- The HTTP handler writes each request to a Redis Stream and immediately returns a `transfer_id`.
+- The async worker consumes from the stream’s consumer group, batches transfers, and submits NEAR transactions.
 - Gas accounting ensures we never exceed NEAR’s 300 TGas prepaid limit (`90` transfers × `40 TGas`).
 - The signer pool is backed by `near-api-rs` and can host multiple secret keys for high concurrency.
 
@@ -30,6 +31,7 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
 
 - [Rust](https://www.rust-lang.org/tools/install) 1.86 (pinned in CI).
 - `near-sandbox` dependencies (the integration tests download and run it automatically).
+- [Redis](https://redis.io/) 8 or newer, reachable from the relay.
 
 ---
 
@@ -55,12 +57,16 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
    The server listens on `0.0.0.0:8080` unless you set `BIND_ADDR`.
 
 3. **Send a transfer**
-   ```bash
-   curl -X POST http://localhost:8080/v1/transfer \
-     -H 'Content-Type: application/json' \
-     -d '{"receiver_id":"alice.testnet","amount":"1000000000000000000"}'
-   ```
-   Responses are fire-and-forget acknowledgements (`{"status":"accepted"}`).
+```bash
+curl -X POST http://localhost:8080/v1/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver_id":"alice.testnet","amount":"1000000000000000000"}'
+```
+Responses include a durable identifier you can poll later:
+
+```json
+{"status":"queued","transfer_id":"6b81f45e-5c7c-4c84-987d-3cf6c3e4232a"}
+```
 
 ---
 
@@ -78,66 +84,11 @@ All configuration except the FT contract ID comes from environment variables. Th
 | `BATCH_LINGER_MS`      | ❌       | Max time to wait for a batch to fill (default `20ms`).                                                |
 | `MAX_INFLIGHT_BATCHES` | ❌       | Inflight batch semaphore (default `200`).                                                             |
 | `RUST_LOG`             | ❌       | Standard Rust logging spec (`info,ft_relay=info`).                                                    |
+| `REDIS_URL`            | ❌       | Connection string for Redis (default `redis://127.0.0.1:6379`).                                       |
+| `REDIS_STREAM_KEY`     | ❌       | Stream key for pending transfers (default `ftrelay:pending`).                                        |
+| `REDIS_CONSUMER_GROUP` | ❌       | Consumer group name used by the batch worker (default `ftrelay:batcher`).                             |
 
 > ⚠️ Use function-call restricted keys that can only call your FT contract. Never ship full-access secrets in production.
-
----
-
-## Testing
-
-The project includes ignored integration suites that each spin up `near-sandbox`. Run them explicitly:
-
-```bash
-# Basic single transfer
-cargo test --test integrated_benchmark basic -- --ignored --nocapture
-
-# Debug helper with verbose logging (10 transfers)
-cargo test --test debug_load -- --ignored --nocapture
-
-# Concurrent load test (100 transfers)
-cargo test --test integrated_benchmark load -- --ignored --nocapture
-
-# Bounty-scale benchmark (60k transfers / 10 minutes)
-cargo test --test integrated_benchmark bounty -- --ignored --nocapture
-```
-
-Before pushing changes, run formatting and linting:
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo check
-```
-
----
-
-## Docker Usage
-
-### Run from GitHub Container Registry
-
-```bash
-docker run --rm \
-  -p 8080:8080 \
-  --env-file .env \
-  ghcr.io/r-near/ft-relay:latest \
-  --token your-ft-contract.testnet
-```
-
-### Build locally
-
-```bash
-docker build -t ft-relay:latest .
-```
-
-```bash
-docker run --rm \
-  -p 8080:8080 \
-  --env-file .env \
-  ft-relay:latest \
-  --token your-ft-contract.testnet
-```
-
-The image exposes port `8080` and defaults to `RUST_LOG=info`. Override the command arguments or environment variables as needed.
 
 ---
 
@@ -162,10 +113,44 @@ The image exposes port `8080` and defaults to `RUST_LOG=info`. Override the comm
 **Response**
 
 ```json
-{ "status": "accepted" }
+{
+  "status": "queued",
+  "transfer_id": "6b81f45e-5c7c-4c84-987d-3cf6c3e4232a"
+}
 ```
 
 HTTP `503` signals the internal queue is saturated.
+
+### `GET /v1/transfer/:id`
+
+Query the status of a previously submitted transfer.
+
+**Request**
+
+```bash
+curl http://localhost:8080/v1/transfer/6b81f45e-5c7c-4c84-987d-3cf6c3e4232a
+```
+
+**Response (pending)**
+
+```json
+{
+  "transfer_id": "6b81f45e-5c7c-4c84-987d-3cf6c3e4232a",
+  "status": "pending"
+}
+```
+
+**Response (completed)**
+
+```json
+{
+  "transfer_id": "6b81f45e-5c7c-4c84-987d-3cf6c3e4232a",
+  "status": "completed",
+  "tx_hash": "HMeo3DYSuAmXWxuTotFzWMac5bcePhHeRqfCDLRNBs9Y"
+}
+```
+
+Status records are stored in Redis for 24 hours after completion.
 
 ---
 
@@ -174,13 +159,37 @@ HTTP `503` signals the internal queue is saturated.
 - **Sandbox kernel parameter warnings** – `near-sandbox` may warn about TCP buffer sizes on Linux. Adjust via `scripts/set_kernel_params.sh` if you need peak throughput.
 - **Nonce errors** – Add more keys to `PRIVATE_KEYS` or ensure the signer account isn’t used elsewhere.
 - **Gas exceeded** – The relay automatically chunks batches, but if you change `FT_TRANSFER_GAS_PER_ACTION`, keep `gas * BATCH_SIZE ≤ 300 TGas`.
+- **Redis connectivity** – The server returns `500` if it cannot enqueue into Redis; verify `REDIS_URL` and that the stream/group exist.
+
+---
+
+## Testing
+
+The project includes comprehensive test suites:
+
+**Run all tests serially** (required to avoid Redis conflicts):
+```bash
+cargo test --all --locked -- --test-threads=1 --nocapture
+```
+
+**Run ignored integration/benchmark tests serially**:
+```bash
+cargo test --all --locked -- --ignored --nocapture --test-threads=1
+```
+
+**Test types**:
+- **Unit tests** – Fast, in-memory validation
+- **Integration tests** – Sandbox-based with real NEAR nodes
+- **Testnet tests** – Live testnet benchmarks (require `TESTNET_RPC_URL` in `.env`)
+
+> ⚠️ Always use `--test-threads=1` to run tests serially and avoid Redis/sandbox conflicts.
 
 ---
 
 ## Roadmap & Caveats
 
-- No durable queue or persistence – restarts drop in-flight transfers.
 - No finality tracking – we optimistically submit and rely on NEAR RPC to process transactions.
 - Idempotency and retry logic are minimal; upstream callers should implement their own safeguards.
+- Redis availability is required; if Redis is down the relay rejects new transfers.
 
 Contributions and issue reports are welcome!

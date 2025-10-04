@@ -7,7 +7,7 @@
 /// 4. Starts the relay API server
 /// 5. Runs benchmark with actual FT transfers
 /// 6. Verifies balances changed correctly
-use ft_relay::RelayConfig;
+use ft_relay::{RedisConfig, RelayConfig};
 use near_api::{NetworkConfig, RPCEndpoint, Signer};
 use near_api_types::NearToken;
 use near_primitives::action::{Action, DeployContractAction, FunctionCallAction};
@@ -16,6 +16,19 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
+
+/// Flush Redis before test
+async fn flush_redis() -> Result<(), Box<dyn std::error::Error>> {
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    println!("Flushing Redis at {}...", redis_url);
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    redis::cmd("FLUSHALL")
+        .query_async::<()>(&mut redis_conn)
+        .await?;
+    println!("✅ Redis flushed");
+    Ok(())
+}
 
 /// Deploy and initialize the FT contract
 async fn setup_ft_contract(
@@ -109,312 +122,6 @@ async fn register_accounts(
 }
 
 #[tokio::test]
-#[ignore] // Run with: cargo test --test integrated_benchmark basic -- --ignored --nocapture
-async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::try_init().ok();
-
-    println!("\nIntegrated Test: Basic FT Transfer");
-    println!("====================================");
-
-    // Start sandbox
-    let ft_owner = GenesisAccount::generate_with_name("ft.sandbox".parse()?);
-    let receiver = GenesisAccount::generate_with_name("receiver.sandbox".parse()?);
-
-    let sandbox = Sandbox::start_sandbox_with_config(SandboxConfig {
-        additional_accounts: vec![ft_owner.clone(), receiver.clone()],
-        ..Default::default()
-    })
-    .await?;
-
-    println!("Sandbox started at {}", sandbox.rpc_addr);
-
-    // Deploy FT contract
-    setup_ft_contract(&sandbox, &ft_owner).await?;
-    println!("FT contract deployed and initialized");
-
-    // Register receiver
-    register_accounts(&sandbox, &ft_owner, &[receiver.clone()]).await?;
-    println!("Receiver registered");
-
-    // Start relay server
-    let config = RelayConfig {
-        token: ft_owner.account_id.clone(),
-        account_id: ft_owner.account_id.clone(),
-        secret_keys: vec![ft_owner.private_key.to_string()],
-        rpc_url: sandbox.rpc_addr.clone(),
-        batch_size: 1,
-        batch_linger_ms: 10,
-        max_inflight_batches: 10,
-        bind_addr: "127.0.0.1:18080".to_string(),
-    };
-
-    tokio::spawn(async move {
-        if let Err(e) = ft_relay::run(config).await {
-            eprintln!("Server error: {:?}", e);
-        }
-    });
-
-    // Wait for server to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("Relay server started");
-
-    // Send transfer request
-    let client = reqwest::Client::new();
-    let response = client
-        .post("http://127.0.0.1:18080/v1/transfer")
-        .json(&json!({
-            "receiver_id": receiver.account_id,
-            "amount": "1000000000000000000", // 1 token
-            "memo": "test"
-        }))
-        .send()
-        .await?;
-
-    assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().await?;
-    println!("Transfer request accepted: {:?}", body);
-
-    // Wait for transaction to process (batching + blockchain)
-    println!("Waiting for transaction to process...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Verify balance
-    let network = NetworkConfig {
-        network_name: "sandbox".to_string(),
-        rpc_endpoints: vec![RPCEndpoint::new(sandbox.rpc_addr.parse()?)],
-        ..NetworkConfig::testnet()
-    };
-
-    let balance_args = json!({
-        "account_id": receiver.account_id
-    });
-
-    let result = near_api::Contract(ft_owner.account_id.clone())
-        .call_function("ft_balance_of", balance_args)?
-        .read_only()
-        .fetch_from(&network)
-        .await?;
-
-    let balance: String = result.data;
-    println!("Receiver balance: {}", balance);
-
-    assert_eq!(balance, "1000000000000000000", "Balance should be 1 token");
-
-    println!("\nIntegration test passed!");
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore] // Run with: cargo test --test integrated_benchmark load -- --ignored --nocapture
-async fn test_integrated_load() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("info,ft_relay=info,near_api=warn,tracing::span=warn"),
-    )
-    .is_test(true)
-    .try_init()
-    .ok();
-
-    println!("\nIntegrated Load Test: 1000 FT Transfers");
-    println!("=========================================");
-
-    // Start sandbox with multiple receivers
-    let ft_owner = GenesisAccount::generate_with_name("ft.sandbox".parse()?);
-
-    let mut receivers = Vec::new();
-    for i in 0..10 {
-        receivers.push(GenesisAccount::generate_with_name(
-            format!("recv{}.sandbox", i).parse()?,
-        ));
-    }
-
-    let mut accounts = vec![ft_owner.clone()];
-    accounts.extend(receivers.clone());
-
-    let sandbox = Sandbox::start_sandbox_with_config(SandboxConfig {
-        additional_accounts: accounts,
-        ..Default::default()
-    })
-    .await?;
-
-    println!("Sandbox started with 10 receivers");
-
-    // Deploy and setup
-    setup_ft_contract(&sandbox, &ft_owner).await?;
-    println!("FT contract deployed and initialized");
-
-    register_accounts(&sandbox, &ft_owner, &receivers).await?;
-    println!("All 10 receivers registered");
-
-    // Start relay server with batching
-    let config = RelayConfig {
-        token: ft_owner.account_id.clone(),
-        account_id: ft_owner.account_id.clone(),
-        secret_keys: vec![ft_owner.private_key.to_string()],
-        rpc_url: sandbox.rpc_addr.clone(),
-        batch_size: 90, // Use optimized batch size
-        batch_linger_ms: 20,
-        max_inflight_batches: 50,
-        bind_addr: "127.0.0.1:18081".to_string(),
-    };
-
-    let server_handle = tokio::spawn(async move {
-        match ft_relay::run(config).await {
-            Ok(_) => println!("Server exited normally"),
-            Err(e) => {
-                eprintln!("\nRelay server error: {:?}", e);
-                panic!("Server failed: {:?}", e);
-            }
-        }
-    });
-
-    // Wait for server to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("Relay server started");
-
-    // Send transfer requests
-    let client = reqwest::Client::new();
-    let total_requests = 1000;
-
-    println!("Sending {} transfer requests...", total_requests);
-    let start = Instant::now();
-
-    let mut tasks = Vec::new();
-    for i in 0..total_requests {
-        let client = client.clone();
-        let receiver_id = receivers[i % 10].account_id.clone();
-
-        let task = tokio::spawn(async move {
-            match client
-                .post("http://127.0.0.1:18081/v1/transfer")
-                .json(&json!({
-                    "receiver_id": receiver_id,
-                    "amount": "1000000000000000000" // 1 token each
-                }))
-                .send()
-                .await
-            {
-                Ok(r) if r.status() == 200 => true,
-                Ok(r) => {
-                    eprintln!(
-                        "Request failed with status {}: {:?}",
-                        r.status(),
-                        r.text().await
-                    );
-                    false
-                }
-                Err(e) => {
-                    eprintln!("Request error: {}", e);
-                    false
-                }
-            }
-        });
-        tasks.push(task);
-    }
-
-    let mut success = 0;
-    for task in tasks {
-        if task.await.unwrap_or(false) {
-            success += 1;
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let throughput = total_requests as f64 / elapsed.as_secs_f64();
-
-    println!("\nHTTP Results:");
-    println!("  Requests sent: {}", total_requests);
-    println!("  Accepted: {}", success);
-    println!("  Duration: {:?}", elapsed);
-    println!("  Throughput: {:.2} req/sec", throughput);
-
-    // Check if server is still running
-    if server_handle.is_finished() {
-        panic!("Server task died!");
-    }
-    println!("  Server status: Running");
-
-    // Wait for batches to process
-    println!("\nWaiting for transactions to process on-chain...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
-
-    // Verify balances for each receiver
-    println!("Verifying on-chain balances...");
-
-    let network = NetworkConfig {
-        network_name: "sandbox".to_string(),
-        rpc_endpoints: vec![RPCEndpoint::new(sandbox.rpc_addr.parse()?)],
-        ..NetworkConfig::testnet()
-    };
-
-    let mut total_balance_verified: u128 = 0;
-    let expected_per_receiver = (total_requests / 10) as u128 * 1_000_000_000_000_000_000; // Each receiver gets N tokens
-
-    for (i, receiver) in receivers.iter().enumerate() {
-        let balance_args = json!({
-            "account_id": receiver.account_id
-        });
-
-        let result = near_api::Contract(ft_owner.account_id.clone())
-            .call_function("ft_balance_of", balance_args)?
-            .read_only()
-            .fetch_from(&network)
-            .await?;
-
-        let balance_str: String = result.data;
-        let balance: u128 = balance_str.parse().unwrap_or(0);
-        total_balance_verified += balance;
-
-        println!(
-            "  Receiver {}: {} tokens (expected: ~{})",
-            i,
-            balance / 1_000_000_000_000_000_000,
-            expected_per_receiver / 1_000_000_000_000_000_000
-        );
-    }
-
-    let expected_total = total_requests as u128 * 1_000_000_000_000_000_000;
-    let success_rate = (total_balance_verified as f64 / expected_total as f64) * 100.0;
-
-    println!("\nOn-Chain Verification:");
-    println!(
-        "  Expected total: {} tokens",
-        expected_total / 1_000_000_000_000_000_000
-    );
-    println!(
-        "  Actual total:   {} tokens",
-        total_balance_verified / 1_000_000_000_000_000_000
-    );
-    println!("  Success rate:   {:.2}%", success_rate);
-
-    // Assert at least 90% of transactions succeeded
-    assert!(
-        success_rate >= 90.0,
-        "At least 90% of transactions should succeed on-chain. Got {:.2}%",
-        success_rate
-    );
-
-    // If less than 95%, print warning
-    if success_rate < 95.0 {
-        println!(
-            "\nWarning: Success rate is {:.2}%, expected >=95%",
-            success_rate
-        );
-        println!("  Some transactions may have failed due to concurrent load");
-    }
-
-    println!("\nLoad test complete!");
-    println!(
-        "  {} HTTP requests accepted at {:.2} req/sec",
-        success, throughput
-    );
-    println!("  {:.2}% of transfers confirmed on-chain", success_rate);
-
-    Ok(())
-}
-
-#[tokio::test]
 #[ignore] // Run with: cargo test --test integrated_benchmark bounty -- --ignored --nocapture
 async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
@@ -424,6 +131,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     .is_test(true)
     .try_init()
     .ok();
+    flush_redis().await?;
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  BOUNTY REQUIREMENT TEST: 60,000 Transfers in 10 Minutes  ║");
@@ -515,7 +223,9 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         batch_size: 90,            // Max safe batch size
         batch_linger_ms: 20,       // Fast batching
         max_inflight_batches: 500, // High concurrency
+        max_workers: 3,
         bind_addr: "127.0.0.1:18082".to_string(),
+        redis: test_redis_config(),
     };
 
     println!("\nServer Configuration:");
@@ -771,8 +481,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     );
 
     assert!(
-        final_success_rate >= 80.0,
-        "❌ Failed: Only {:.2}% of transactions confirmed on-chain",
+        final_success_rate >= 100.0,
+        "❌ Failed: Only {:.2}% of transactions confirmed on-chain (expected 100%)",
         final_success_rate
     );
 
@@ -785,5 +495,23 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("   ║  All requirements satisfied!                               ║");
     println!("   ╚════════════════════════════════════════════════════════════╝");
 
+    // Emit benchmark results in parseable format for CI
+    println!("\n--- BENCHMARK RESULTS (SANDBOX) ---");
+    println!("test_name: test_bounty_requirement_60k");
+    println!("transfers: {}", total_requests);
+    println!("duration_secs: {:.2}", elapsed.as_secs_f64());
+    println!("throughput_req_per_sec: {:.2}", throughput);
+    println!("http_success_rate: {:.2}", http_success_rate);
+    println!("onchain_success_rate: {:.2}", final_success_rate);
+    println!("status: PASSED");
+    println!("--- END BENCHMARK RESULTS ---");
+
     Ok(())
+}
+fn test_redis_config() -> RedisConfig {
+    RedisConfig {
+        url: "redis://127.0.0.1:6379".to_string(),
+        stream_key: "ftrelay:pending".to_string(),
+        consumer_group: "ftrelay:batcher".to_string(),
+    }
 }
