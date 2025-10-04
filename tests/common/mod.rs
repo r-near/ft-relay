@@ -50,7 +50,7 @@ pub struct HarnessConfig<'a> {
     pub faucet_wait: Duration,
 }
 
-impl<'a> Default for HarnessConfig<'a> {
+impl Default for HarnessConfig<'_> {
     fn default() -> Self {
         Self {
             label: "harness",
