@@ -1129,6 +1129,7 @@ dependencies = [
  "log",
  "near-api",
  "near-api-types",
+ "near-crypto",
  "near-primitives",
  "near-sandbox",
  "redis",

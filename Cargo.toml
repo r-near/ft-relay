@@ -24,5 +24,6 @@ near-api-types = "0.6.1"
 near-primitives = "0.30.3"
 
 [dev-dependencies]
+near-crypto = "0.30.3"
 near-sandbox = { version = "0.2.0", features = ["generate"] }
 reqwest = { version = "0.12.23", features = ["json"] }
