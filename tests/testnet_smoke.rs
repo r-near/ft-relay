@@ -468,12 +468,49 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         elapsed.as_secs_f64()
     );
 
-    // Wait for transactions to finalize on testnet
-    println!("\n⏳ Waiting for NEAR testnet to finalize balances...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    // Poll for transactions to finalize on testnet (with retries for 100% success)
+    println!("\n⏳ Polling for NEAR testnet to finalize balances...");
 
-    let final_totals = harness.collect_balances().await?;
     let expected_total = accepted as u128 * 1_000_000_000_000_000_000u128;
+    let poll_interval = Duration::from_secs(5);
+    let max_polls = 60; // ~5 minutes max wait
+
+    let mut final_totals: Option<BalanceSummary> = None;
+
+    for poll in 1..=max_polls {
+        let totals = harness.collect_balances().await?;
+        let success_rate = totals.total_tokens as f64 / expected_total as f64 * 100.0;
+
+        println!(
+            "  Poll {}: {} tokens ({:.2}% complete)",
+            poll,
+            totals.total_tokens / 1_000_000_000_000_000_000,
+            success_rate
+        );
+
+        if totals.total_tokens >= expected_total {
+            println!(
+                "  ✅ Target reached after {} polls (~{}s)",
+                poll,
+                poll * poll_interval.as_secs()
+            );
+            final_totals = Some(totals);
+            break;
+        }
+
+        if poll == max_polls {
+            println!(
+                "  ⚠️  Reached polling cap (~{}s); proceeding with current totals",
+                poll * poll_interval.as_secs()
+            );
+            final_totals = Some(totals);
+            break;
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    let final_totals = final_totals.expect("should have collected balances");
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  ON-CHAIN VERIFICATION                                     ║");
@@ -500,8 +537,8 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     }
 
     ensure!(
-        on_chain_success_pct >= 80.0,
-        "On-chain success rate {:.2}% below 80% minimum",
+        on_chain_success_pct >= 99.0,
+        "On-chain success rate {:.2}% below 99% minimum (polling should reach 100%)",
         on_chain_success_pct
     );
 
