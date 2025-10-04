@@ -278,13 +278,16 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     // Use fewer receivers due to 10N testnet faucet limit
     // For 60k transfers, use just 5 receivers to spread out the load
     // Each receiver gets 60k/5 = 12k transfers = 12k tokens
-    // Need more deposit per receiver to handle the volume
-    // 10N budget = 1 owner (~8N for gas) + 5 receivers (~1N total) + 1N buffer
+    // Use 2 faucet accounts to get ~20N total budget:
+    //   - Owner gets 10N from faucet + ~9N from donor = ~19N
+    //   - 5 receivers × 0.2N = 1N
+    //   - Leaves ~18N for gas to handle 60k transfers
+    // Use 15 access keys to maximize parallelism and avoid nonce contention
     let harness = TestnetHarness::new(HarnessConfig {
         label: "60k",
         receiver_count: 5,
         receiver_deposit: NearToken::from_millinear(200), // 0.2N per receiver
-        signer_pool_size: 3,
+        signer_pool_size: 15, // High parallelism for 60k transfers
         faucet_wait: default_faucet_wait(),
     })
     .await?;
@@ -292,7 +295,7 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     println!("✅ Testnet harness initialized");
     println!("   Owner: {}", harness.owner.account_id);
     println!("   Receivers: {}", harness.receivers.len());
-    println!("   Signer pool size: 3\n");
+    println!("   Signer pool size: 15\n");
 
     let result = run_60k_benchmark(&harness).await;
     let teardown = harness.teardown().await;

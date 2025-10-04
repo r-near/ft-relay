@@ -114,6 +114,52 @@ impl TestnetHarness {
             ..NetworkConfig::testnet()
         };
 
+        // For high-volume tests, request a second faucet account and transfer its balance
+        // to the owner to increase available funds (faucet limit is 5 accounts)
+        if config.receiver_count >= 5 {
+            println!("Requesting additional faucet account for extra funds...");
+            let donor_id_str = format!("dev-{now_ms}-{pid}-donor-{}.testnet", seq);
+            let donor_id: AccountId = donor_id_str.parse()?;
+            let donor_secret_key = near_api::signer::generate_secret_key()?;
+            let donor_public_key = donor_secret_key.public_key();
+
+            request_faucet_account(&donor_id_str, &donor_public_key.to_string()).await?;
+            tokio::time::sleep(config.faucet_wait).await;
+
+            // Transfer all funds from donor to owner, then delete donor
+            let donor_signer = Signer::new(Signer::from_secret_key(donor_secret_key.clone()))?;
+
+            // Get donor balance to determine transfer amount
+            let donor_state = near_api::Account(donor_id.clone())
+                .view()
+                .fetch_from(&network)
+                .await?;
+
+            // Transfer almost all balance (leave 0.1N for transaction fees)
+            let donor_balance_yocto = donor_state.data.amount;
+            let reserve_yocto = NearToken::from_millinear(100).as_yoctonear();
+            let transfer_amount_yocto = donor_balance_yocto.saturating_sub(reserve_yocto);
+
+            if transfer_amount_yocto > 0 {
+                let transfer_action = Action::Transfer(TransferAction {
+                    deposit: transfer_amount_yocto,
+                });
+
+                Transaction::construct(donor_id.clone(), owner_id.clone())
+                    .add_action(transfer_action)
+                    .with_signer(donor_signer.clone())
+                    .send_to(&network)
+                    .await?;
+
+                let transfer_near = NearToken::from_yoctonear(transfer_amount_yocto);
+                println!("✅ Transferred {} NEAR from donor to owner", transfer_near.as_near());
+
+                // Delete donor account (send remaining funds to owner)
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = delete_account(&network, &donor_id, &donor_secret_key, owner_id.clone()).await;
+            }
+        }
+
         let owner_signer = Signer::new(Signer::from_secret_key(owner_secret_key.clone()))?;
         deploy_ft_contract(&network, &owner_signer, &owner_id).await?;
 
