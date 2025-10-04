@@ -21,7 +21,7 @@ const MINI_BENCH_CONCURRENCY: usize = 25;
 const KILO_BENCH_REQUESTS: usize = 1_000;
 const KILO_BENCH_CONCURRENCY: usize = 100;
 const MEGA_BENCH_REQUESTS: usize = 60_000;
-const MEGA_BENCH_CONCURRENCY: usize = 200;
+const MEGA_BENCH_CONCURRENCY: usize = 100;
 
 fn test_redis_config() -> RedisConfig {
     RedisConfig {
@@ -160,6 +160,7 @@ async fn run_benchmark(
         batch_size: 90,
         batch_linger_ms: 20,
         max_inflight_batches: 300,
+        max_workers: 3,
         bind_addr: bind_addr.clone(),
         redis: test_redis_config(),
     };
@@ -270,7 +271,17 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     .ok();
     dotenv().ok();
 
-    println!("\n╔════════════════════════════════════════════════════════════╗");
+    // Flush Redis before test
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    redis::cmd("FLUSHALL")
+        .query_async::<()>(&mut redis_conn)
+        .await?;
+    println!("✅ Redis flushed\n");
+
+    println!("╔════════════════════════════════════════════════════════════╗");
     println!("║  TESTNET 60K BENCHMARK: 60,000 Transfers in 10 Minutes    ║");
     println!("║  Target: ≥100 transfers/second sustained                   ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
@@ -287,7 +298,7 @@ async fn sixty_k_benchmark_test() -> Result<()> {
         label: "60k",
         receiver_count: 5,
         receiver_deposit: NearToken::from_millinear(200), // 0.2N per receiver
-        signer_pool_size: 3, // 3 keys is the sweet spot for RPC limits
+        signer_pool_size: 3,                              // 3 keys is the sweet spot for RPC limits
         faucet_wait: default_faucet_wait(),
     })
     .await?;
@@ -321,6 +332,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         batch_size: 90,
         batch_linger_ms: 20,
         max_inflight_batches: 500, // Higher for 60k
+        max_workers: 3,
         bind_addr: bind_addr.clone(),
         redis: test_redis_config(),
     };

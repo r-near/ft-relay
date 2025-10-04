@@ -46,8 +46,12 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     });
 
     let semaphore = Arc::new(Semaphore::new(config.max_inflight_batches));
-    let worker_count = std::cmp::max(1, secret_keys.len());
-    info!("spawning {worker_count} worker(s)");
+    let worker_count = std::cmp::max(1, std::cmp::min(config.max_workers, secret_keys.len()));
+    info!(
+        "spawning {} worker(s) with {} access key(s) in pool",
+        worker_count,
+        secret_keys.len()
+    );
     for idx in 0..worker_count {
         let worker_ctx = worker::WorkerContext {
             redis: redis.clone(),

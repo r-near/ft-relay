@@ -152,6 +152,7 @@ async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
         batch_size: 1,
         batch_linger_ms: 20,
         max_inflight_batches: 10,
+        max_workers: 3,
         bind_addr: "127.0.0.1:18080".to_string(),
         redis: test_redis_config(),
     };
@@ -294,6 +295,7 @@ async fn test_integrated_load() -> Result<(), Box<dyn std::error::Error>> {
         batch_size: 90, // Use optimized batch size
         batch_linger_ms: 20,
         max_inflight_batches: 50,
+        max_workers: 3,
         bind_addr: "127.0.0.1:18081".to_string(),
         redis: test_redis_config(),
     };
@@ -561,6 +563,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         batch_size: 90,            // Max safe batch size
         batch_linger_ms: 20,       // Fast batching
         max_inflight_batches: 500, // High concurrency
+        max_workers: 3,
         bind_addr: "127.0.0.1:18082".to_string(),
         redis: test_redis_config(),
     };

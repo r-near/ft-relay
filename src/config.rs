@@ -10,6 +10,7 @@ pub const MAX_TOTAL_PREPAID_GAS: u64 = 300_000_000_000_000; // protocol hard lim
 pub const DEFAULT_BATCH_SIZE: usize = 90; // Fits safely under 300 TGas
 pub const DEFAULT_BATCH_LINGER_MS: u64 = 20;
 pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 200;
+pub const DEFAULT_MAX_WORKERS: usize = 3;
 
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 pub const DEFAULT_REDIS_STREAM_KEY: &str = "ftrelay:pending";
@@ -42,6 +43,7 @@ pub struct RelayConfig {
     pub batch_size: usize,
     pub batch_linger_ms: u64,
     pub max_inflight_batches: usize,
+    pub max_workers: usize,
     pub bind_addr: String,
     pub redis: RedisConfig,
 }
@@ -57,6 +59,8 @@ struct RawSettings {
     batch_linger_ms: u64,
     #[serde(default = "default_max_inflight_batches")]
     max_inflight_batches: usize,
+    #[serde(default = "default_max_workers")]
+    max_workers: usize,
     #[serde(default = "default_bind_addr")]
     bind_addr: String,
     #[serde(default = "default_redis_url")]
@@ -92,6 +96,7 @@ impl RelayConfig {
             batch_size: settings.batch_size,
             batch_linger_ms: settings.batch_linger_ms,
             max_inflight_batches: settings.max_inflight_batches,
+            max_workers: settings.max_workers,
             bind_addr: settings.bind_addr,
             redis,
         })
@@ -132,6 +137,10 @@ fn default_batch_linger_ms() -> u64 {
 
 fn default_max_inflight_batches() -> usize {
     DEFAULT_MAX_INFLIGHT_BATCHES
+}
+
+fn default_max_workers() -> usize {
+    DEFAULT_MAX_WORKERS
 }
 
 fn default_bind_addr() -> String {
