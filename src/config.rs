@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use config::{Config, Environment};
 use near_api_types::AccountId;
 use serde::Deserialize;
@@ -63,11 +64,28 @@ impl RelayConfig {
     pub fn load() -> Result<Self> {
         RelayConfigBuilder::from_env()?.build()
     }
+
+    pub fn load_with_cli(args: &CliArgs) -> Result<Self> {
+        RelayConfigBuilder::from_env()?.with_cli_args(args).build()
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "Fungible Token Relay", long_about = None)]
+pub struct CliArgs {
+    /// Token (FT contract) account ID
+    #[arg(long)]
+    pub token: AccountId,
+
+    /// RPC URL override (optional; defaults to environment)
+    #[arg(long)]
+    pub rpc_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RelayConfigBuilder {
-    token: AccountId,
+    #[serde(default)]
+    token: Option<AccountId>,
     account_id: AccountId,
     private_keys: String,
     rpc_url: String,
@@ -98,30 +116,50 @@ impl RelayConfigBuilder {
         Ok(config.try_deserialize::<Self>()?)
     }
 
+    pub fn with_cli_args(mut self, args: &CliArgs) -> Self {
+        self.token = Some(args.token.clone());
+        if let Some(rpc) = &args.rpc_url {
+            self.rpc_url = rpc.clone();
+        }
+        self
+    }
+
     pub fn build(self) -> Result<RelayConfig> {
-        let secret_keys = parse_secret_keys(&self.private_keys)?;
+        let RelayConfigBuilder {
+            token,
+            account_id,
+            private_keys,
+            rpc_url,
+            batch_size,
+            batch_linger_ms,
+            max_inflight_batches,
+            max_workers,
+            bind_addr,
+            redis_url,
+            redis_stream_key,
+            redis_consumer_group,
+        } = self;
+
+        let token = token
+            .ok_or_else(|| anyhow!("FT token must be provided via --token or TOKEN env var"))?;
+        let secret_keys = parse_secret_keys(&private_keys)?;
 
         let redis = RedisSettings::new(
-            self.redis_url
-                .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
-            self.redis_stream_key
-                .unwrap_or_else(|| DEFAULT_REDIS_STREAM_KEY.to_string()),
-            self.redis_consumer_group
-                .unwrap_or_else(|| DEFAULT_REDIS_CONSUMER_GROUP.to_string()),
+            redis_url.unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
+            redis_stream_key.unwrap_or_else(|| DEFAULT_REDIS_STREAM_KEY.to_string()),
+            redis_consumer_group.unwrap_or_else(|| DEFAULT_REDIS_CONSUMER_GROUP.to_string()),
         );
 
         Ok(RelayConfig {
-            token: self.token,
-            account_id: self.account_id,
+            token,
+            account_id,
             secret_keys,
-            rpc_url: self.rpc_url,
-            batch_size: self.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
-            batch_linger_ms: self.batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
-            max_inflight_batches: self
-                .max_inflight_batches
-                .unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
-            max_workers: self.max_workers.unwrap_or(DEFAULT_MAX_WORKERS),
-            bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
+            rpc_url,
+            batch_size: batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
+            batch_linger_ms: batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
+            max_inflight_batches: max_inflight_batches.unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
+            max_workers: max_workers.unwrap_or(DEFAULT_MAX_WORKERS),
+            bind_addr: bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
             redis,
         })
     }

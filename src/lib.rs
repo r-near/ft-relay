@@ -4,7 +4,7 @@ mod redis_queue;
 mod types;
 mod worker;
 
-pub use config::{RedisSettings, RelayConfig, RelayConfigBuilder};
+pub use config::{CliArgs, RedisSettings, RelayConfig, RelayConfigBuilder};
 pub use redis_queue::RedisQueue;
 
 use std::sync::Arc;
