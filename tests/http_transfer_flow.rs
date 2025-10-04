@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ft_relay::{http::build_router, RedisQueue};
+use ft_relay::{http::build_router, RedisQueue, RedisSettings};
 use redis::aio::ConnectionManager;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -15,7 +15,9 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
     let stream_key = format!("ftrelay:test:{}:stream", namespace);
     let consumer_group = format!("ftrelay:test:{}:group", namespace);
 
-    let queue = RedisQueue::new(&redis_url, stream_key.clone(), consumer_group).await?;
+    let queue_settings =
+        RedisSettings::new(redis_url.clone(), stream_key.clone(), consumer_group.clone());
+    let queue = RedisQueue::new(queue_settings).await?;
     let queue = std::sync::Arc::new(queue);
 
     // Flush Redis before test

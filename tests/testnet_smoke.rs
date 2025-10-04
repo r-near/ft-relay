@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Result};
 use dotenv::dotenv;
-use ft_relay::RelayConfig;
+use ft_relay::{RedisSettings, RelayConfig};
 use near_api_types::NearToken;
 use reqwest::StatusCode;
 
@@ -14,11 +14,11 @@ const TRANSFER_AMOUNT: &str = "1000000000000000000"; // 1 token
 const MEGA_BENCH_REQUESTS: usize = 60_000;
 const MEGA_BENCH_CONCURRENCY: usize = 100;
 
-fn test_redis_settings() -> (String, String, String) {
-    (
+fn test_redis_settings() -> RedisSettings {
+    RedisSettings::new(
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
-        "ftrelay:testnet:pending".to_string(),
-        "ftrelay:testnet:batcher".to_string(),
+        "ftrelay:testnet:pending",
+        "ftrelay:testnet:batcher",
     )
 }
 
@@ -87,7 +87,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
 
     let bind_addr = allocate_bind_addr()?;
 
-    let (redis_url, redis_stream_key, redis_consumer_group) = test_redis_settings();
+    let redis = test_redis_settings();
 
     let config = RelayConfig {
         token: harness.owner.account_id.clone(),
@@ -99,9 +99,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         max_inflight_batches: 500, // Higher for 60k
         max_workers: 3,
         bind_addr: bind_addr.clone(),
-        redis_url,
-        redis_stream_key,
-        redis_consumer_group,
+        redis,
     };
 
     println!("Server Configuration:");

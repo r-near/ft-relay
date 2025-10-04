@@ -7,7 +7,7 @@
 /// 4. Starts the relay API server
 /// 5. Runs benchmark with actual FT transfers
 /// 6. Verifies balances changed correctly
-use ft_relay::RelayConfig;
+use ft_relay::{RedisSettings, RelayConfig};
 use near_api::{NetworkConfig, RPCEndpoint, Signer};
 use near_api_types::NearToken;
 use near_primitives::action::{Action, DeployContractAction, FunctionCallAction};
@@ -215,7 +215,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("✅ {} access keys configured", secret_keys.len());
 
     // Start relay server with optimized config for high throughput
-    let (redis_url, redis_stream_key, redis_consumer_group) = test_redis_settings();
+    let redis = test_redis_settings();
 
     let config = RelayConfig {
         token: ft_owner.account_id.clone(),
@@ -227,9 +227,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         max_inflight_batches: 500, // High concurrency
         max_workers: 3,
         bind_addr: "127.0.0.1:18082".to_string(),
-        redis_url,
-        redis_stream_key,
-        redis_consumer_group,
+        redis,
     };
 
     println!("\nServer Configuration:");
@@ -512,10 +510,10 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 
     Ok(())
 }
-fn test_redis_settings() -> (String, String, String) {
-    (
-        "redis://127.0.0.1:6379".to_string(),
-        "ftrelay:pending".to_string(),
-        "ftrelay:batcher".to_string(),
+fn test_redis_settings() -> RedisSettings {
+    RedisSettings::new(
+        "redis://127.0.0.1:6379",
+        "ftrelay:pending",
+        "ftrelay:batcher",
     )
 }
