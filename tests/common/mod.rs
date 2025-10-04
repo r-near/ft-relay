@@ -81,6 +81,17 @@ impl TestnetHarness {
             "signer_pool_size must be at least 1"
         );
 
+        // Flush Redis before each test
+        if let Ok(redis_url) = std::env::var("REDIS_URL") {
+            println!("Flushing Redis at {}...", redis_url);
+            let client = redis::Client::open(redis_url)?;
+            let mut conn = client.get_multiplexed_async_connection().await?;
+            redis::cmd("FLUSHALL")
+                .query_async::<()>(&mut conn)
+                .await?;
+            println!("✅ Redis flushed");
+        }
+
         let rpc_url = std::env::var("TESTNET_RPC_URL")
             .or_else(|_| std::env::var("RPC_URL"))
             .context(
