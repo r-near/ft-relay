@@ -32,7 +32,6 @@ static ACCOUNT_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct OwnerCtx {
     pub account_id: AccountId,
     primary_secret: SecretKey,
-    signer: Arc<Signer>,
     signer_keys: Vec<SecretKey>,
 }
 
@@ -214,7 +213,6 @@ impl TestnetHarness {
             owner: OwnerCtx {
                 account_id: owner_id,
                 primary_secret: owner_secret_key,
-                signer: owner_signer,
                 signer_keys,
             },
             receivers,
@@ -231,33 +229,6 @@ impl TestnetHarness {
             .collect()
     }
 
-    pub async fn ft_transfer(&self, receiver_id: &AccountId, amount: &str) -> Result<()> {
-        let args = json!({
-            "receiver_id": receiver_id,
-            "amount": amount,
-        })
-        .to_string()
-        .into_bytes();
-
-        let action = Action::FunctionCall(Box::new(FunctionCallAction {
-            method_name: "ft_transfer".to_string(),
-            args,
-            gas: 30_000_000_000_000,
-            deposit: 1,
-        }));
-
-        let tx =
-            Transaction::construct(self.owner.account_id.clone(), self.owner.account_id.clone())
-                .add_action(action)
-                .with_signer(self.owner.signer.clone())
-                .send_to(&self.network)
-                .await
-                .context("failed to submit ft_transfer")?;
-
-        tx.assert_success();
-        println!("Transferred {} yocto tokens to {}", amount, receiver_id);
-        Ok(())
-    }
 
     pub async fn fetch_balance(&self, receiver_id: &AccountId) -> Result<String> {
         let args = json!({ "account_id": receiver_id });
