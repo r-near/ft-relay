@@ -7,7 +7,7 @@
 /// 4. Starts the relay API server
 /// 5. Runs benchmark with actual FT transfers
 /// 6. Verifies balances changed correctly
-use ft_relay::RelayConfig;
+use ft_relay::{RedisConfig, RelayConfig};
 use near_api::{NetworkConfig, RPCEndpoint, Signer};
 use near_api_types::NearToken;
 use near_primitives::action::{Action, DeployContractAction, FunctionCallAction};
@@ -113,6 +113,13 @@ async fn register_accounts(
 async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::try_init().ok();
 
+    // Flush Redis before test
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    redis::cmd("FLUSHALL")
+        .query_async::<()>(&mut redis_conn)
+        .await?;
+
     println!("\nIntegrated Test: Basic FT Transfer");
     println!("====================================");
 
@@ -143,9 +150,10 @@ async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
         secret_keys: vec![ft_owner.private_key.to_string()],
         rpc_url: sandbox.rpc_addr.clone(),
         batch_size: 1,
-        batch_linger_ms: 10,
+        batch_linger_ms: 20,
         max_inflight_batches: 10,
         bind_addr: "127.0.0.1:18080".to_string(),
+        redis: test_redis_config(),
     };
 
     tokio::spawn(async move {
@@ -172,7 +180,18 @@ async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await?;
+    let transfer_id = body["transfer_id"].as_str().expect("transfer_id present");
     println!("Transfer request accepted: {:?}", body);
+
+    // Check initial status is pending
+    let status_response = client
+        .get(format!("http://127.0.0.1:18080/v1/transfer/{}", transfer_id))
+        .send()
+        .await?;
+    assert_eq!(status_response.status(), 200);
+    let status_body: serde_json::Value = status_response.json().await?;
+    assert_eq!(status_body["status"], "pending");
+    println!("Initial status: {:?}", status_body);
 
     // Wait for transaction to process (batching + blockchain)
     println!("Waiting for transaction to process...");
@@ -200,6 +219,18 @@ async fn test_integrated_basic() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(balance, "1000000000000000000", "Balance should be 1 token");
 
+    // Verify transfer status now shows completed with tx_hash
+    let final_status_response = client
+        .get(format!("http://127.0.0.1:18080/v1/transfer/{}", transfer_id))
+        .send()
+        .await?;
+    assert_eq!(final_status_response.status(), 200);
+    let final_status_body: serde_json::Value = final_status_response.json().await?;
+    assert_eq!(final_status_body["status"], "completed");
+    assert!(final_status_body["tx_hash"].is_string(), "tx_hash should be present");
+    println!("Final status: {:?}", final_status_body);
+    println!("Transaction hash: {}", final_status_body["tx_hash"].as_str().unwrap());
+
     println!("\nIntegration test passed!");
 
     Ok(())
@@ -215,6 +246,13 @@ async fn test_integrated_load() -> Result<(), Box<dyn std::error::Error>> {
     .is_test(true)
     .try_init()
     .ok();
+
+    // Flush Redis before test
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    redis::cmd("FLUSHALL")
+        .query_async::<()>(&mut redis_conn)
+        .await?;
 
     println!("\nIntegrated Load Test: 1000 FT Transfers");
     println!("=========================================");
@@ -257,6 +295,7 @@ async fn test_integrated_load() -> Result<(), Box<dyn std::error::Error>> {
         batch_linger_ms: 20,
         max_inflight_batches: 50,
         bind_addr: "127.0.0.1:18081".to_string(),
+        redis: test_redis_config(),
     };
 
     let server_handle = tokio::spawn(async move {
@@ -425,6 +464,13 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     .try_init()
     .ok();
 
+    // Flush Redis before test
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    redis::cmd("FLUSHALL")
+        .query_async::<()>(&mut redis_conn)
+        .await?;
+
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  BOUNTY REQUIREMENT TEST: 60,000 Transfers in 10 Minutes  ║");
     println!("║  Target: ≥100 transfers/second sustained for 10 minutes   ║");
@@ -516,6 +562,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         batch_linger_ms: 20,       // Fast batching
         max_inflight_batches: 500, // High concurrency
         bind_addr: "127.0.0.1:18082".to_string(),
+        redis: test_redis_config(),
     };
 
     println!("\nServer Configuration:");
@@ -786,4 +833,11 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("   ╚════════════════════════════════════════════════════════════╝");
 
     Ok(())
+}
+fn test_redis_config() -> RedisConfig {
+    RedisConfig {
+        url: "redis://127.0.0.1:6379".to_string(),
+        stream_key: "ftrelay:pending".to_string(),
+        consumer_group: "ftrelay:batcher".to_string(),
+    }
 }

@@ -1,0 +1,24 @@
+services:
+  redis:
+    image: redis:8
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - redis-data:/data
+      - ./resources/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    ports:
+      - "6379:6379"
+
+  relay:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8080:8080"
+    command: ["/usr/local/bin/ft-relay", "--token", "your-ft-contract.testnet"]
+    env_file:
+      - .env
+
+volumes:
+  redis-data:
