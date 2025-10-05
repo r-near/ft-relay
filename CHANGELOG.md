@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/r-near/ft-relay/compare/v0.2.0...v0.3.0) (2025-10-05)
+
+
+### Features
+
+* better benchmarking ([41738fb](https://github.com/r-near/ft-relay/commit/41738fb14f2b11831d202e58cb00d5260ee4b01b))
+
 ## [0.2.0](https://github.com/r-near/ft-relay/compare/v0.1.3...v0.2.0) (2025-10-04)
 
 
