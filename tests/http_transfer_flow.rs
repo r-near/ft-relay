@@ -15,8 +15,11 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
     let stream_key = format!("ftrelay:test:{}:stream", namespace);
     let consumer_group = format!("ftrelay:test:{}:group", namespace);
 
-    let queue_settings =
-        RedisSettings::new(redis_url.clone(), stream_key.clone(), consumer_group.clone());
+    let queue_settings = RedisSettings::new(
+        redis_url.clone(),
+        stream_key.clone(),
+        consumer_group.clone(),
+    );
     let queue = RedisQueue::new(queue_settings).await?;
     let queue = std::sync::Arc::new(queue);
 

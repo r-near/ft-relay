@@ -8,11 +8,14 @@ use reqwest::StatusCode;
 
 mod common;
 
-use common::{allocate_bind_addr, default_faucet_wait, BalanceSummary, HarnessConfig, TestnetHarness};
+use common::{
+    allocate_bind_addr, default_faucet_wait, BalanceSummary, HarnessConfig, TestnetHarness,
+};
 
 const TRANSFER_AMOUNT: &str = "1000000000000000000"; // 1 token
 const MEGA_BENCH_REQUESTS: usize = 60_000;
 const MEGA_BENCH_CONCURRENCY: usize = 100;
+const YOCTO_PER_TRANSFER: u128 = 1_000_000_000_000_000_000;
 
 fn test_redis_settings() -> RedisSettings {
     RedisSettings::new(
@@ -61,7 +64,7 @@ async fn sixty_k_benchmark_test() -> Result<()> {
         label: "60k",
         receiver_count: 5,
         receiver_deposit: NearToken::from_millinear(200), // 0.2N per receiver
-        signer_pool_size: 50,                             // Large key pool, limited by max_workers=3
+        signer_pool_size: 50, // Large key pool, limited by max_workers=3
         faucet_wait: default_faucet_wait(),
     })
     .await?;
@@ -128,7 +131,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     println!("║  Concurrent HTTP workers: {}", MEGA_BENCH_CONCURRENCY);
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
-    let start = Instant::now();
+    let api_start = Instant::now();
     let requests_per_worker = MEGA_BENCH_REQUESTS / MEGA_BENCH_CONCURRENCY;
 
     let tasks: Vec<_> = (0..MEGA_BENCH_CONCURRENCY)
@@ -137,6 +140,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
             let endpoint = endpoint.clone();
             let receiver_ids = receiver_ids.clone();
             let receiver_count = receiver_ids.len();
+            let api_started_at = api_start;
 
             tokio::spawn(async move {
                 let mut worker_success = 0;
@@ -174,7 +178,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
 
                     // Progress indicator every 10k requests from worker 0
                     if worker_id == 0 && i > 0 && i % 10_000 == 0 {
-                        let elapsed = start.elapsed();
+                        let elapsed = api_started_at.elapsed();
                         let current_rate = i as f64 / elapsed.as_secs_f64();
                         println!(
                             "  Progress: {} requests in {:?} ({:.1} req/sec)",
@@ -193,8 +197,16 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         accepted += task.await.unwrap_or(0);
     }
 
-    let elapsed = start.elapsed();
-    let throughput = MEGA_BENCH_REQUESTS as f64 / elapsed.as_secs_f64();
+    let api_end = Instant::now();
+    let api_elapsed = api_end
+        .checked_duration_since(api_start)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let api_duration_secs = api_elapsed.as_secs_f64();
+    let api_throughput = if api_duration_secs > 0.0 {
+        accepted as f64 / api_duration_secs
+    } else {
+        0.0
+    };
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  HTTP REQUEST RESULTS                                      ║");
@@ -202,13 +214,13 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     println!("  Requests sent: {}", MEGA_BENCH_REQUESTS);
     println!("  Accepted: {}", accepted);
     println!("  Failed: {}", MEGA_BENCH_REQUESTS - accepted);
-    println!("  Duration: {:.2}s", elapsed.as_secs_f64());
-    println!("  Throughput: {:.2} req/sec", throughput);
+    println!("  API duration: {:.2}s", api_duration_secs);
+    println!("  API throughput: {:.2} req/sec", api_throughput);
     println!("  Target: ≥100 req/sec");
     let http_success_pct = (accepted as f64 / MEGA_BENCH_REQUESTS as f64) * 100.0;
     println!("  HTTP success rate: {:.2}%", http_success_pct);
 
-    if throughput >= 100.0 {
+    if api_throughput >= 100.0 {
         println!("  Status: ✅ PASSED");
     } else {
         println!("  Status: ❌ FAILED");
@@ -222,25 +234,26 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     );
 
     ensure!(
-        throughput >= 100.0,
+        api_throughput >= 100.0,
         "Throughput {:.2} req/sec below 100 req/sec requirement",
-        throughput
+        api_throughput
     );
 
     ensure!(
-        elapsed.as_secs() <= 600,
+        api_elapsed.as_secs() <= 600,
         "Took {:.2}s, should complete within 600s (10 minutes)",
-        elapsed.as_secs_f64()
+        api_duration_secs
     );
 
     // Poll for transactions to finalize on testnet (with retries for 100% success)
     println!("\n⏳ Polling for NEAR testnet to finalize balances...");
 
-    let expected_total = accepted as u128 * 1_000_000_000_000_000_000u128;
+    let expected_total = accepted as u128 * YOCTO_PER_TRANSFER;
     let poll_interval = Duration::from_secs(5);
     let max_polls = 60; // ~5 minutes max wait
 
     let mut final_totals: Option<BalanceSummary> = None;
+    let mut completion_instant: Option<Instant> = None;
 
     for poll in 1..=max_polls {
         let totals = harness.collect_balances().await?;
@@ -249,7 +262,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         println!(
             "  Poll {}: {} tokens ({:.2}% complete)",
             poll,
-            totals.total_tokens / 1_000_000_000_000_000_000,
+            totals.total_tokens / YOCTO_PER_TRANSFER,
             success_rate
         );
 
@@ -260,6 +273,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
                 poll * poll_interval.as_secs()
             );
             final_totals = Some(totals);
+            completion_instant = Some(Instant::now());
             break;
         }
 
@@ -269,6 +283,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
                 poll * poll_interval.as_secs()
             );
             final_totals = Some(totals);
+            completion_instant = Some(Instant::now());
             break;
         }
 
@@ -276,29 +291,60 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     }
 
     let final_totals = final_totals.expect("should have collected balances");
+    let completion_instant = completion_instant.unwrap_or_else(Instant::now);
+    let onchain_elapsed = completion_instant
+        .checked_duration_since(api_start)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let onchain_duration_secs = onchain_elapsed.as_secs_f64();
+    let post_api_elapsed = completion_instant
+        .checked_duration_since(api_end)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let post_api_duration_secs = post_api_elapsed.as_secs_f64();
+    let completed_transfers = (final_totals.total_tokens / YOCTO_PER_TRANSFER) as usize;
+    let blockchain_throughput = if onchain_duration_secs > 0.0 {
+        completed_transfers as f64 / onchain_duration_secs
+    } else {
+        0.0
+    };
+    let settlement_throughput = if post_api_duration_secs > 0.0 {
+        completed_transfers as f64 / post_api_duration_secs
+    } else {
+        0.0
+    };
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  ON-CHAIN VERIFICATION                                     ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!(
         "  Expected total: {} tokens",
-        expected_total / 1_000_000_000_000_000_000
+        expected_total / YOCTO_PER_TRANSFER
     );
     println!(
         "  Actual total:   {} tokens",
-        final_totals.total_tokens / 1_000_000_000_000_000_000
+        final_totals.total_tokens / YOCTO_PER_TRANSFER
     );
 
     let on_chain_success_pct = final_totals.total_tokens as f64 / expected_total as f64 * 100.0;
     println!("  On-chain success rate: {:.2}%", on_chain_success_pct);
+    println!(
+        "  Blockchain time: {:.2}s (from first request)",
+        onchain_duration_secs
+    );
+    println!(
+        "  Settlement lag: {:.2}s after API completion",
+        post_api_duration_secs
+    );
+    println!(
+        "  Blockchain throughput {:.2} tx/sec (completed)",
+        blockchain_throughput
+    );
+    if post_api_duration_secs > 0.0 {
+        println!("  Post-API throughput {:.2} tx/sec", settlement_throughput);
+    }
 
     println!("\nReceiver breakdown:");
     for (account, balance) in &final_totals.per_receiver {
-        println!(
-            "  {:<45} {} tokens",
-            account,
-            balance / 1_000_000_000_000_000_000
-        );
+        println!("  {:<45} {} tokens", account, balance / YOCTO_PER_TRANSFER);
     }
 
     ensure!(
@@ -311,7 +357,11 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     println!("   ║  TESTNET 60K BENCHMARK: ✅ PASSED                          ║");
     println!(
         "   ║  Successfully handled 60,000 transfers at {:.0}+ req/sec      ║",
-        throughput
+        api_throughput
+    );
+    println!(
+        "   ║  On-chain throughput {:.0}+ tx/sec (to completion)           ║",
+        blockchain_throughput
     );
     println!("   ║  All requirements satisfied!                               ║");
     println!("   ╚════════════════════════════════════════════════════════════╝");
@@ -320,8 +370,14 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     println!("\n--- BENCHMARK RESULTS (TESTNET) ---");
     println!("test_name: sixty_k_benchmark_test");
     println!("transfers: {}", MEGA_BENCH_REQUESTS);
-    println!("duration_secs: {:.2}", elapsed.as_secs_f64());
-    println!("throughput_req_per_sec: {:.2}", throughput);
+    println!("api_duration_secs: {:.2}", api_duration_secs);
+    println!("duration_secs: {:.2}", api_duration_secs);
+    println!("throughput_req_per_sec: {:.2}", api_throughput);
+    println!("blockchain_completion_secs: {:.2}", onchain_duration_secs);
+    println!(
+        "blockchain_throughput_req_per_sec: {:.2}",
+        blockchain_throughput
+    );
     println!("http_success_rate: {:.2}", http_success_pct);
     println!("onchain_success_rate: {:.2}", on_chain_success_pct);
     println!("status: PASSED");

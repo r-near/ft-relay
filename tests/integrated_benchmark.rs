@@ -16,10 +16,12 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
+const YOCTO_PER_TRANSFER: u128 = 1_000_000_000_000_000_000;
 
 /// Flush Redis before test
 async fn flush_redis() -> Result<(), Box<dyn std::error::Error>> {
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     println!("Flushing Redis at {}...", redis_url);
     let redis_client = redis::Client::open(redis_url)?;
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
@@ -259,7 +261,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("║  Concurrent HTTP workers: {}", concurrent_workers);
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
-    let start = Instant::now();
+    let api_start = Instant::now();
     let mut tasks = Vec::new();
     let batch_size = total_requests / concurrent_workers;
 
@@ -273,6 +275,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             start_idx + batch_size
         };
 
+        let api_started_at = api_start;
         let task = tokio::spawn(async move {
             let mut worker_success = 0;
             for i in start_idx..end_idx {
@@ -308,7 +311,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 
                 // Print progress every 10k requests
                 if i > 0 && i % 10_000 == 0 && worker_id == 0 {
-                    let elapsed = start.elapsed();
+                    let elapsed = api_started_at.elapsed();
                     let current_rate = i as f64 / elapsed.as_secs_f64();
                     println!(
                         "  Progress: {} requests in {:?} ({:.1} req/sec)",
@@ -326,8 +329,16 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         total_success += task.await.unwrap_or(0);
     }
 
-    let elapsed = start.elapsed();
-    let throughput = total_requests as f64 / elapsed.as_secs_f64();
+    let api_end = Instant::now();
+    let api_elapsed = api_end
+        .checked_duration_since(api_start)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let api_duration_secs = api_elapsed.as_secs_f64();
+    let api_throughput = if api_duration_secs > 0.0 {
+        total_success as f64 / api_duration_secs
+    } else {
+        0.0
+    };
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  HTTP REQUEST RESULTS                                      ║");
@@ -335,11 +346,11 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("  Total requests:  {}", total_requests);
     println!("  Accepted:        {}", total_success);
     println!("  Failed:          {}", total_requests - total_success);
-    println!("  Duration:        {:.2}s", elapsed.as_secs_f64());
-    println!("  Throughput:      {:.2} req/sec", throughput);
+    println!("  API duration:    {:.2}s", api_duration_secs);
+    println!("  API throughput:  {:.2} req/sec", api_throughput);
     println!("  Target:          ≥100 req/sec");
 
-    if throughput >= 100.0 {
+    if api_throughput >= 100.0 {
         println!("  Status:          ✅ PASSED");
     } else {
         println!("  Status:          ❌ FAILED");
@@ -358,13 +369,14 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         ..NetworkConfig::testnet()
     };
 
-    let expected_total = total_requests as u128 * 1_000_000_000_000_000_000;
+    let expected_total = total_requests as u128 * YOCTO_PER_TRANSFER;
     let poll_interval = Duration::from_secs(3);
     let max_polls = 60; // ~3 minutes max wait
 
     let mut final_balances = Vec::new();
     let mut final_total: u128 = 0;
     let mut final_success_rate = 0.0;
+    let mut completion_instant: Option<Instant> = None;
 
     for poll in 1..=max_polls {
         let mut balances = Vec::with_capacity(receiver_count);
@@ -392,7 +404,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         println!(
             "  Poll {}: {} tokens ({:.2}% complete)",
             poll,
-            total_balance / 1_000_000_000_000_000_000,
+            total_balance / YOCTO_PER_TRANSFER,
             final_success_rate
         );
 
@@ -404,6 +416,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             );
             final_balances = balances;
             final_total = total_balance;
+            completion_instant = Some(Instant::now());
             break;
         }
 
@@ -414,14 +427,35 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             );
             final_balances = balances;
             final_total = total_balance;
+            completion_instant = Some(Instant::now());
             break;
         }
 
         tokio::time::sleep(poll_interval).await;
     }
 
-    let expected_per_receiver =
-        (total_requests / receiver_count) as u128 * 1_000_000_000_000_000_000;
+    let expected_per_receiver = (total_requests / receiver_count) as u128 * YOCTO_PER_TRANSFER;
+
+    let completion_instant = completion_instant.unwrap_or_else(Instant::now);
+    let onchain_elapsed = completion_instant
+        .checked_duration_since(api_start)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let onchain_duration_secs = onchain_elapsed.as_secs_f64();
+    let post_api_elapsed = completion_instant
+        .checked_duration_since(api_end)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let post_api_duration_secs = post_api_elapsed.as_secs_f64();
+    let completed_transfers = (final_total / YOCTO_PER_TRANSFER) as usize;
+    let blockchain_throughput = if onchain_duration_secs > 0.0 {
+        completed_transfers as f64 / onchain_duration_secs
+    } else {
+        0.0
+    };
+    let settlement_throughput = if post_api_duration_secs > 0.0 {
+        completed_transfers as f64 / post_api_duration_secs
+    } else {
+        0.0
+    };
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!(
@@ -431,13 +465,28 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("╚════════════════════════════════════════════════════════════╝");
     println!(
         "  Expected total:     {} tokens",
-        expected_total / 1_000_000_000_000_000_000
+        expected_total / YOCTO_PER_TRANSFER
     );
     println!(
         "  Actual total:       {} tokens",
-        final_total / 1_000_000_000_000_000_000
+        final_total / YOCTO_PER_TRANSFER
     );
     println!("  Success rate:       {:.2}%", final_success_rate);
+    println!(
+        "  Blockchain time:    {:.2}s (from first request)",
+        onchain_duration_secs
+    );
+    println!(
+        "  Settlement lag:     {:.2}s after API completion",
+        post_api_duration_secs
+    );
+    println!(
+        "  Blockchain throughput {:.2} tx/sec (completed)",
+        blockchain_throughput
+    );
+    if post_api_duration_secs > 0.0 {
+        println!("  Post-API throughput {:.2} tx/sec", settlement_throughput);
+    }
 
     println!("\n  Receiver breakdown:");
     for (idx, (receiver, balance)) in receivers.iter().zip(final_balances.iter()).enumerate() {
@@ -445,8 +494,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             "    {:>2}: {:<20} {} tokens (expected: {})",
             idx,
             receiver.account_id,
-            balance / 1_000_000_000_000_000_000,
-            expected_per_receiver / 1_000_000_000_000_000_000
+            balance / YOCTO_PER_TRANSFER,
+            expected_per_receiver / YOCTO_PER_TRANSFER
         );
     }
 
@@ -454,10 +503,17 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("║  FINAL BOUNTY REQUIREMENT CHECK                            ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!("  ✓ Total transfers:   {} / 60,000", total_success);
-    println!("  ✓ Throughput:        {:.2} / ≥100 req/sec", throughput);
     println!(
-        "  ✓ Duration:          {:.2}s / ≤600s (10 min)",
-        elapsed.as_secs_f64()
+        "  ✓ API throughput:    {:.2} / ≥100 req/sec",
+        api_throughput
+    );
+    println!(
+        "  ✓ API duration:      {:.2}s / ≤600s (10 min)",
+        api_duration_secs
+    );
+    println!(
+        "  - On-chain throughput {:.2} tx/sec",
+        blockchain_throughput
     );
     let http_success_rate = (total_success as f64 / total_requests as f64) * 100.0;
     println!("  ✓ HTTP success:      {:.2}%", http_success_rate);
@@ -471,15 +527,15 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     );
 
     assert!(
-        throughput >= 100.0,
+        api_throughput >= 100.0,
         "❌ Failed: Throughput {:.2} req/sec is below 100 req/sec requirement",
-        throughput
+        api_throughput
     );
 
     assert!(
-        elapsed.as_secs() <= 600,
+        api_elapsed.as_secs() <= 600,
         "❌ Failed: Took {:.2}s, should complete within 600s (10 minutes)",
-        elapsed.as_secs_f64()
+        api_duration_secs
     );
 
     assert!(
@@ -492,7 +548,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("   ║  BOUNTY REQUIREMENTS: ✅ PASSED                            ║");
     println!(
         "   ║  Successfully handled 60,000 transfers at {:.0}+ req/sec     ║",
-        throughput
+        api_throughput
     );
     println!("   ║  All requirements satisfied!                               ║");
     println!("   ╚════════════════════════════════════════════════════════════╝");
@@ -501,8 +557,14 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("\n--- BENCHMARK RESULTS (SANDBOX) ---");
     println!("test_name: test_bounty_requirement_60k");
     println!("transfers: {}", total_requests);
-    println!("duration_secs: {:.2}", elapsed.as_secs_f64());
-    println!("throughput_req_per_sec: {:.2}", throughput);
+    println!("api_duration_secs: {:.2}", api_duration_secs);
+    println!("duration_secs: {:.2}", api_duration_secs);
+    println!("throughput_req_per_sec: {:.2}", api_throughput);
+    println!("blockchain_completion_secs: {:.2}", onchain_duration_secs);
+    println!(
+        "blockchain_throughput_req_per_sec: {:.2}",
+        blockchain_throughput
+    );
     println!("http_success_rate: {:.2}", http_success_rate);
     println!("onchain_success_rate: {:.2}", final_success_rate);
     println!("status: PASSED");
