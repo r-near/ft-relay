@@ -7,6 +7,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use uuid;
 
 use crate::{
     config::{MAX_GAS_PER_TX, STORAGE_DEPOSIT_AMOUNT, STORAGE_DEPOSIT_GAS_PER_ACTION},
@@ -30,51 +31,65 @@ pub struct RegistrationWorkerContext {
 }
 
 /// Dedicated worker that processes storage deposits
-/// Multiple workers can run concurrently since storage_deposit is idempotent
+/// Uses Redis Streams with consumer groups for distributed work
 pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<()> {
-    info!("registration worker started (poll interval: {}ms)", ctx.poll_interval_ms);
+    let consumer_name = format!("registration-{}", uuid::Uuid::new_v4());
+    info!("registration worker started: {}", consumer_name);
 
     loop {
-        // Get all accounts needing registration
-        let accounts = ctx.runtime.queue.get_accounts_needing_registration().await?;
+        // Pop a batch of registration requests from stream (with PEL autoclaim)
+        let batch = ctx.runtime.queue
+            .pop_registration_batch(&consumer_name, MAX_REGISTRATIONS_PER_TX)
+            .await?;
 
-        if accounts.is_empty() {
-            // No accounts need registration, sleep briefly
+        if batch.is_empty() {
+            // No registration requests, sleep briefly
             tokio::time::sleep(Duration::from_millis(ctx.poll_interval_ms)).await;
             continue;
         }
 
         info!(
-            "found {} account(s) needing registration",
-            accounts.len()
+            "claimed {} registration request(s)",
+            batch.len()
         );
 
-        // Process in batches of up to MAX_REGISTRATIONS_PER_TX
-        for batch in accounts.chunks(MAX_REGISTRATIONS_PER_TX) {
-            if let Err(err) = process_registration_batch(&ctx.runtime, batch).await {
-                warn!("failed to process registration batch: {err:?}");
-                // Continue to next batch even if this one fails
-            }
-        }
+        process_registration_batch(&ctx.runtime, batch).await;
     }
 }
 
 async fn process_registration_batch(
     runtime: &Arc<RegistrationWorkerRuntime>,
-    accounts: &[String],
+    batch: Vec<(String, String)>,
+) {
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        if let Err(err) = process_registration_batch_inner(&runtime, batch).await {
+            warn!("registration batch failed: {err:?}");
+            // Failed batches will be autoclaimed from PEL later
+        }
+    });
+}
+
+async fn process_registration_batch_inner(
+    runtime: &Arc<RegistrationWorkerRuntime>,
+    batch: Vec<(String, String)>,
 ) -> Result<()> {
-    info!("registering {} account(s)", accounts.len());
+    info!("registering {} account(s)", batch.len());
+
+    // Extract account_ids and redis_ids
+    let redis_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+    let account_ids: Vec<String> = batch.iter().map(|(_, acc)| acc.clone()).collect();
 
     // Build transaction with storage_deposit actions
     let mut actions = Vec::new();
-    let mut unique_accounts: HashSet<&str> = HashSet::new();
+    let mut unique_accounts: HashSet<String> = HashSet::new();
 
-    for account_id in accounts {
+    for account_id in &account_ids {
         // Deduplicate within batch
-        if unique_accounts.contains(account_id.as_str()) {
+        if unique_accounts.contains(account_id) {
             continue;
         }
-        unique_accounts.insert(account_id);
+        unique_accounts.insert(account_id.clone());
 
         let deposit_args = json!({
             "account_id": account_id,
@@ -128,7 +143,7 @@ async fn process_registration_batch(
 
     // Only pop pending transfers if tx succeeded
     // For each account, move pending transfers to ready stream
-    for account_id in unique_accounts {
+    for account_id in &unique_accounts {
         // Get all pending transfers for this account
         let pending_transfers = runtime
             .queue
@@ -158,6 +173,9 @@ async fn process_registration_batch(
             .mark_registered_and_enqueue(account_id, ready_transfers)
             .await?;
     }
+
+    // ACK all registration requests after successful processing
+    runtime.queue.ack_registrations(&redis_ids).await?;
 
     Ok(())
 }
