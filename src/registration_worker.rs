@@ -6,19 +6,20 @@ use near_primitives::action::{Action, FunctionCallAction};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
-use uuid;
 
 use crate::{
     config::{MAX_GAS_PER_TX, STORAGE_DEPOSIT_AMOUNT, STORAGE_DEPOSIT_GAS_PER_ACTION},
-    queue::TransferQueue,
-    transfer_states::Transfer,
+    redis_helpers,
+    stream_queue::{RegistrationRequest, StreamQueue},
 };
 
-const MAX_REGISTRATIONS_PER_TX: usize = (MAX_GAS_PER_TX / STORAGE_DEPOSIT_GAS_PER_ACTION) as usize; // ~60 with 5 TGas each
+const MAX_REGISTRATIONS_PER_TX: usize =
+    (MAX_GAS_PER_TX / STORAGE_DEPOSIT_GAS_PER_ACTION) as usize;
 
 pub struct RegistrationWorkerRuntime {
-    pub queue: Arc<TransferQueue>,
+    pub redis_client: redis::Client,
+    pub registration_queue: Arc<StreamQueue<RegistrationRequest>>,
+    pub ready_queue: Arc<StreamQueue<crate::transfer_states::Transfer<crate::transfer_states::ReadyToSend>>>,
     pub signer: Arc<Signer>,
     pub signer_account: AccountId,
     pub token: AccountId,
@@ -27,39 +28,32 @@ pub struct RegistrationWorkerRuntime {
 
 pub struct RegistrationWorkerContext {
     pub runtime: Arc<RegistrationWorkerRuntime>,
-    pub poll_interval_ms: u64,
+    pub linger_ms: u64,
 }
 
-/// Dedicated worker that processes storage deposits
-/// Uses Redis Streams with consumer groups for distributed work
+/// Registration worker - processes registration requests from the stream
 pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<()> {
-    let consumer_name = format!("registration-{}", uuid::Uuid::new_v4());
+    let consumer_name = format!("registration-{}", ::uuid::Uuid::new_v4());
     info!("registration worker started: {}", consumer_name);
 
     loop {
-        // Pop a batch of registration requests from stream (with PEL autoclaim)
-        let batch = ctx.runtime.queue
-            .pop_registration_batch(&consumer_name, MAX_REGISTRATIONS_PER_TX)
+        // Pop a batch of registration requests from stream (with PEL autoclaim + lingering)
+        let batch = ctx
+            .runtime
+            .registration_queue
+            .pop_batch(&consumer_name, MAX_REGISTRATIONS_PER_TX, ctx.linger_ms)
             .await?;
 
-        if batch.is_empty() {
-            // No registration requests, sleep briefly
-            tokio::time::sleep(Duration::from_millis(ctx.poll_interval_ms)).await;
-            continue;
+        if !batch.is_empty() {
+            info!("claimed {} registration request(s)", batch.len());
+            process_registration_batch(&ctx.runtime, batch).await;
         }
-
-        info!(
-            "claimed {} registration request(s)",
-            batch.len()
-        );
-
-        process_registration_batch(&ctx.runtime, batch).await;
     }
 }
 
 async fn process_registration_batch(
     runtime: &Arc<RegistrationWorkerRuntime>,
-    batch: Vec<(String, String)>,
+    batch: Vec<(String, RegistrationRequest)>,
 ) {
     let runtime = runtime.clone();
     tokio::spawn(async move {
@@ -72,13 +66,16 @@ async fn process_registration_batch(
 
 async fn process_registration_batch_inner(
     runtime: &Arc<RegistrationWorkerRuntime>,
-    batch: Vec<(String, String)>,
+    batch: Vec<(String, RegistrationRequest)>,
 ) -> Result<()> {
     info!("registering {} account(s)", batch.len());
 
     // Extract account_ids and redis_ids
     let redis_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-    let account_ids: Vec<String> = batch.iter().map(|(_, acc)| acc.clone()).collect();
+    let account_ids: Vec<String> = batch
+        .iter()
+        .map(|(_, req)| req.account_id.clone())
+        .collect();
 
     // Build transaction with storage_deposit actions
     let mut actions = Vec::new();
@@ -129,10 +126,7 @@ async fn process_registration_batch_inner(
             );
         }
         FinalExecutionStatus::Failure(err) => {
-            warn!(
-                "storage_deposit tx failed: {} - {:?}",
-                tx_hash, err
-            );
+            warn!("storage_deposit tx failed: {} - {:?}", tx_hash, err);
             return Err(anyhow::anyhow!("storage_deposit tx failed: {:?}", err));
         }
         status => {
@@ -142,13 +136,14 @@ async fn process_registration_batch_inner(
     }
 
     // Only pop pending transfers if tx succeeded
+    let mut conn = runtime.redis_client.get_multiplexed_async_connection().await?;
+    let token_str = runtime.token.to_string();
+
     // For each account, move pending transfers to ready stream
     for account_id in &unique_accounts {
         // Get all pending transfers for this account
-        let pending_transfers = runtime
-            .queue
-            .pop_pending_transfers(account_id)
-            .await?;
+        let pending_transfers =
+            redis_helpers::pop_pending_transfers(&mut conn, &token_str, account_id).await?;
 
         if pending_transfers.is_empty() {
             continue;
@@ -160,22 +155,33 @@ async fn process_registration_batch_inner(
             account_id
         );
 
-        // Transform to ReadyToSend and enqueue
-        let ready_transfers: Vec<Transfer<crate::transfer_states::ReadyToSend>> =
-            pending_transfers
-                .into_iter()
-                .map(|t| t.mark_registered())
-                .collect();
+        // Transform to ReadyToSend
+        let ready_transfers: Vec<crate::transfer_states::Transfer<crate::transfer_states::ReadyToSend>> = pending_transfers
+            .into_iter()
+            .map(|t| t.mark_registered())
+            .collect();
 
         // Mark as registered and enqueue all transfers atomically
-        runtime
-            .queue
-            .mark_registered_and_enqueue(account_id, ready_transfers)
-            .await?;
+        redis_helpers::mark_registered_and_push_to_stream(
+            &mut conn,
+            &token_str,
+            runtime.ready_queue.stream_key(),
+            account_id,
+            ready_transfers,
+        )
+        .await?;
+    }
+
+    // Remove accounts from pending registration set (cleanup for deduplication)
+    let pending_reg_key = format!("registration_pending:{}", token_str);
+    let account_ids_vec: Vec<&str> = unique_accounts.iter().map(|s| s.as_str()).collect();
+    if !account_ids_vec.is_empty() {
+        use redis::AsyncCommands;
+        let _: () = conn.srem(&pending_reg_key, &account_ids_vec).await?;
     }
 
     // ACK all registration requests after successful processing
-    runtime.queue.ack_registrations(&redis_ids).await?;
+    runtime.registration_queue.ack(&redis_ids).await?;
 
     Ok(())
 }

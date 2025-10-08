@@ -11,14 +11,16 @@ use uuid::Uuid;
 
 use crate::{
     config::{FT_TRANSFER_DEPOSIT, FT_TRANSFER_GAS_PER_ACTION, MAX_GAS_PER_TX},
-    queue::TransferQueue,
+    redis_helpers,
+    stream_queue::StreamQueue,
     transfer_states::{ReadyToSend, Transfer},
 };
 
 const MAX_NONCE_RETRIES: u32 = 3;
 
 pub struct TransferWorkerRuntime {
-    pub queue: Arc<TransferQueue>,
+    pub redis_client: redis::Client,
+    pub ready_queue: Arc<StreamQueue<Transfer<ReadyToSend>>>,
     pub signer: Arc<Signer>,
     pub signer_account: AccountId,
     pub token: AccountId,
@@ -42,8 +44,8 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
         // Pull batch from ready stream
         let batch = ctx
             .runtime
-            .queue
-            .pop_ready_batch(&consumer_name, max_transfers_per_tx, ctx.linger_ms)
+            .ready_queue
+            .pop_batch(&consumer_name, max_transfers_per_tx, ctx.linger_ms)
             .await?;
 
         if !batch.is_empty() {
@@ -94,8 +96,6 @@ async fn process_transfer_batch(
                 let tx_hash = outcome.transaction_outcome.id.to_string();
 
                 // Check overall transaction status
-                // When batching multiple actions to the same contract, they execute atomically
-                // Either all succeed or all fail together
                 match &outcome.status {
                     near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
                         info!("tx {} succeeded: {} transfers", tx_hash, batch.len());
@@ -109,12 +109,28 @@ async fn process_transfer_batch(
                             .collect();
 
                         // Mark all as completed
-                        if let Err(err) = runtime.queue.set_status(&transfer_ids, &tx_hash).await {
+                        let mut conn = match runtime.redis_client.get_multiplexed_async_connection().await {
+                            Ok(c) => c,
+                            Err(err) => {
+                                warn!("failed to get redis connection: {err:?}");
+                                return;
+                            }
+                        };
+
+                        let token_str = runtime.token.to_string();
+                        if let Err(err) = redis_helpers::set_transfers_completed(
+                            &mut conn,
+                            &token_str,
+                            &transfer_ids,
+                            &tx_hash,
+                        )
+                        .await
+                        {
                             warn!("failed to set transfer status: {err:?}");
                         }
 
                         // Ack all transfers
-                        if let Err(err) = runtime.queue.ack(&redis_ids).await {
+                        if let Err(err) = runtime.ready_queue.ack(&redis_ids).await {
                             warn!("failed to ack transfers: {err:?}");
                         }
                     }
@@ -134,14 +150,30 @@ async fn process_transfer_batch(
                                 "batch failed due to unregistered account(s), re-enqueueing all as pending"
                             );
 
+                            let mut conn = match runtime.redis_client.get_multiplexed_async_connection().await {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    warn!("failed to get redis connection: {err:?}");
+                                    return;
+                                }
+                            };
+
+                            let token_str = runtime.token.to_string();
+
                             // Re-enqueue all as pending and ack
                             for (redis_id, transfer) in &batch {
                                 let pending_transfer = transfer.clone().into_pending_registration();
-                                if let Err(err) =
-                                    runtime.queue.push_pending(&pending_transfer).await
+                                if let Err(err) = redis_helpers::push_to_pending_list(
+                                    &mut conn,
+                                    &token_str,
+                                    &pending_transfer,
+                                )
+                                .await
                                 {
                                     warn!("failed to re-enqueue transfer as pending: {err:?}");
-                                } else if let Err(err) = runtime.queue.ack(&[redis_id.clone()]).await {
+                                } else if let Err(err) =
+                                    runtime.ready_queue.ack(&[redis_id.clone()]).await
+                                {
                                     warn!("failed to ack re-enqueued transfer: {err:?}");
                                 }
                             }

@@ -1,12 +1,12 @@
 mod config;
 pub mod http;
-mod queue;
+pub mod redis_helpers;
 mod registration_worker;
+pub mod stream_queue;
 pub mod transfer_states;
 mod transfer_worker;
 
 pub use config::{CliArgs, RedisSettings, RelayConfig, RelayConfigBuilder};
-pub use queue::TransferQueue;
 
 use std::sync::Arc;
 
@@ -33,17 +33,37 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         ..NetworkConfig::testnet()
     };
 
-    let queue = Arc::new(
-        TransferQueue::new(
+    // Create Redis client for shared operations
+    let redis_client = redis::Client::open(redis.url.as_str())?;
+
+    // Create ready transfer stream queue
+    let ready_queue = Arc::new(
+        stream_queue::StreamQueue::new(
             &redis.url,
-            token.as_ref(),
-            &redis.stream_key,
-            &redis.consumer_group,
+            redis.stream_key.clone(),
+            redis.consumer_group.clone(),
         )
         .await?,
     );
 
-    let router = http::build_router(queue.clone(), token.clone());
+    // Create registration request stream queue
+    let registration_stream_key = format!("registration_requests:{}", token);
+    let registration_consumer_group = format!("registration_requests:{}:group", token);
+    let registration_queue = Arc::new(
+        stream_queue::StreamQueue::new(
+            &redis.url,
+            registration_stream_key,
+            registration_consumer_group,
+        )
+        .await?,
+    );
+
+    let router = http::build_router(
+        redis_client.clone(),
+        ready_queue.clone(),
+        registration_queue.clone(),
+        token.clone(),
+    );
 
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
@@ -67,20 +87,25 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(max_inflight_batches));
 
-    // Spawn registration worker (single dedicated worker)
+    // Spawn registration worker(s)
     let registration_runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
-        queue: queue.clone(),
+        redis_client: redis_client.clone(),
+        registration_queue: registration_queue.clone(),
+        ready_queue: ready_queue.clone(),
         signer: signer.clone(),
         signer_account: account_id.clone(),
         token: token.clone(),
         network: network.clone(),
     });
 
-    info!("spawning {} registration worker(s)", config::DEFAULT_MAX_REGISTRATION_WORKERS);
+    info!(
+        "spawning {} registration worker(s)",
+        config::DEFAULT_MAX_REGISTRATION_WORKERS
+    );
     for idx in 0..config::DEFAULT_MAX_REGISTRATION_WORKERS {
         let ctx = registration_worker::RegistrationWorkerContext {
             runtime: registration_runtime.clone(),
-            poll_interval_ms: batch_linger_ms,
+            linger_ms: batch_linger_ms,
         };
         tokio::spawn(async move {
             if let Err(err) = registration_worker::registration_worker_loop(ctx).await {
@@ -91,7 +116,8 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     // Spawn transfer workers
     let transfer_runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
-        queue: queue.clone(),
+        redis_client: redis_client.clone(),
+        ready_queue: ready_queue.clone(),
         signer: signer.clone(),
         signer_account: account_id.clone(),
         token: token.clone(),

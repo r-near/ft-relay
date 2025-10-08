@@ -16,8 +16,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    queue::TransferQueue,
-    transfer_states::{Transfer, PendingRegistration, ReadyToSend},
+    redis_helpers,
+    stream_queue::{RegistrationRequest, StreamQueue},
+    transfer_states::{PendingRegistration, ReadyToSend, Transfer},
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -30,12 +31,24 @@ pub struct TransferBody {
 
 #[derive(Clone)]
 struct AppState {
-    queue: Arc<TransferQueue>,
+    redis_client: redis::Client,
+    ready_queue: Arc<StreamQueue<Transfer<ReadyToSend>>>,
+    registration_queue: Arc<StreamQueue<RegistrationRequest>>,
     token: AccountId,
 }
 
-pub fn build_router(queue: Arc<TransferQueue>, token: AccountId) -> Router {
-    let state = AppState { queue, token };
+pub fn build_router(
+    redis_client: redis::Client,
+    ready_queue: Arc<StreamQueue<Transfer<ReadyToSend>>>,
+    registration_queue: Arc<StreamQueue<RegistrationRequest>>,
+    token: AccountId,
+) -> Router {
+    let state = AppState {
+        redis_client,
+        ready_queue,
+        registration_queue,
+        token,
+    };
 
     Router::new()
         .route("/v1/transfer", post(create_transfer))
@@ -54,11 +67,19 @@ async fn create_transfer(
         .unwrap_or(0);
 
     let receiver_str = body.receiver_id.to_string();
+    let token_str = state.token.to_string();
+
+    let mut conn = state
+        .redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|err| {
+            warn!("failed to connect to redis: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Check if account is already registered
-    let is_registered = state
-        .queue
-        .is_registered(&receiver_str)
+    let is_registered = redis_helpers::is_registered(&mut conn, &token_str, &receiver_str)
         .await
         .map_err(|err| {
             warn!("failed to check registration: {err:?}");
@@ -76,24 +97,62 @@ async fn create_transfer(
             enqueued_at,
         });
 
-        state.queue.push_ready(&transfer).await.map_err(|err| {
+        state.ready_queue.push(&transfer).await.map_err(|err| {
             warn!("failed to enqueue transfer: {err:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+        // Set status
+        redis_helpers::set_transfer_status(&mut conn, &token_str, &transfer_id, "ready")
+            .await
+            .map_err(|err| {
+                warn!("failed to set transfer status: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     } else {
-        // Account needs registration - enqueue to pending
+        // Account needs registration - enqueue to pending + registration stream
         let transfer = Transfer::<PendingRegistration>::new(
             transfer_id.clone(),
-            body.receiver_id,
+            body.receiver_id.clone(),
             body.amount,
             body.memo,
             enqueued_at,
         );
 
-        state.queue.push_pending(&transfer).await.map_err(|err| {
-            warn!("failed to enqueue pending transfer: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        // Push to pending list
+        redis_helpers::push_to_pending_list(&mut conn, &token_str, &transfer)
+            .await
+            .map_err(|err| {
+                warn!("failed to enqueue pending transfer: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Check if registration is already pending using SADD
+        // Only push to registration stream if this is the first request for this account
+        let pending_reg_key = format!("registration_pending:{}", token_str);
+        let newly_added: i32 = conn
+            .sadd(&pending_reg_key, &receiver_str)
+            .await
+            .map_err(|err| {
+                warn!("failed to check registration pending: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if newly_added == 1 {
+            // First time seeing this account - push to registration stream
+            let reg_request = RegistrationRequest {
+                account_id: body.receiver_id.to_string(),
+            };
+            state
+                .registration_queue
+                .push(&reg_request)
+                .await
+                .map_err(|err| {
+                    warn!("failed to enqueue registration request: {err:?}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
+        // else: registration already pending, transfer is in pending list and will be processed when registration completes
     }
 
     Ok(Json(json!({
@@ -107,8 +166,7 @@ async fn get_transfer_status(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut conn = state
-        .queue
-        .get_client()
+        .redis_client
         .get_multiplexed_async_connection()
         .await
         .map_err(|err| {

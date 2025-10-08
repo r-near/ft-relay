@@ -21,7 +21,6 @@ use serde_json::json;
 
 const FAUCET_URL: &str = "https://helper.nearprotocol.com/account";
 const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
-const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(125);
 const DEFAULT_FAUCET_WAIT: Duration = Duration::from_secs(2);
 const DEFAULT_RECEIVER_DEPOSIT: NearToken = NearToken::from_millinear(500);
 const DEFAULT_BENEFICIARY: &str = "testnet";

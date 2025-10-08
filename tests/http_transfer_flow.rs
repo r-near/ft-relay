@@ -1,7 +1,8 @@
 use anyhow::Result;
-use ft_relay::{http::build_router, TransferQueue};
+use ft_relay::http::build_router;
 use redis::aio::ConnectionManager;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -14,29 +15,48 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
     let namespace = Uuid::new_v4().to_string();
     let ready_stream_key = format!("ftrelay:test:{}:ready", namespace);
     let ready_consumer_group = format!("ftrelay:test:{}:ready_workers", namespace);
+    let registration_stream_key = format!("ftrelay:test:{}:registration", namespace);
+    let registration_consumer_group = format!("ftrelay:test:{}:registration_workers", namespace);
     let token: near_api_types::AccountId = "test.near".parse().unwrap();
 
-    let queue = TransferQueue::new(
-        &redis_url,
-        token.as_ref(),
-        &ready_stream_key,
-        &ready_consumer_group,
-    )
-    .await?;
-    let queue = std::sync::Arc::new(queue);
-
-    // Flush Redis before test
+    // Create Redis client and stream queues
     let redis_client = redis::Client::open(redis_url.clone())?;
     let mut redis_conn = ConnectionManager::new(redis_client.clone()).await?;
+
+    // Flush Redis before test
     redis::cmd("FLUSHALL")
         .query_async::<()>(&mut redis_conn)
         .await?;
+
+    // Create stream queues
+    let ready_queue = Arc::new(
+        ft_relay::stream_queue::StreamQueue::new(
+            &redis_url,
+            ready_stream_key.clone(),
+            ready_consumer_group.clone(),
+        )
+        .await?,
+    );
+
+    let registration_queue = Arc::new(
+        ft_relay::stream_queue::StreamQueue::new(
+            &redis_url,
+            registration_stream_key.clone(),
+            registration_consumer_group.clone(),
+        )
+        .await?,
+    );
 
     // Start HTTP server on an ephemeral port.
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = build_router(queue.clone(), token.clone());
+    let server = build_router(
+        redis_client.clone(),
+        ready_queue.clone(),
+        registration_queue.clone(),
+        token.clone(),
+    );
 
     tokio::spawn(async move {
         let _ = axum::serve(listener, server)
@@ -95,9 +115,14 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
 
     // Simulate worker setting tx_hash for first transfer
     let test_tx_hash = "ABC123DEF456HASH";
-    queue
-        .set_status(&[transfer_ids[0].clone()], test_tx_hash)
-        .await?;
+    let mut conn = redis_client.get_multiplexed_async_connection().await?;
+    ft_relay::redis_helpers::set_transfers_completed(
+        &mut conn,
+        token.as_ref(),
+        &[transfer_ids[0].clone()],
+        test_tx_hash,
+    )
+    .await?;
 
     // Test GET endpoint returns tx_hash when completed
     let resp = client
