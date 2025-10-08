@@ -1,7 +1,6 @@
 /// Test to reproduce the race condition in pop_pending_transfers
 /// This test demonstrates that transfers can be lost when HTTP handlers
 /// add new transfers between LRANGE and DEL operations.
-
 use ft_relay::redis_helpers;
 use ft_relay::transfer_states::{PendingRegistration, Transfer};
 use near_api_types::AccountId;
