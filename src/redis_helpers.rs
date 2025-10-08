@@ -55,21 +55,31 @@ where
 {
     let pending_key = format!("pending:{}:{}", token, account_id);
 
-    // Get all pending transfers and delete the list
-    let serialized_list: Vec<String> = redis::cmd("LRANGE")
-        .arg(&pending_key)
-        .arg(0)
-        .arg(-1)
-        .query_async(conn)
-        .await?;
+    // Atomically get all items and delete the list using Lua script
+    // This prevents race conditions where items are added between LRANGE and DEL
+    let lua_script = r#"
+        local items = redis.call('LRANGE', KEYS[1], 0, -1)
+        redis.call('DEL', KEYS[1])
+        return items
+    "#;
 
-    conn.del::<_, ()>(&pending_key).await?;
+    let serialized_list: Vec<String> = redis::Script::new(lua_script)
+        .key(&pending_key)
+        .invoke_async(conn)
+        .await?;
 
     // Deserialize all transfers
     let mut transfers = Vec::new();
     for s in serialized_list {
-        if let Ok(transfer) = Transfer::<PendingRegistration>::deserialize(&s) {
-            transfers.push(transfer);
+        match Transfer::<PendingRegistration>::deserialize(&s) {
+            Ok(transfer) => transfers.push(transfer),
+            Err(e) => {
+                log::warn!(
+                    "failed to deserialize pending transfer for {}: {:?}",
+                    account_id,
+                    e
+                );
+            }
         }
     }
 
