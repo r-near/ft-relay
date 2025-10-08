@@ -28,6 +28,9 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
         .query_async::<()>(&mut redis_conn)
         .await?;
 
+    // Create connection manager for HTTP server
+    let http_redis_conn = ConnectionManager::new(redis_client.clone()).await?;
+
     // Create stream queues
     let ready_queue = Arc::new(
         ft_relay::stream_queue::StreamQueue::new(
@@ -52,7 +55,7 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = build_router(
-        redis_client.clone(),
+        http_redis_conn,
         ready_queue.clone(),
         registration_queue.clone(),
         token.clone(),
