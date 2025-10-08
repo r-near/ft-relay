@@ -116,7 +116,7 @@ async fn get_transfer_status(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Check if completed (has tx_hash in status key)
+    // Check completion status (tx_hash in status key)
     let status_key = format!("status:{}:{}", state.token, id);
     let tx_hash: Option<String> = conn.get(&status_key).await.map_err(|err| {
         warn!("failed to get transfer status: {err:?}");
@@ -131,39 +131,31 @@ async fn get_transfer_status(
         })));
     }
 
-    // Check if in ready stream (search stream - expensive, but accurate)
-    // For production, consider caching or using a separate status tracking system
-    let ready_stream_key = format!("ready:{}", state.token);
-    let stream_result: Result<redis::streams::StreamReadReply, _> = redis::cmd("XRANGE")
-        .arg(&ready_stream_key)
-        .arg("-")
-        .arg("+")
-        .query_async(&mut conn)
-        .await;
+    // Check lifecycle status (O(1) lookup)
+    let transfer_status_key = format!("transfer:{}:{}", state.token, id);
+    let status: Option<String> = conn.get(&transfer_status_key).await.map_err(|err| {
+        warn!("failed to get transfer lifecycle status: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    if let Ok(reply) = stream_result {
-        for stream in reply.keys {
-            for entry in stream.ids {
-                if let Some(redis::Value::BulkString(bytes)) = entry.map.get("data") {
-                    if let Ok(s) = std::str::from_utf8(bytes) {
-                        if s.contains(&format!("\"transfer_id\":\"{}\"", id)) {
-                            return Ok(Json(json!({
-                                "transfer_id": id,
-                                "status": "ready",
-                                "message": "Waiting for worker to process transfer"
-                            })));
-                        }
-                    }
-                }
-            }
+    match status.as_deref() {
+        Some("ready") => Ok(Json(json!({
+            "transfer_id": id,
+            "status": "ready",
+            "message": "Waiting for worker to process transfer"
+        }))),
+        Some("pending_registration") => Ok(Json(json!({
+            "transfer_id": id,
+            "status": "pending_registration",
+            "message": "Waiting for account registration to complete"
+        }))),
+        _ => {
+            // Transfer not found or status expired
+            Ok(Json(json!({
+                "transfer_id": id,
+                "status": "unknown",
+                "message": "Transfer not found or status expired (1h TTL)"
+            })))
         }
     }
-
-    // Check if pending registration (check all pending lists - also expensive)
-    // For now, just return pending_registration if not in ready or completed
-    Ok(Json(json!({
-        "transfer_id": id,
-        "status": "pending_registration",
-        "message": "Waiting for account registration to complete"
-    })))
 }

@@ -79,8 +79,10 @@ impl TransferQueue {
     /// Push a transfer to pending list and mark account as needing registration
     pub async fn push_pending(&self, transfer: &Transfer<PendingRegistration>) -> Result<()> {
         let account_id = transfer.data().receiver_id.to_string();
+        let transfer_id = &transfer.data().transfer_id;
         let pending_key = format!("pending:{}:{}", self.token, account_id);
         let needs_reg_key = format!("needs_registration:{}", self.token);
+        let status_key = format!("transfer:{}:{}", self.token, transfer_id);
 
         let serialized = transfer.serialize()?;
         let mut conn = self.conn.lock().await;
@@ -90,6 +92,7 @@ impl TransferQueue {
         pipe.atomic();
         pipe.rpush(&pending_key, &serialized);  // Add to pending list
         pipe.sadd(&needs_reg_key, &account_id);  // Add to needs_registration set
+        pipe.set_ex(&status_key, "pending_registration", 3600);  // Set status
         pipe.query_async::<()>(&mut *conn).await?;
 
         Ok(())
@@ -147,14 +150,18 @@ impl TransferQueue {
         pipe.sadd(&registered_key, account_id);  // Mark as registered
         pipe.srem(&needs_reg_key, account_id);  // Remove from needs_registration
 
-        // Enqueue all transfers to ready stream
+        // Enqueue all transfers to ready stream and set their status
         for transfer in &transfers {
             let serialized = transfer.serialize()?;
+            let transfer_id = &transfer.data().transfer_id;
+            let status_key = format!("transfer:{}:{}", self.token, transfer_id);
+
             pipe.xadd(
                 &self.ready_stream_key,
                 "*",
                 &[("data", serialized.as_str())],
             );
+            pipe.set_ex(&status_key, "ready", 3600);  // Set status
         }
 
         pipe.query_async::<()>(&mut *conn).await?;
@@ -169,6 +176,8 @@ impl TransferQueue {
     /// Push a transfer directly to ready stream (for already-registered accounts)
     pub async fn push_ready(&self, transfer: &Transfer<ReadyToSend>) -> Result<()> {
         let serialized = transfer.serialize()?;
+        let transfer_id = &transfer.data().transfer_id;
+        let status_key = format!("transfer:{}:{}", self.token, transfer_id);
         let mut conn = self.conn.lock().await;
 
         conn.xadd::<_, _, _, _, ()>(
@@ -176,6 +185,8 @@ impl TransferQueue {
             "*",
             &[("data", &serialized)],
         ).await?;
+
+        conn.set_ex::<_, _, ()>(&status_key, "ready", 3600).await?;
 
         Ok(())
     }
@@ -266,6 +277,14 @@ impl TransferQueue {
         }
         cmd.query_async::<()>(&mut *conn).await?;
 
+        Ok(())
+    }
+
+    /// Set transfer status for a single transfer (for tracking lifecycle)
+    pub async fn set_transfer_status(&self, transfer_id: &str, status: &str) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        let key = format!("transfer:{}:{}", self.token, transfer_id);
+        conn.set_ex::<_, _, ()>(&key, status, 3600).await?; // 1h TTL
         Ok(())
     }
 
