@@ -31,20 +31,20 @@ pub struct TransferBody {
 
 #[derive(Clone)]
 struct AppState {
-    redis_client: redis::Client,
+    redis_conn: redis::aio::ConnectionManager,
     ready_queue: Arc<StreamQueue<Transfer<ReadyToSend>>>,
     registration_queue: Arc<StreamQueue<RegistrationRequest>>,
     token: AccountId,
 }
 
 pub fn build_router(
-    redis_client: redis::Client,
+    redis_conn: redis::aio::ConnectionManager,
     ready_queue: Arc<StreamQueue<Transfer<ReadyToSend>>>,
     registration_queue: Arc<StreamQueue<RegistrationRequest>>,
     token: AccountId,
 ) -> Router {
     let state = AppState {
-        redis_client,
+        redis_conn,
         ready_queue,
         registration_queue,
         token,
@@ -69,14 +69,7 @@ async fn create_transfer(
     let receiver_str = body.receiver_id.to_string();
     let token_str = state.token.to_string();
 
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|err| {
-            warn!("failed to connect to redis: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut conn = state.redis_conn.clone();
 
     // Check if account is already registered
     let is_registered = redis_helpers::is_registered(&mut conn, &token_str, &receiver_str)
@@ -165,14 +158,7 @@ async fn get_transfer_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|err| {
-            warn!("failed to connect to redis: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut conn = state.redis_conn.clone();
 
     // Check completion status (tx_hash in status key)
     let status_key = format!("status:{}:{}", state.token, id);

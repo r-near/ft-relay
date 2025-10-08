@@ -68,6 +68,7 @@ jobs:
           RUST_LOG: info,ft_relay=info,near_api=warn,tracing::span=warn
           RUST_BACKTRACE: 1
         run: |
+          set -o pipefail
           cargo test --all --locked -- --ignored --nocapture --test-threads=1 2>&1 | tee benchmark_output.txt
 
       - name: Extract and display benchmark results

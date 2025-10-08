@@ -36,6 +36,9 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     // Create Redis client for shared operations
     let redis_client = redis::Client::open(redis.url.as_str())?;
 
+    // Create connection manager for HTTP server (prevents connection exhaustion under load)
+    let http_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+
     // Create ready transfer stream queue
     let ready_queue = Arc::new(
         stream_queue::StreamQueue::new(
@@ -59,7 +62,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     );
 
     let router = http::build_router(
-        redis_client.clone(),
+        http_redis_conn,
         ready_queue.clone(),
         registration_queue.clone(),
         token.clone(),
