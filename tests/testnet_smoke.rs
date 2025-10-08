@@ -20,8 +20,10 @@ const YOCTO_PER_TRANSFER: u128 = 1_000_000_000_000_000_000;
 fn test_redis_settings() -> RedisSettings {
     RedisSettings::new(
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
-        "ftrelay:testnet:pending",
-        "ftrelay:testnet:batcher",
+        "ftrelay:testnet:ready",
+        "ftrelay:testnet:ready_workers",
+        "ftrelay:testnet:registrations",
+        "ftrelay:testnet:registration_workers",
     )
 }
 
@@ -97,8 +99,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         account_id: harness.owner.account_id.clone(),
         secret_keys: harness.relay_secret_keys(),
         rpc_url: harness.rpc_url.clone(),
-        batch_size: 90,
-        batch_linger_ms: 20,
+        batch_linger_ms: 500,
         max_inflight_batches: 500, // Higher for 60k
         max_workers: 3,
         bind_addr: bind_addr.clone(),
@@ -106,7 +107,6 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     };
 
     println!("Server Configuration:");
-    println!("  Batch size: {}", config.batch_size);
     println!("  Batch linger: {}ms", config.batch_linger_ms);
     println!("  Max inflight batches: {}", config.max_inflight_batches);
     println!("  Access keys: {}\n", config.secret_keys.len());

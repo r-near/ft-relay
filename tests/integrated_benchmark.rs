@@ -3,13 +3,11 @@
 /// This test:
 /// 1. Starts near-sandbox programmatically
 /// 2. Deploys the FT contract
-/// 3. Registers receiver accounts
-/// 4. Starts the relay API server
-/// 5. Runs benchmark with actual FT transfers
-/// 6. Verifies balances changed correctly
+/// 3. Starts the relay API server (with registration workers)
+/// 4. Runs benchmark with actual FT transfers
+/// 5. Verifies balances changed correctly (registration happens automatically)
 use ft_relay::{RedisSettings, RelayConfig};
 use near_api::{NetworkConfig, RPCEndpoint, Signer};
-use near_api_types::NearToken;
 use near_primitives::action::{Action, DeployContractAction, FunctionCallAction};
 use near_sandbox::{GenesisAccount, Sandbox, SandboxConfig};
 use serde_json::json;
@@ -80,49 +78,6 @@ async fn setup_ft_contract(
     Ok(())
 }
 
-/// Register accounts for storage
-async fn register_accounts(
-    sandbox: &Sandbox,
-    ft_owner: &GenesisAccount,
-    accounts: &[GenesisAccount],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let network = NetworkConfig {
-        network_name: "sandbox".to_string(),
-        rpc_endpoints: vec![RPCEndpoint::new(sandbox.rpc_addr.parse()?)],
-        ..NetworkConfig::testnet()
-    };
-
-    let signer = Signer::new(Signer::from_secret_key(ft_owner.private_key.parse()?))?;
-
-    for account in accounts {
-        let args = json!({
-            "account_id": account.account_id
-        })
-        .to_string()
-        .into_bytes();
-
-        let action = Action::FunctionCall(Box::new(FunctionCallAction {
-            method_name: "storage_deposit".to_string(),
-            args,
-            gas: 10_000_000_000_000, // 10 Tgas
-            deposit: NearToken::from_millinear(125).as_yoctonear(),
-        }));
-
-        let tx = near_api::Transaction::construct(
-            ft_owner.account_id.clone(),
-            ft_owner.account_id.clone(),
-        )
-        .add_action(action)
-        .with_signer(signer.clone())
-        .send_to(&network)
-        .await?;
-
-        tx.assert_success();
-    }
-
-    Ok(())
-}
-
 #[tokio::test]
 #[ignore] // Run with: cargo test --test integrated_benchmark bounty -- --ignored --nocapture
 async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,10 +123,6 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     // Deploy and setup
     setup_ft_contract(&sandbox, &ft_owner).await?;
     println!("✅ FT contract deployed and initialized");
-
-    println!("Registering {} receiver accounts...", receiver_count);
-    register_accounts(&sandbox, &ft_owner, &receivers).await?;
-    println!("✅ All receivers registered for storage");
 
     // Generate multiple access keys for better throughput (real-world usage pattern)
     println!("\nGenerating 3 access keys for key pooling...");
@@ -224,8 +175,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         account_id: ft_owner.account_id.clone(),
         secret_keys,
         rpc_url: sandbox.rpc_addr.clone(),
-        batch_size: 90,            // Max safe batch size
-        batch_linger_ms: 20,       // Fast batching
+        batch_linger_ms: 1000,     // Fast batching
         max_inflight_batches: 500, // High concurrency
         max_workers: 3,
         bind_addr: "127.0.0.1:18082".to_string(),
@@ -233,7 +183,6 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     };
 
     println!("\nServer Configuration:");
-    println!("  Batch size: {}", config.batch_size);
     println!("  Batch linger: {}ms", config.batch_linger_ms);
     println!("  Max inflight batches: {}", config.max_inflight_batches);
     println!("  Access keys: {}", config.secret_keys.len());
@@ -575,7 +524,9 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 fn test_redis_settings() -> RedisSettings {
     RedisSettings::new(
         "redis://127.0.0.1:6379",
-        "ftrelay:pending",
-        "ftrelay:batcher",
+        "ftrelay:ready",
+        "ftrelay:ready_workers",
+        "ftrelay:registrations",
+        "ftrelay:registration_workers",
     )
 }
