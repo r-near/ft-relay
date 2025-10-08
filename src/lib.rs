@@ -2,7 +2,7 @@ mod config;
 pub mod http;
 mod queue;
 mod registration_worker;
-mod transfer_states;
+pub mod transfer_states;
 mod transfer_worker;
 
 pub use config::{CliArgs, RedisSettings, RelayConfig, RelayConfigBuilder};

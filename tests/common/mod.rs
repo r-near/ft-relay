@@ -202,7 +202,6 @@ impl TestnetHarness {
                 config.receiver_deposit,
             )
             .await?;
-            register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
             receivers.push(receiver);
         }
 
@@ -446,35 +445,6 @@ async fn create_receiver_account(
         account_id: receiver_id,
         secret_key: receiver_secret,
     })
-}
-
-async fn register_storage(
-    network: &NetworkConfig,
-    signer: &Arc<Signer>,
-    owner_id: &AccountId,
-    receiver_id: &AccountId,
-) -> Result<()> {
-    let args = json!({ "account_id": receiver_id })
-        .to_string()
-        .into_bytes();
-
-    let action = Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "storage_deposit".to_string(),
-        args,
-        gas: 10_000_000_000_000,
-        deposit: STORAGE_DEPOSIT.as_yoctonear(),
-    }));
-
-    let tx = Transaction::construct(owner_id.clone(), owner_id.clone())
-        .add_action(action)
-        .with_signer(signer.clone())
-        .send_to(network)
-        .await
-        .context("failed to register receiver for storage")?;
-
-    tx.assert_success();
-    println!("Receiver {} registered for storage", receiver_id);
-    Ok(())
 }
 
 async fn add_function_access_keys(

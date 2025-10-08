@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use crate::transfer_states::{Transfer, PendingRegistration, ReadyToSend};
+use crate::transfer_states::{PendingRegistration, ReadyToSend, Transfer};
 
 /// Multi-stream queue architecture:
 /// 1. pending:{token}:{account_id} - List of Transfer<PendingRegistration> per account
@@ -90,9 +90,9 @@ impl TransferQueue {
         // Use pipeline for atomicity
         let mut pipe = redis::pipe();
         pipe.atomic();
-        pipe.rpush(&pending_key, &serialized);  // Add to pending list
-        pipe.sadd(&needs_reg_key, &account_id);  // Add to needs_registration set
-        pipe.set_ex(&status_key, "pending_registration", 3600);  // Set status
+        pipe.rpush(&pending_key, &serialized); // Add to pending list
+        pipe.sadd(&needs_reg_key, &account_id); // Add to needs_registration set
+        pipe.set_ex(&status_key, "pending_registration", 3600); // Set status
         pipe.query_async::<()>(&mut *conn).await?;
 
         Ok(())
@@ -107,7 +107,10 @@ impl TransferQueue {
     }
 
     /// Get all pending transfers for an account (and remove from pending list)
-    pub async fn pop_pending_transfers(&self, account_id: &str) -> Result<Vec<Transfer<PendingRegistration>>> {
+    pub async fn pop_pending_transfers(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<Transfer<PendingRegistration>>> {
         let pending_key = format!("pending:{}:{}", self.token, account_id);
         let mut conn = self.conn.lock().await;
 
@@ -147,8 +150,8 @@ impl TransferQueue {
         // Use pipeline for atomicity
         let mut pipe = redis::pipe();
         pipe.atomic();
-        pipe.sadd(&registered_key, account_id);  // Mark as registered
-        pipe.srem(&needs_reg_key, account_id);  // Remove from needs_registration
+        pipe.sadd(&registered_key, account_id); // Mark as registered
+        pipe.srem(&needs_reg_key, account_id); // Remove from needs_registration
 
         // Enqueue all transfers to ready stream and set their status
         for transfer in &transfers {
@@ -161,7 +164,7 @@ impl TransferQueue {
                 "*",
                 &[("data", serialized.as_str())],
             );
-            pipe.set_ex(&status_key, "ready", 3600);  // Set status
+            pipe.set_ex(&status_key, "ready", 3600); // Set status
         }
 
         pipe.query_async::<()>(&mut *conn).await?;
@@ -180,11 +183,8 @@ impl TransferQueue {
         let status_key = format!("transfer:{}:{}", self.token, transfer_id);
         let mut conn = self.conn.lock().await;
 
-        conn.xadd::<_, _, _, _, ()>(
-            &self.ready_stream_key,
-            "*",
-            &[("data", &serialized)],
-        ).await?;
+        conn.xadd::<_, _, _, _, ()>(&self.ready_stream_key, "*", &[("data", &serialized)])
+            .await?;
 
         conn.set_ex::<_, _, ()>(&status_key, "ready", 3600).await?;
 
@@ -201,8 +201,20 @@ impl TransferQueue {
     ) -> Result<Vec<(String, Transfer<ReadyToSend>)>> {
         let mut conn = self.client.get_multiplexed_async_connection().await?;
 
-        // Read whatever is available right now (non-blocking)
-        let mut collected = self.read_transfers(&mut conn, consumer_name, count, 0).await?;
+        // First, try to autoclaim idle messages from PEL (idle > 30s)
+        let mut collected = self.autoclaim_from_pel(&mut conn, consumer_name, count).await?;
+
+        // If we got enough from PEL, return early
+        if collected.len() >= count {
+            return Ok(collected);
+        }
+
+        // Read whatever is available right now (minimal block time - BLOCK 0 may have issues)
+        let remaining = count.saturating_sub(collected.len());
+        let mut more = self
+            .read_new_messages(&mut conn, consumer_name, remaining, 1)
+            .await?;
+        collected.append(&mut more);
 
         // If batch is full, return immediately
         if collected.len() >= count {
@@ -213,24 +225,112 @@ impl TransferQueue {
         if !collected.is_empty() {
             tokio::time::sleep(Duration::from_millis(linger_ms)).await;
             let remaining = count.saturating_sub(collected.len());
-            let more = self.read_transfers(&mut conn, consumer_name, remaining, 0).await?;
-            collected.extend(more);
+            let mut more = self
+                .read_new_messages(&mut conn, consumer_name, remaining, 1)
+                .await?;
+            collected.append(&mut more);
             return Ok(collected);
         }
 
         // Stream was empty - do a blocking wait
-        collected = self.read_transfers(&mut conn, consumer_name, count, linger_ms).await?;
+        let mut more = self
+            .read_new_messages(&mut conn, consumer_name, count, linger_ms)
+            .await?;
+        collected.append(&mut more);
         Ok(collected)
     }
 
-    /// Helper to read transfers from stream
-    async fn read_transfers(
+    /// Autoclaim idle messages from PEL
+    async fn autoclaim_from_pel(
+        &self,
+        conn: &mut redis::aio::MultiplexedConnection,
+        consumer_name: &str,
+        count: usize,
+    ) -> Result<Vec<(String, Transfer<ReadyToSend>)>> {
+        let mut transfers = Vec::new();
+
+        let autoclaim_result: redis::RedisResult<redis::Value> = redis::cmd("XAUTOCLAIM")
+            .arg(&self.ready_stream_key)
+            .arg(&self.ready_consumer_group)
+            .arg(consumer_name)
+            .arg(30000) // Min idle time: 30s
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(count)
+            .query_async(conn)
+            .await;
+
+        match &autoclaim_result {
+            Ok(redis::Value::Array(ref parts)) => {
+                if let Some(redis::Value::Array(entries)) = parts.get(1) {
+                    if !entries.is_empty() {
+                        log::info!("XAUTOCLAIM found {} idle messages to claim", entries.len());
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("XAUTOCLAIM failed: {:?}", e);
+            }
+            _ => {}
+        }
+
+        if let Ok(redis::Value::Array(ref parts)) = autoclaim_result {
+            // XAUTOCLAIM returns [next_id, [[id, [field, val, ...]], ...], [deleted_ids]]
+            if let Some(redis::Value::Array(entries)) = parts.get(1) {
+                for entry in entries {
+                    if let redis::Value::Array(ref pair) = entry {
+                        let id = pair.get(0).and_then(|v| {
+                            if let redis::Value::BulkString(b) = v {
+                                std::str::from_utf8(b).ok()
+                            } else {
+                                None
+                            }
+                        });
+                        let fields = pair.get(1).and_then(|v| {
+                            if let redis::Value::Array(f) = v {
+                                Some(f)
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let (Some(id), Some(fields)) = (id, fields) {
+                            // Fields are [key, val, key, val, ...]
+                            for chunk in fields.chunks(2) {
+                                if let [redis::Value::BulkString(k), redis::Value::BulkString(v)] =
+                                    chunk
+                                {
+                                    if k == b"data" {
+                                        if let Ok(s) = std::str::from_utf8(v) {
+                                            if let Ok(transfer) =
+                                                Transfer::<ReadyToSend>::deserialize(s)
+                                            {
+                                                transfers.push((id.to_string(), transfer));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(transfers)
+    }
+
+    /// Read new messages from stream (not from PEL)
+    async fn read_new_messages(
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
         consumer_name: &str,
         count: usize,
         block_ms: u64,
     ) -> Result<Vec<(String, Transfer<ReadyToSend>)>> {
+        let mut transfers = Vec::new();
+
         let result: redis::RedisResult<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(&self.ready_consumer_group)
@@ -245,7 +345,6 @@ impl TransferQueue {
             .query_async(conn)
             .await;
 
-        let mut transfers = Vec::new();
         if let Ok(reply) = result {
             for stream in reply.keys {
                 for id_data in stream.ids {
