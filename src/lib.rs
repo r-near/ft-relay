@@ -36,7 +36,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     let queue = Arc::new(
         TransferQueue::new(
             &redis.url,
-            &token.to_string(),
+            token.as_ref(),
             &redis.stream_key,
             &redis.consumer_group,
         )

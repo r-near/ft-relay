@@ -238,12 +238,10 @@ impl TransferQueue {
         if let Ok(reply) = result {
             for stream in reply.keys {
                 for id_data in stream.ids {
-                    if let Some(data_value) = id_data.map.get("data") {
-                        if let redis::Value::BulkString(bytes) = data_value {
-                            if let Ok(s) = std::str::from_utf8(bytes) {
-                                if let Ok(transfer) = Transfer::<ReadyToSend>::deserialize(s) {
-                                    transfers.push((id_data.id, transfer));
-                                }
+                    if let Some(redis::Value::BulkString(bytes)) = id_data.map.get("data") {
+                        if let Ok(s) = std::str::from_utf8(bytes) {
+                            if let Ok(transfer) = Transfer::<ReadyToSend>::deserialize(s) {
+                                transfers.push((id_data.id, transfer));
                             }
                         }
                     }

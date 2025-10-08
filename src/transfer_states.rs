@@ -98,7 +98,7 @@ impl Transfer<ReadyToSend> {
 
     /// Convert back to PendingRegistration (for re-registration cases)
     /// This happens when a transfer fails due to unregistered account
-    pub fn to_pending_registration(self) -> Transfer<PendingRegistration> {
+    pub fn into_pending_registration(self) -> Transfer<PendingRegistration> {
         Transfer {
             data: self.data,
             _state: PhantomData,

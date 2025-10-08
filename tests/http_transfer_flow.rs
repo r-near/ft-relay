@@ -18,7 +18,7 @@ async fn http_transfer_flow_returns_status() -> Result<()> {
 
     let queue = TransferQueue::new(
         &redis_url,
-        &token.to_string(),
+        token.as_ref(),
         &ready_stream_key,
         &ready_consumer_group,
     )

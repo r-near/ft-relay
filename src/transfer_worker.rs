@@ -136,15 +136,13 @@ async fn process_transfer_batch(
 
                             // Re-enqueue all as pending and ack
                             for (redis_id, transfer) in &batch {
-                                let pending_transfer = transfer.clone().to_pending_registration();
+                                let pending_transfer = transfer.clone().into_pending_registration();
                                 if let Err(err) =
                                     runtime.queue.push_pending(&pending_transfer).await
                                 {
                                     warn!("failed to re-enqueue transfer as pending: {err:?}");
-                                } else {
-                                    if let Err(err) = runtime.queue.ack(&[redis_id.clone()]).await {
-                                        warn!("failed to ack re-enqueued transfer: {err:?}");
-                                    }
+                                } else if let Err(err) = runtime.queue.ack(&[redis_id.clone()]).await {
+                                    warn!("failed to ack re-enqueued transfer: {err:?}");
                                 }
                             }
                         } else {
