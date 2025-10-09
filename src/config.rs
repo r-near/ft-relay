@@ -11,7 +11,7 @@ pub const STORAGE_DEPOSIT_GAS_PER_ACTION: u64 = 5_000_000_000_000; // 5 Tgas (al
 pub const MAX_GAS_PER_TX: u64 = 300_000_000_000_000; // 300 TGas
 pub const DEFAULT_BATCH_LINGER_MS: u64 = 20;
 pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 200;
-pub const DEFAULT_MAX_TRANSFER_WORKERS: usize = 3;
+pub const DEFAULT_MAX_TRANSFER_WORKERS: usize = 1;
 pub const DEFAULT_MAX_REGISTRATION_WORKERS: usize = 1;
 
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";

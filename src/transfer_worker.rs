@@ -166,8 +166,22 @@ async fn process_transfer_batch(
                 }
             }
             Err(err) => {
-                warn!("failed to submit batch: {err:?}");
-                handle_transfer_retry(&runtime, &batch).await;
+                let err_str = err.to_string();
+
+                // "Expired" means transaction was included in a block but execution may have failed
+                // Don't retry - nonce was consumed
+                // On-chain verification will count any tokens that actually transferred
+                if err_str.contains("Expired") {
+                    warn!("batch expired (nonce consumed): {err:?}");
+                    let redis_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+                    if let Err(ack_err) = runtime.ready_queue.ack(&redis_ids).await {
+                        warn!("failed to ack expired batch: {ack_err:?}");
+                    }
+                } else {
+                    // Other errors (network, etc.) are safe to retry
+                    warn!("failed to submit batch, will retry: {err:?}");
+                    handle_transfer_retry(&runtime, &batch).await;
+                }
             }
         }
     });
@@ -190,19 +204,16 @@ async fn handle_unregistered_retry(
     };
 
     let token_str = runtime.token.to_string();
+    let mut redis_ids_to_ack = Vec::new();
+    let mut exhausted_count = 0;
+    let mut requeued_count = 0;
 
     for (redis_id, transfer) in batch {
         // Check attempt count before converting to pending
         if transfer.data().attempts >= MAX_REGISTRATION_RETRY_ATTEMPTS {
-            warn!(
-                "transfer {} exceeded max registration retry attempts ({}), giving up",
-                transfer.data().transfer_id,
-                MAX_REGISTRATION_RETRY_ATTEMPTS
-            );
+            exhausted_count += 1;
+            redis_ids_to_ack.push(redis_id.clone());
             // TODO: Push to dead letter queue
-            if let Err(err) = runtime.ready_queue.ack(&[redis_id.clone()]).await {
-                warn!("failed to ack exhausted transfer: {err:?}");
-            }
             continue;
         }
 
@@ -221,16 +232,29 @@ async fn handle_unregistered_retry(
                 transfer.data().transfer_id
             );
         } else {
-            info!(
-                "re-enqueued transfer {} for registration (attempt {})",
-                transfer.data().transfer_id,
-                pending_transfer.data.attempts
-            );
+            requeued_count += 1;
+            redis_ids_to_ack.push(redis_id.clone());
         }
+    }
 
-        // ACK immediately - we've handled it
-        if let Err(err) = runtime.ready_queue.ack(&[redis_id.clone()]).await {
-            warn!("failed to ack transfer after re-enqueue: {err:?}");
+    // Log summary
+    if requeued_count > 0 {
+        info!(
+            "re-enqueued {} transfer(s) for registration retry",
+            requeued_count
+        );
+    }
+    if exhausted_count > 0 {
+        warn!(
+            "{} transfer(s) exceeded max registration retry attempts ({})",
+            exhausted_count, MAX_REGISTRATION_RETRY_ATTEMPTS
+        );
+    }
+
+    // ACK all at once
+    if !redis_ids_to_ack.is_empty() {
+        if let Err(err) = runtime.ready_queue.ack(&redis_ids_to_ack).await {
+            warn!("failed to ack {} transfers: {err:?}", redis_ids_to_ack.len());
         }
     }
 }
@@ -241,6 +265,10 @@ async fn handle_transfer_retry(
     batch: &[(String, Transfer<ReadyToSend>)],
 ) {
     const MAX_RETRY_ATTEMPTS: u32 = 5;
+
+    let mut redis_ids_to_ack = Vec::new();
+    let mut exhausted_count = 0;
+    let mut requeued_count = 0;
 
     for (redis_id, transfer) in batch {
         let failed = transfer.clone().mark_failed();
@@ -253,24 +281,31 @@ async fn handle_transfer_retry(
                     transfer.data().transfer_id
                 );
             } else {
-                info!(
-                    "re-enqueued transfer {} for retry (attempt {})",
-                    transfer.data().transfer_id,
-                    retry_transfer.data().attempts
-                );
+                requeued_count += 1;
+                redis_ids_to_ack.push(redis_id.clone());
             }
         } else {
-            warn!(
-                "transfer {} exceeded max retry attempts ({}), giving up",
-                transfer.data().transfer_id,
-                MAX_RETRY_ATTEMPTS
-            );
+            exhausted_count += 1;
+            redis_ids_to_ack.push(redis_id.clone());
             // TODO: Could push to dead letter queue here
         }
+    }
 
-        // ACK immediately - we've handled it explicitly
-        if let Err(err) = runtime.ready_queue.ack(&[redis_id.clone()]).await {
-            warn!("failed to ack transfer after retry handling: {err:?}");
+    // Log summary
+    if requeued_count > 0 {
+        info!("re-enqueued {} transfer(s) for retry", requeued_count);
+    }
+    if exhausted_count > 0 {
+        warn!(
+            "{} transfer(s) exceeded max retry attempts ({})",
+            exhausted_count, MAX_RETRY_ATTEMPTS
+        );
+    }
+
+    // ACK all at once
+    if !redis_ids_to_ack.is_empty() {
+        if let Err(err) = runtime.ready_queue.ack(&redis_ids_to_ack).await {
+            warn!("failed to ack {} transfers: {err:?}", redis_ids_to_ack.len());
         }
     }
 }
@@ -285,11 +320,28 @@ async fn submit_with_nonce_retry(
     let mut nonce_retry = 0;
 
     loop {
-        let result = near_api::Transaction::construct(signer_account.clone(), token.clone())
+        // Presign the transaction so we can get the hash before sending
+        let tx_builder = near_api::Transaction::construct(signer_account.clone(), token.clone())
             .add_actions(actions.clone())
-            .with_signer(signer.clone())
-            .send_to(network)
-            .await;
+            .with_signer(signer.clone());
+
+        let presigned = match tx_builder.presign_with(network).await {
+            Ok(p) => p,
+            Err(err) => {
+                warn!("failed to presign transaction: {err:?}");
+                return Err(err.into());
+            }
+        };
+
+        // Get the transaction hash before sending (without consuming presigned)
+        let tx_hash = match &presigned.tr {
+            near_api::advanced::TransactionableOrSigned::Signed((signed_tx, _)) => {
+                signed_tx.get_hash().to_string()
+            }
+            _ => "unknown".to_string(),
+        };
+
+        let result = presigned.send_to(network).await;
 
         match result {
             Ok(tx) => {
@@ -297,6 +349,7 @@ async fn submit_with_nonce_retry(
             }
             Err(err) => {
                 let err_str = err.to_string();
+                warn!("transaction {} failed: {err:?}", tx_hash);
 
                 // Check if it's an InvalidNonce error
                 if err_str.contains("InvalidNonce") && nonce_retry < MAX_NONCE_RETRIES {

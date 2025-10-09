@@ -101,7 +101,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         rpc_url: harness.rpc_url.clone(),
         batch_linger_ms: 500,
         max_inflight_batches: 500, // Higher for 60k
-        max_workers: 3,
+        max_workers: 1,
         bind_addr: bind_addr.clone(),
         redis,
     };
@@ -348,8 +348,10 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
     }
 
     ensure!(
-        on_chain_success_pct >= 100.0,
-        "On-chain success rate {:.2}% below 100% (expected all transfers to succeed)",
+        final_totals.total_tokens == expected_total,
+        "On-chain total mismatch: expected {} tokens, got {} tokens ({:.2}%)",
+        expected_total / YOCTO_PER_TRANSFER,
+        final_totals.total_tokens / YOCTO_PER_TRANSFER,
         on_chain_success_pct
     );
 

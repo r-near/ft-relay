@@ -192,6 +192,9 @@ async fn handle_registration_retry(
     runtime: &Arc<RegistrationWorkerRuntime>,
     batch: &[(String, RegistrationRequest)],
 ) {
+    let mut redis_ids_to_ack = Vec::new();
+    let mut requeued_count = 0;
+
     for (redis_id, request) in batch {
         // Re-push to registration queue for retry
         if let Err(err) = runtime.registration_queue.push(request).await {
@@ -200,12 +203,26 @@ async fn handle_registration_retry(
                 request.account_id
             );
         } else {
-            info!("re-enqueued registration request for {}", request.account_id);
+            requeued_count += 1;
+            redis_ids_to_ack.push(redis_id.clone());
         }
+    }
 
-        // ACK immediately - we've handled it explicitly
-        if let Err(err) = runtime.registration_queue.ack(&[redis_id.clone()]).await {
-            warn!("failed to ack registration after re-enqueue: {err:?}");
+    // Log summary
+    if requeued_count > 0 {
+        info!(
+            "re-enqueued {} registration request(s) for retry",
+            requeued_count
+        );
+    }
+
+    // ACK all at once
+    if !redis_ids_to_ack.is_empty() {
+        if let Err(err) = runtime.registration_queue.ack(&redis_ids_to_ack).await {
+            warn!(
+                "failed to ack {} registrations: {err:?}",
+                redis_ids_to_ack.len()
+            );
         }
     }
 }
