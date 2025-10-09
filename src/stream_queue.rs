@@ -137,7 +137,7 @@ impl<T: StreamMessage> StreamQueue<T> {
             .arg(&self.stream_key)
             .arg(&self.consumer_group)
             .arg(consumer_name)
-            .arg(30000) // Min idle time: 30s
+            .arg(180000) // Min idle time: 180s (3 minutes) - allows time for blockchain tx confirmation
             .arg("0-0")
             .arg("COUNT")
             .arg(count)

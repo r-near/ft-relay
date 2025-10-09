@@ -149,54 +149,130 @@ async fn process_transfer_batch(
                             info!(
                                 "batch failed due to unregistered account(s), re-enqueueing all as pending"
                             );
-
-                            let mut conn = match runtime.redis_client.get_multiplexed_async_connection().await {
-                                Ok(c) => c,
-                                Err(err) => {
-                                    warn!("failed to get redis connection: {err:?}");
-                                    return;
-                                }
-                            };
-
-                            let token_str = runtime.token.to_string();
-
-                            // Re-enqueue all as pending and ack
-                            for (redis_id, transfer) in &batch {
-                                let pending_transfer = transfer.clone().into_pending_registration();
-                                if let Err(err) = redis_helpers::push_to_pending_list(
-                                    &mut conn,
-                                    &token_str,
-                                    &pending_transfer,
-                                )
-                                .await
-                                {
-                                    warn!("failed to re-enqueue transfer as pending: {err:?}");
-                                } else if let Err(err) =
-                                    runtime.ready_queue.ack(&[redis_id.clone()]).await
-                                {
-                                    warn!("failed to ack re-enqueued transfer: {err:?}");
-                                }
-                            }
+                            handle_unregistered_retry(&runtime, &batch).await;
                         } else {
-                            // Other failure - don't ack, let Redis redeliver for retry
+                            // Other failure - explicitly retry with attempt tracking
                             warn!(
-                                "batch failed with error, will retry via Redis redelivery: {:?}",
+                                "batch failed with error, will retry with backoff: {:?}",
                                 tx_err
                             );
+                            handle_transfer_retry(&runtime, &batch).await;
                         }
                     }
                     status => {
                         warn!("tx {} unexpected status: {:?}", tx_hash, status);
-                        // Don't ack - let them retry
+                        handle_transfer_retry(&runtime, &batch).await;
                     }
                 }
             }
             Err(err) => {
                 warn!("failed to submit batch: {err:?}");
-                // Don't ack - let them be redelivered
+                handle_transfer_retry(&runtime, &batch).await;
             }
         }
     });
+}
+
+/// Handle transfers that failed due to unregistered accounts
+/// Converts back to PendingRegistration state with attempt tracking
+async fn handle_unregistered_retry(
+    runtime: &Arc<TransferWorkerRuntime>,
+    batch: &[(String, Transfer<ReadyToSend>)],
+) {
+    const MAX_REGISTRATION_RETRY_ATTEMPTS: u32 = 3;
+
+    let mut conn = match runtime.redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("failed to get redis connection: {err:?}");
+            return;
+        }
+    };
+
+    let token_str = runtime.token.to_string();
+
+    for (redis_id, transfer) in batch {
+        // Check attempt count before converting to pending
+        if transfer.data().attempts >= MAX_REGISTRATION_RETRY_ATTEMPTS {
+            warn!(
+                "transfer {} exceeded max registration retry attempts ({}), giving up",
+                transfer.data().transfer_id,
+                MAX_REGISTRATION_RETRY_ATTEMPTS
+            );
+            // TODO: Push to dead letter queue
+            if let Err(err) = runtime.ready_queue.ack(&[redis_id.clone()]).await {
+                warn!("failed to ack exhausted transfer: {err:?}");
+            }
+            continue;
+        }
+
+        let mut pending_transfer = transfer.clone().into_pending_registration();
+        pending_transfer.data.attempts += 1; // Track registration retry attempts
+
+        if let Err(err) = redis_helpers::push_to_pending_list(
+            &mut conn,
+            &token_str,
+            &pending_transfer,
+        )
+        .await
+        {
+            warn!(
+                "failed to re-enqueue transfer {} as pending: {err:?}",
+                transfer.data().transfer_id
+            );
+        } else {
+            info!(
+                "re-enqueued transfer {} for registration (attempt {})",
+                transfer.data().transfer_id,
+                pending_transfer.data.attempts
+            );
+        }
+
+        // ACK immediately - we've handled it
+        if let Err(err) = runtime.ready_queue.ack(&[redis_id.clone()]).await {
+            warn!("failed to ack transfer after re-enqueue: {err:?}");
+        }
+    }
+}
+
+/// Handle failed transfers by explicitly re-enqueuing with attempt tracking
+async fn handle_transfer_retry(
+    runtime: &Arc<TransferWorkerRuntime>,
+    batch: &[(String, Transfer<ReadyToSend>)],
+) {
+    const MAX_RETRY_ATTEMPTS: u32 = 5;
+
+    for (redis_id, transfer) in batch {
+        let failed = transfer.clone().mark_failed();
+
+        if let Some(retry_transfer) = failed.retry(MAX_RETRY_ATTEMPTS) {
+            // Re-push to ready queue for retry
+            if let Err(err) = runtime.ready_queue.push(&retry_transfer).await {
+                warn!(
+                    "failed to re-enqueue transfer {} for retry: {err:?}",
+                    transfer.data().transfer_id
+                );
+            } else {
+                info!(
+                    "re-enqueued transfer {} for retry (attempt {})",
+                    transfer.data().transfer_id,
+                    retry_transfer.data().attempts
+                );
+            }
+        } else {
+            warn!(
+                "transfer {} exceeded max retry attempts ({}), giving up",
+                transfer.data().transfer_id,
+                MAX_RETRY_ATTEMPTS
+            );
+            // TODO: Could push to dead letter queue here
+        }
+
+        // ACK immediately - we've handled it explicitly
+        if let Err(err) = runtime.ready_queue.ack(&[redis_id.clone()]).await {
+            warn!("failed to ack transfer after retry handling: {err:?}");
+        }
+    }
 }
 
 async fn submit_with_nonce_retry(

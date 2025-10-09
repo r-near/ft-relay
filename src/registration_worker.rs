@@ -57,16 +57,16 @@ async fn process_registration_batch(
 ) {
     let runtime = runtime.clone();
     tokio::spawn(async move {
-        if let Err(err) = process_registration_batch_inner(&runtime, batch).await {
+        if let Err(err) = process_registration_batch_inner(&runtime, &batch).await {
             warn!("registration batch failed: {err:?}");
-            // Failed batches will be autoclaimed from PEL later
+            handle_registration_retry(&runtime, &batch).await;
         }
     });
 }
 
 async fn process_registration_batch_inner(
     runtime: &Arc<RegistrationWorkerRuntime>,
-    batch: Vec<(String, RegistrationRequest)>,
+    batch: &[(String, RegistrationRequest)],
 ) -> Result<()> {
     info!("registering {} account(s)", batch.len());
 
@@ -184,4 +184,28 @@ async fn process_registration_batch_inner(
     runtime.registration_queue.ack(&redis_ids).await?;
 
     Ok(())
+}
+
+/// Handle failed registration attempts by explicitly re-enqueuing
+/// Note: RegistrationRequest doesn't track attempts since registration is idempotent
+async fn handle_registration_retry(
+    runtime: &Arc<RegistrationWorkerRuntime>,
+    batch: &[(String, RegistrationRequest)],
+) {
+    for (redis_id, request) in batch {
+        // Re-push to registration queue for retry
+        if let Err(err) = runtime.registration_queue.push(request).await {
+            warn!(
+                "failed to re-enqueue registration for {}: {err:?}",
+                request.account_id
+            );
+        } else {
+            info!("re-enqueued registration request for {}", request.account_id);
+        }
+
+        // ACK immediately - we've handled it explicitly
+        if let Err(err) = runtime.registration_queue.ack(&[redis_id.clone()]).await {
+            warn!("failed to ack registration after re-enqueue: {err:?}");
+        }
+    }
 }
