@@ -9,7 +9,9 @@
 use ft_relay::{RedisSettings, RelayConfig};
 use near_crypto::SecretKey;
 use near_jsonrpc_client::{methods, JsonRpcClient};
-use near_jsonrpc_primitives::types::{query::QueryResponseKind, transactions::RpcSendTransactionRequest};
+use near_jsonrpc_primitives::types::{
+    query::QueryResponseKind, transactions::RpcSendTransactionRequest,
+};
 use near_primitives::account::AccessKeyPermission;
 use near_primitives::action::{Action, AddKeyAction, DeployContractAction, FunctionCallAction};
 use near_primitives::transaction::{SignedTransaction, Transaction, TransactionV0};
@@ -173,11 +175,20 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("\nGenerating 3 access keys for key pooling...");
     let mut secret_keys = vec![ft_owner.private_key.to_string()];
 
-    // Add 2 more keys to the pool
+    // Generate 2 new keypairs upfront
+    let new_keys: Vec<SecretKey> = (0..2)
+        .map(|_| SecretKey::from_random(near_crypto::KeyType::ED25519))
+        .collect();
+    
+    println!("Adding 2 new access keys in a single batch transaction...");
+    for (i, key) in new_keys.iter().enumerate() {
+        println!("  Key {}: {}", i + 1, key.public_key());
+    }
+
     let client = JsonRpcClient::connect(&sandbox.rpc_addr);
     let owner_secret_key: SecretKey = ft_owner.private_key.parse()?;
 
-    // Get initial nonce once
+    // Get initial nonce
     let access_key_request = methods::query::RpcQueryRequest {
         block_reference: BlockReference::Finality(Finality::Final),
         request: near_primitives::views::QueryRequest::ViewAccessKey {
@@ -186,74 +197,73 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         },
     };
     let access_key_response = client.call(access_key_request).await?;
-    let mut current_nonce = match access_key_response.kind {
+    let current_nonce = match access_key_response.kind {
         QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
         _ => return Err("Unexpected response type".into()),
     };
 
-    for i in 1..3 {
-        println!("Adding access key {} of 2...", i);
-        
-        // Generate a new random keypair
-        let new_secret_key = SecretKey::from_random(near_crypto::KeyType::ED25519);
-        let new_public_key = new_secret_key.public_key();
-        println!("  Generated key: {}", new_public_key);
+    // Get block hash
+    let block_request = methods::block::RpcBlockRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+    };
+    let block = client.call(block_request).await?;
+    let block_hash = block.header.hash;
 
-        // Get block hash
-        let block_request = methods::block::RpcBlockRequest {
-            block_reference: BlockReference::Finality(Finality::Final),
-        };
-        let block = client.call(block_request).await?;
-        let block_hash = block.header.hash;
+    // Create AddKey actions for all new keys
+    let add_key_actions: Vec<Action> = new_keys
+        .iter()
+        .map(|key| {
+            Action::AddKey(Box::new(AddKeyAction {
+                public_key: key.public_key(),
+                access_key: near_primitives::account::AccessKey {
+                    nonce: 0,
+                    permission: AccessKeyPermission::FullAccess,
+                },
+            }))
+        })
+        .collect();
 
-        // Add the key to the account
-        let add_key_action = Action::AddKey(Box::new(AddKeyAction {
-            public_key: new_public_key.clone(),
-            access_key: near_primitives::account::AccessKey {
-                nonce: 0,
-                permission: AccessKeyPermission::FullAccess,
-            },
-        }));
+    // Submit all keys in a single transaction
+    let transaction = Transaction::V0(TransactionV0 {
+        signer_id: ft_owner.account_id.clone(),
+        public_key: owner_secret_key.public_key(),
+        nonce: current_nonce,
+        receiver_id: ft_owner.account_id.clone(),
+        block_hash,
+        actions: add_key_actions,
+    });
 
-        let transaction = Transaction::V0(TransactionV0 {
-            signer_id: ft_owner.account_id.clone(),
-            public_key: owner_secret_key.public_key(),
-            nonce: current_nonce,
-            receiver_id: ft_owner.account_id.clone(),
-            block_hash,
-            actions: vec![add_key_action],
-        });
+    let signature = owner_secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+    let signed_tx = SignedTransaction::new(signature, transaction);
 
-        let signature = owner_secret_key.sign(transaction.get_hash_and_size().0.as_ref());
-        let signed_tx = SignedTransaction::new(signature, transaction);
+    let broadcast_request = RpcSendTransactionRequest {
+        signed_transaction: signed_tx,
+        wait_until: TxExecutionStatus::Final,
+    };
+    let response = client.call(broadcast_request).await?;
 
-        let broadcast_request = RpcSendTransactionRequest {
-            signed_transaction: signed_tx,
-            wait_until: TxExecutionStatus::Final,
-        };
-        let response = client.call(broadcast_request).await?;
-
-        if let Some(outcome) = response.final_execution_outcome {
-            match outcome.into_outcome().status {
-                near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
-                    println!("  ✅ Key added successfully");
-                    secret_keys.push(new_secret_key.to_string());
-                    current_nonce += 1; // Increment nonce for next transaction
-                    
-                    // Wait for state to propagate - sandbox needs time
-                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                }
-                status => {
-                    return Err(format!("Add key transaction failed: {:?}", status).into());
+    if let Some(outcome) = response.final_execution_outcome {
+        match outcome.into_outcome().status {
+            near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
+                println!("  ✅ All keys added successfully in batch");
+                // Add all new keys to the pool
+                for key in new_keys {
+                    secret_keys.push(key.to_string());
                 }
             }
-        } else {
-            return Err("No execution outcome returned for add key transaction".into());
+            status => {
+                return Err(format!("Batch add key transaction failed: {:?}", status).into());
+            }
         }
+    } else {
+        return Err("No execution outcome returned for batch add key transaction".into());
     }
 
     // Verify all keys are actually on-chain before proceeding
-    println!("\nVerifying all {} access keys are on-chain...", secret_keys.len());
+    println!(
+        "\nVerifying all {} access keys are on-chain...",
+        secret_keys.len()
+    );
     for (idx, key_str) in secret_keys.iter().enumerate() {
         let verify_key: SecretKey = key_str.parse()?;
         let verify_request = methods::query::RpcQueryRequest {
@@ -263,7 +273,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                 public_key: verify_key.public_key(),
             },
         };
-        
+
         match client.call(verify_request).await {
             Ok(resp) => {
                 if let QueryResponseKind::AccessKey(_) = resp.kind {
@@ -271,12 +281,17 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                 }
             }
             Err(e) => {
-                return Err(format!("Failed to verify key {}: {:?}", verify_key.public_key(), e).into());
+                return Err(
+                    format!("Failed to verify key {}: {:?}", verify_key.public_key(), e).into(),
+                );
             }
         }
     }
-    
-    println!("✅ All {} access keys configured and verified", secret_keys.len());
+
+    println!(
+        "✅ All {} access keys configured and verified",
+        secret_keys.len()
+    );
 
     // Start relay server with optimized config for high throughput
     let redis = test_redis_settings();
@@ -286,10 +301,10 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         account_id: ft_owner.account_id.to_string(),
         secret_keys,
         rpc_url: sandbox.rpc_addr.clone(),
-        batch_linger_ms: 1000,     // Fast batching
-        batch_submit_delay_ms: 0,  // No throttling needed for sandbox
-        max_inflight_batches: 500, // High concurrency
-        max_workers: 3,            // 3 transfer workers
+        batch_linger_ms: 1000,       // Fast batching
+        batch_submit_delay_ms: 0,    // No throttling needed for sandbox
+        max_inflight_batches: 500,   // High concurrency
+        max_workers: 3,              // 3 transfer workers
         max_registration_workers: 1, // 1 registration worker
         max_verification_workers: 1, // 1 verification worker
         bind_addr: "127.0.0.1:18082".to_string(),
@@ -344,8 +359,12 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             for i in start_idx..end_idx {
                 let receiver_id = receivers[i % receiver_count].account_id.clone();
 
+                // Generate unique idempotency key for this request
+                let idempotency_key = format!("worker-{}-req-{}", worker_id, i);
+                
                 match client
                     .post("http://127.0.0.1:18082/v1/transfer")
+                    .header("X-Idempotency-Key", &idempotency_key)
                     .json(&json!({
                         "receiver_id": receiver_id,
                         "amount": "1000000000000000000" // 1 token each
