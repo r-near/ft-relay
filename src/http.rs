@@ -35,26 +35,16 @@ pub fn build_router(
 }
 
 async fn create_transfer(
-    State(_state): State<AppState>,
-    _headers: HeaderMap,
-    _body: Json<TransferRequest>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransferRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
     let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-    info!("[REQUEST_TRACE] HTTP request #{} - ENTRY", count);
+    info!("[REQUEST_TRACE] #{} - ENTRY", count);
     
-    // Early return to test if we can even reach here
-    Ok((
-        StatusCode::OK,
-        Json(json!({"test": "response", "request_num": count})),
-    ))
-    
-    /* Commented out for testing
-    let _state = _state;
-    let _headers = _headers;
-    let Json(_body) = _body;
-    
+    // Extract idempotency key
     let idempotency_key = headers
         .get("X-Idempotency-Key")
         .and_then(|v| v.to_str().ok())
@@ -63,6 +53,7 @@ async fn create_transfer(
     let transfer_id = match idempotency_key {
         Some(key) => key,
         None => {
+            warn!("[REQUEST_TRACE] #{} - Missing idempotency key", count);
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -73,6 +64,7 @@ async fn create_transfer(
     };
 
     if body.receiver_id.is_empty() {
+        warn!("[REQUEST_TRACE] #{} - Invalid receiver_id", count);
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -82,6 +74,7 @@ async fn create_transfer(
     }
 
     if body.amount.parse::<u128>().is_err() {
+        warn!("[REQUEST_TRACE] #{} - Invalid amount", count);
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -89,7 +82,21 @@ async fn create_transfer(
             }),
         ));
     }
-
+    
+    info!("[REQUEST_TRACE] #{} - Validation passed", count);
+    
+    // For now, return success without Redis operations
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "transfer_id": transfer_id,
+            "receiver_id": body.receiver_id,
+            "amount": body.amount,
+            "status": "TEST"
+        })),
+    ))
+    
+    /* REDIS OPERATIONS - Temporarily commented out
     let mut conn = state.redis_conn.clone();
 
     if let Some(existing) = rh::get_transfer_state(&mut conn, &transfer_id)
@@ -209,7 +216,7 @@ async fn create_transfer(
         StatusCode::CREATED,
         Json(serde_json::to_value(response).unwrap()),
     ))
-    */
+    END REDIS OPERATIONS */
 }
 
 async fn get_transfer_status(

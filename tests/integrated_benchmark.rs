@@ -373,7 +373,11 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         let api_started_at = api_start;
         let task = tokio::spawn(async move {
             let mut worker_success = 0;
+            let mut worker_errors = 0;
             for i in start_idx..end_idx {
+                if worker_id == 0 && i % 1000 == 0 {
+                    println!("Worker {} at request {}/{}", worker_id, i - start_idx, end_idx - start_idx);
+                }
                 let receiver_id = receivers[i % receiver_count].account_id.clone();
 
                 // Generate unique idempotency key for this request
@@ -402,7 +406,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                         }
                     }
                     Err(e) => {
-                        if worker_id == 0 && worker_success < 5 {
+                        worker_errors += 1;
+                        if worker_id == 0 && worker_errors < 5 {
                             eprintln!("❌ Worker {} request error: {:?}", worker_id, e);
                             if let Some(source) = e.source() {
                                 eprintln!("   Caused by: {:?}", source);
@@ -421,14 +426,17 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                     );
                 }
             }
-            worker_success
+            (worker_success, worker_errors)
         });
         tasks.push(task);
     }
 
     let mut total_success = 0;
+    let mut total_errors = 0;
     for task in tasks {
-        total_success += task.await.unwrap_or(0);
+        let (success, errors) = task.await.unwrap_or((0, 0));
+        total_success += success;
+        total_errors += errors;
     }
 
     let api_end = Instant::now();
@@ -447,7 +455,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("╚════════════════════════════════════════════════════════════╝");
     println!("  Total requests:  {}", total_requests);
     println!("  Accepted:        {}", total_success);
-    println!("  Failed:          {}", total_requests - total_success);
+    println!("  Errors:          {}", total_errors);
+    println!("  Other:           {}", total_requests - total_success - total_errors);
     println!("  API duration:    {:.2}s", api_duration_secs);
     println!("  API throughput:  {:.2} req/sec", api_throughput);
     println!("  Target:          ≥100 req/sec");
