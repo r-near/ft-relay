@@ -325,6 +325,8 @@ impl NearRpcClient {
     async fn get_block_hash(&self) -> Result<CryptoHash>;
     async fn broadcast_tx(&self, signed_tx: SignedTransaction) -> Result<CryptoHash>;
     async fn check_tx_status(&self, tx_hash: CryptoHash, sender: AccountId) -> Result<TxStatus>;
+    async fn register_account(&self, account: &AccountId, token: &AccountId) -> Result<CryptoHash>;
+    async fn get_access_key(&self, account: &AccountId, public_key: &PublicKey) -> Result<AccessKeyView>;
 }
 
 pub enum TxStatus {
@@ -332,6 +334,10 @@ pub enum TxStatus {
     Success(FinalExecutionOutcomeView),
     Failed(String),
 }
+```
+
+**Note on `register_account`:**
+Calls `storage_deposit` on the FT contract to register the account. This is a NEAR FT standard method that allocates storage for the account on the token contract. The relay account pays the storage deposit (~0.0125 NEAR per account).
 ```
 
 ### 8. Redis Helper
@@ -356,6 +362,8 @@ impl RedisHelper {
     async fn store_transfer_state(&self, key: &str, state: TransferState) -> Result<()>;
     async fn get_transfer_state(&self, key: &str) -> Result<Option<TransferState>>;
     async fn update_transfer_status(&self, key: &str, status: Status, tx_hash: Option<String>) -> Result<()>;
+    async fn update_tx_hash(&self, key: &str, tx_hash: &str) -> Result<()>;
+    async fn increment_retry_count(&self, key: &str) -> Result<u32>;  // Returns new count
     
     // Audit trail
     async fn log_event(&self, key: &str, event: Event) -> Result<()>;
@@ -365,7 +373,11 @@ impl RedisHelper {
     async fn is_registered(&self, account: &str) -> Result<bool>;
     async fn mark_registered(&self, account: &str) -> Result<()>;
     
-    // Streams
+    // Distributed locks
+    async fn set_nx_ex(&self, key: &str, value: &str, ttl_seconds: u64) -> Result<bool>;
+    async fn del(&self, key: &str) -> Result<()>;
+    
+    // Streams (reads current retry_count from transfer state)
     async fn enqueue_registration(&self, transfer_id: &str) -> Result<()>;
     async fn enqueue_transfer(&self, transfer_id: &str) -> Result<()>;
     async fn enqueue_verification(&self, transfer_id: &str, tx_hash: &str) -> Result<()>;
@@ -561,6 +573,8 @@ X-Idempotency-Key: request-abc-123
   "error": "Idempotency key already used with different parameters"
 }
 ```
+
+**Note:** The `X-Idempotency-Key` header value becomes the `transfer_id`. Throughout the system, we use `transfer_id` and `idempotency_key` interchangeably - they are the same value.
 
 ### GET /transfer/{idempotency_key}
 
@@ -1456,9 +1470,9 @@ enum CircuitState {
 #### 1.1 Project Setup
 - [ ] Create new branch `rearchitecture`
 - [ ] Update `Cargo.toml` dependencies:
-  - [ ] Add `near-jsonrpc-client = "0.8"`
-  - [ ] Add `near-primitives = "0.20"`
-  - [ ] Keep `near-crypto = "0.20"` (for signing)
+  - [ ] Add `near-jsonrpc-client = "0.18"`
+  - [ ] Add `near-primitives = "0.32"`
+  - [ ] Keep `near-crypto = "0.32"` (for signing)
   - [ ] Remove `near-api-rs` (if present)
   - [ ] Add `axum = "0.7"` (HTTP framework)
   - [ ] Add `redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }`
@@ -1468,6 +1482,7 @@ enum CircuitState {
   - [ ] Add `anyhow = "1"`
   - [ ] Add `uuid = { version = "1", features = ["v4"] }`
   - [ ] Add `chrono = { version = "0.4", features = ["serde"] }`
+  - [ ] Add `rand = "0.9"` (for random key selection in access key pool)
 
 #### 1.2 Core Data Structures
 - [ ] Create `src/types.rs`:
