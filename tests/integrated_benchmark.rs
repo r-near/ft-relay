@@ -271,7 +271,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         batch_linger_ms: 100, // Fast batching (100ms is enough with high load)
         batch_submit_delay_ms: 0, // No throttling needed for sandbox
         max_inflight_batches: 500, // High concurrency
-        max_workers: 1,       // 1 transfer worker
+        max_workers: 3,       // 1 transfer worker
         max_registration_workers: 1, // 1 registration worker (serial registration)
         max_verification_workers: 1, // 1 verification worker (no sleep needed, txs already Final)
         bind_addr: "127.0.0.1:18082".to_string(),
@@ -488,10 +488,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                 .query_async(&mut redis_conn)
                 .await?;
 
-            state_count += keys
-                .iter()
-                .filter(|k| !k.ends_with(":ev"))
-                .count() as u64;
+            state_count += keys.iter().filter(|k| !k.ends_with(":ev")).count() as u64;
 
             cursor = next_cursor;
             if cursor == 0 {
@@ -529,10 +526,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             .query_async(&mut redis_conn)
             .await?;
 
-        final_count += keys
-            .iter()
-            .filter(|k| !k.ends_with(":ev"))
-            .count() as u64;
+        final_count += keys.iter().filter(|k| !k.ends_with(":ev")).count() as u64;
 
         cursor = next_cursor;
         if cursor == 0 {
