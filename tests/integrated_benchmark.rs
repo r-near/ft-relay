@@ -499,9 +499,10 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         // Max 60 seconds
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        // Check registration stream (first in pipeline) to verify HTTP → Redis worked
         let stream_info: redis::Value = redis::cmd("XINFO")
             .arg("STREAM")
-            .arg("ftrelay:sandbox:verify")
+            .arg("ftrelay:sandbox:reg")
             .query_async(&mut redis_conn)
             .await?;
 
@@ -537,10 +538,10 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    // Get stream info to see total entries added
+    // Get stream info to see total entries added (check registration stream)
     let stream_info: redis::Value = redis::cmd("XINFO")
         .arg("STREAM")
-        .arg("ftrelay:sandbox:verify")
+        .arg("ftrelay:sandbox:reg")
         .query_async(&mut redis_conn)
         .await?;
 
@@ -559,7 +560,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     }
 
     let pending_count: u64 = redis::cmd("XLEN")
-        .arg("ftrelay:sandbox:verify")
+        .arg("ftrelay:sandbox:reg")
         .query_async(&mut redis_conn)
         .await?;
 
