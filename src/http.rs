@@ -29,7 +29,7 @@ pub fn build_router(
 
     Router::new()
         .route("/v1/transfer", post(create_transfer))
-        .route("/v1/transfer/:id", get(get_transfer_status))
+        .route("/v1/transfer/{id}", get(get_transfer_status))
         .route("/health", get(health_check))
         .with_state(state)
 }
