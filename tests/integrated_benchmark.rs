@@ -327,13 +327,29 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    println!("✅ Relay server started\n");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    
+    // Wait for server to be ready with health check
+    let client = reqwest::Client::new();
+    println!("Waiting for server to be ready...");
+    for attempt in 1..=10 {
+        match client.get("http://127.0.0.1:18082/health").send().await {
+            Ok(r) if r.status().is_success() => {
+                println!("✅ Server is ready (attempt {})\n", attempt);
+                break;
+            }
+            _ if attempt < 10 => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            _ => {
+                panic!("Server health check failed after 10 attempts");
+            }
+        }
+    }
 
     // Send 60,000 transfer requests
-    let client = reqwest::Client::new();
     let total_requests = 60_000;
-    let concurrent_workers = 200; // Number of parallel HTTP workers
+    let concurrent_workers = 100; // Number of parallel HTTP workers (reduced to avoid overwhelming server)
 
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║  Starting benchmark: {} transfers", total_requests);

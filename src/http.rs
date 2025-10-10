@@ -39,6 +39,13 @@ async fn create_transfer(
     headers: HeaderMap,
     Json(body): Json<TransferRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 10 || count % 1000 == 0 {
+        info!("HTTP request #{} received", count);
+    }
+    
     let idempotency_key = headers
         .get("X-Idempotency-Key")
         .and_then(|v| v.to_str().ok())
