@@ -85,32 +85,38 @@ async fn create_transfer(
     
     info!("[REQUEST_TRACE] #{} - Validation passed", count);
     
-    // For now, return success without Redis operations
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "transfer_id": transfer_id,
-            "receiver_id": body.receiver_id,
-            "amount": body.amount,
-            "status": "TEST"
-        })),
-    ))
-    
-    /* REDIS OPERATIONS - Temporarily commented out
+    // Step 1: Test Redis GET (idempotency check)
     let mut conn = state.redis_conn.clone();
+    info!("[REQUEST_TRACE] #{} - Redis conn cloned", count);
 
-    if let Some(existing) = rh::get_transfer_state(&mut conn, &transfer_id)
+    let existing_transfer = rh::get_transfer_state(&mut conn, &transfer_id)
         .await
         .map_err(|e| {
-            warn!("Redis error: {:?}", e);
+            warn!("[REQUEST_TRACE] #{} - Redis GET error: {:?}", count, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Internal server error".to_string(),
                 }),
             )
-        })?
-    {
+        })?;
+    
+    info!("[REQUEST_TRACE] #{} - Redis GET completed, existing: {}", count, existing_transfer.is_some());
+    
+    // For now, return success after Redis GET test
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "transfer_id": transfer_id,
+            "receiver_id": body.receiver_id,
+            "amount": body.amount,
+            "status": "REDIS_GET_OK",
+            "was_cached": existing_transfer.is_some()
+        })),
+    ))
+    
+    /* Temporarily commenting out the rest
+    if let Some(existing) = existing_transfer {
         if existing.receiver_id != body.receiver_id || existing.amount != body.amount {
             return Err((
                 StatusCode::CONFLICT,
