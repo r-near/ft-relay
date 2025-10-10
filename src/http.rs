@@ -38,16 +38,6 @@ async fn create_transfer(
     headers: HeaderMap,
     Json(body): Json<TransferRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-    
-    static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
-    let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-    let request_start = Instant::now();
-    
-    if count < 5 || count % 100 == 0 {
-        info!("[REQUEST_TRACE] #{} - ENTRY", count);
-    }
 
     // Extract idempotency key
     let idempotency_key = headers
@@ -58,7 +48,6 @@ async fn create_transfer(
     let transfer_id = match idempotency_key {
         Some(key) => key,
         None => {
-            warn!("[REQUEST_TRACE] #{} - Missing idempotency key", count);
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -69,7 +58,6 @@ async fn create_transfer(
     };
 
     if body.receiver_id.is_empty() {
-        warn!("[REQUEST_TRACE] #{} - Invalid receiver_id", count);
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -79,7 +67,6 @@ async fn create_transfer(
     }
 
     if body.amount.parse::<u128>().is_err() {
-        warn!("[REQUEST_TRACE] #{} - Invalid amount", count);
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -88,23 +75,11 @@ async fn create_transfer(
         ));
     }
 
-    if count < 5 {
-        info!("[REQUEST_TRACE] #{} - Validation passed", count);
-    }
-
-    // TIMING: Measure each operation
-    let start = Instant::now();
-
     // Clone connection (ConnectionManager is designed for concurrent use)
-    let clone_start = Instant::now();
     let mut conn = state.redis_conn.clone();
-    if count < 5 {
-        info!("[TIMING] #{} - Clone took {:?}", count, clone_start.elapsed());
-    }
 
     // FAST PATH: Just enqueue directly - no Redis state storage in HTTP handler
     // Workers will handle all the state management
-    let xadd_start = Instant::now();
     rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
         .await
         .map_err(|e| {
@@ -116,10 +91,6 @@ async fn create_transfer(
                 }),
             )
         })?;
-    if count < 5 {
-        info!("[TIMING] #{} - XADD took {:?}", count, xadd_start.elapsed());
-        info!("[TIMING] #{} - Total HTTP handler: {:?}", count, start.elapsed());
-    }
 
     // Return minimal response - worker will handle the rest
     let response = json!({
@@ -129,10 +100,6 @@ async fn create_transfer(
         "status": "QUEUED"
     });
 
-    if count < 5 || count % 100 == 0 {
-        info!("[TIMING] #{} - TOTAL REQUEST: {:?}", count, request_start.elapsed());
-    }
-    
     Ok((StatusCode::CREATED, Json(response)))
 }
 

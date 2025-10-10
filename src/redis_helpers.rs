@@ -222,9 +222,6 @@ pub async fn enqueue_registration<C>(
 where
     C: ConnectionLike + AsyncCommands + Send + Sync,
 {
-    use std::time::Instant;
-    
-    let start = Instant::now();
     let stream_key = format!("ftrelay:{}:reg", env);
     let msg = RegistrationMessage {
         transfer_id: transfer_id.to_string(),
@@ -232,14 +229,8 @@ where
     };
     let serialized = serde_json::to_string(&msg)?;
     
-    let xadd_start = Instant::now();
     conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())])
         .await?;
-    
-    let elapsed = start.elapsed();
-    if elapsed.as_millis() > 5 {
-        log::info!("[REDIS_TIMING] enqueue_registration took {:?} (XADD: {:?})", elapsed, xadd_start.elapsed());
-    }
     
     Ok(())
 }
