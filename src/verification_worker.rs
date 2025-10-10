@@ -191,20 +191,15 @@ async fn verify_transaction(
     let mut conn = ctx.runtime.redis_conn.clone();
     
     // Fast path: Check if tx_hash status is already cached in Redis
+    // If cached as completed/failed, the first worker already updated ALL transfers
+    // So we can just ACK and skip (no need to update again)
     if let Some(cached_status) = rh::get_tx_status(&mut conn, &msg.tx_hash).await? {
-        info!("Tx {} status cached: {}", msg.tx_hash, cached_status);
+        info!("Tx {} status already cached: {} (transfer {} already updated by first worker)", 
+              msg.tx_hash, cached_status, msg.transfer_id);
         
         match cached_status.as_str() {
-            "completed" => {
-                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Completed).await?;
-                rh::log_event(&mut conn, &msg.transfer_id, Event::new("COMPLETED")).await?;
-                return Ok(VerificationResult::Completed);
-            }
-            "failed" => {
-                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed).await?;
-                rh::log_event(&mut conn, &msg.transfer_id, Event::new("FAILED").with_reason("Cached failure".to_string())).await?;
-                return Ok(VerificationResult::Failed("Cached failure".to_string()));
-            }
+            "completed" => return Ok(VerificationResult::Completed),
+            "failed" => return Ok(VerificationResult::Failed("Cached failure".to_string())),
             _ => {} // "pending" - fall through to RPC check
         }
     }
