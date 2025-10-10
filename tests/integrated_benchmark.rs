@@ -457,106 +457,102 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         panic!("❌ Server task died during benchmark!");
     }
 
-    // Verify Redis received all accepted requests
+    // Verify Redis recorded a TransferState for every accepted HTTP request
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║  REDIS QUEUE VERIFICATION                                  ║");
     println!("╚════════════════════════════════════════════════════════════╝");
-
-    // Wait for all HTTP requests to be added to Redis AND
-    // for registration workers AND transfer workers to finish processing
-    println!("  Waiting for all workers to complete processing...");
+    println!("  Verifying transfer state keys match HTTP 200 responses...");
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let redis_client = redis::Client::open(redis_url)?;
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
 
-    // Poll until count stabilizes (indicating all workers finished)
+    // Poll using SCAN to count `transfer:*` state keys (exclude `:ev` event lists)
     let mut prev_count = 0u64;
     let mut stable_count = 0;
+    let expected = total_success as u64;
+
     for _ in 0..60 {
-        // Max 60 seconds
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // Check transfers stream to verify HTTP → Redis worked
-        let stream_info: redis::Value = redis::cmd("XINFO")
-            .arg("STREAM")
-            .arg("ftrelay:sandbox:xfer")
-            .query_async(&mut redis_conn)
-            .await?;
+        let mut cursor: u64 = 0;
+        let mut state_count: u64 = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("transfer:*")
+                .arg("COUNT")
+                .arg(2000)
+                .query_async(&mut redis_conn)
+                .await?;
 
-        let mut entries_added = 0u64;
-        if let redis::Value::Array(info) = stream_info {
-            for i in (0..info.len()).step_by(2) {
-                if let Some(redis::Value::BulkString(key)) = info.get(i) {
-                    if key == b"entries-added" {
-                        if let Some(redis::Value::Int(count)) = info.get(i + 1) {
-                            entries_added = *count as u64;
-                            break;
-                        }
-                    }
-                }
+            state_count += keys
+                .iter()
+                .filter(|k| !k.ends_with(":ev"))
+                .count() as u64;
+
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
             }
         }
 
-        if entries_added == prev_count {
+        if state_count == prev_count {
             stable_count += 1;
             if stable_count >= 3 {
-                // Stable for 3 seconds
-                println!("  Count stabilized at {} entries", entries_added);
+                println!("  Count stabilized at {} keys", state_count);
                 break;
             }
         } else {
             stable_count = 0;
         }
-        prev_count = entries_added;
+        prev_count = state_count;
 
-        if entries_added >= total_success as u64 {
-            println!("  All {} entries accounted for!", total_success);
+        if state_count >= expected {
+            println!("  All {} transfer states observed!", expected);
             break;
         }
     }
 
-    // Get stream info to see total entries added (check registration stream)
-    let stream_info: redis::Value = redis::cmd("XINFO")
-        .arg("STREAM")
-        .arg("ftrelay:sandbox:reg")
-        .query_async(&mut redis_conn)
-        .await?;
+    // Final count
+    let mut cursor: u64 = 0;
+    let mut final_count: u64 = 0;
+    loop {
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("transfer:*")
+            .arg("COUNT")
+            .arg(2000)
+            .query_async(&mut redis_conn)
+            .await?;
 
-    let mut entries_added = 0u64;
-    if let redis::Value::Array(info) = stream_info {
-        for i in (0..info.len()).step_by(2) {
-            if let Some(redis::Value::BulkString(key)) = info.get(i) {
-                if key == b"entries-added" {
-                    if let Some(redis::Value::Int(count)) = info.get(i + 1) {
-                        entries_added = *count as u64;
-                        break;
-                    }
-                }
-            }
+        final_count += keys
+            .iter()
+            .filter(|k| !k.ends_with(":ev"))
+            .count() as u64;
+
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
         }
     }
 
-    let pending_count: u64 = redis::cmd("XLEN")
-        .arg("ftrelay:sandbox:reg")
-        .query_async(&mut redis_conn)
-        .await?;
+    println!("  HTTP 200 responses:     {}", total_success);
+    println!("  Transfer state keys:    {}", final_count);
 
-    println!("  HTTP 200 responses:  {}", total_success);
-    println!("  Redis entries added: {}", entries_added);
-    println!("  Currently pending:   {}", pending_count);
-
-    if entries_added != total_success as u64 {
-        println!("  Status:              ❌ MISMATCH");
+    if final_count != expected {
+        println!("  Status:                 ❌ MISMATCH");
         panic!(
-            "❌ Redis verification failed: {} HTTP requests accepted but only {} entries in Redis (lost {} transfers)",
+            "❌ Redis verification failed: {} HTTP requests accepted but only {} transfer states stored (lost {})",
             total_success,
-            entries_added,
-            total_success as u64 - entries_added
+            final_count,
+            expected.saturating_sub(final_count)
         );
     } else {
-        println!("  Status:              ✅ VERIFIED");
+        println!("  Status:                 ✅ VERIFIED");
     }
 
     println!("\n⏳ Waiting for NEAR to finalize balances...");
