@@ -1,8 +1,8 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use redis::aio::ConnectionManager;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::access_key_pool::AccessKeyPool;
@@ -12,6 +12,7 @@ use crate::rpc_client::NearRpcClient;
 use crate::types::{AccountId, Event, RegistrationMessage, Status};
 
 const MAX_RETRIES: u32 = 10;
+const MAX_REGISTRATIONS_PER_BATCH: usize = 50;
 
 pub struct RegistrationWorkerRuntime {
     pub redis_conn: ConnectionManager,
@@ -53,36 +54,31 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
             &stream_key,
             &consumer_group,
             &consumer_name,
-            50,
+            MAX_REGISTRATIONS_PER_BATCH,
             ctx.linger_ms,
         )
         .await
         {
             Ok(b) => b,
             Err(e) => {
-                warn!("Error popping batch: {:?}", e);
+                debug!("No registration messages: {:?}", e);
                 continue;
             }
         };
 
-        for (stream_id, msg) in batch {
-            match process_registration(&ctx, &msg).await {
-                Ok(_) => {
-                    let _ =
-                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
-                }
-                Err(e) => {
-                    warn!(
-                        "Error processing registration for {}: {:?}",
-                        msg.transfer_id, e
-                    );
+        if batch.is_empty() {
+            continue;
+        }
 
-                    let _ =
-                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
-
+        match process_registration_batch(&ctx, &batch, &stream_key, &consumer_group).await {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("Batch processing error: {:?}", e);
+                // Re-enqueue with retry
+                for (stream_id, msg) in &batch {
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
                     let retry_count = msg.retry_count + 1;
                     if retry_count < MAX_RETRIES {
-                        let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
                         let _ = rh::enqueue_registration(
                             &mut conn,
                             &ctx.runtime.env,
@@ -91,9 +87,7 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
                         )
                         .await;
                     } else {
-                        let _ =
-                            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed)
-                                .await;
+                        let _ = rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed).await;
                         let _ = rh::log_event(
                             &mut conn,
                             &msg.transfer_id,
@@ -110,54 +104,101 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
     }
 }
 
-async fn process_registration(
+/// Process a batch of registration requests with deduplication
+async fn process_registration_batch(
     ctx: &RegistrationWorkerContext,
-    msg: &RegistrationMessage,
+    batch: &[(String, RegistrationMessage)],
+    stream_key: &str,
+    consumer_group: &str,
 ) -> Result<()> {
     let mut conn = ctx.runtime.redis_conn.clone();
 
-    let transfer = match rh::get_transfer_state(&mut conn, &msg.transfer_id).await? {
-        Some(t) => t,
-        None => {
-            warn!("Transfer {} not found", msg.transfer_id);
-            return Ok(());
+    // Group transfers by account (deduplication within batch)
+    let mut account_to_transfers: HashMap<AccountId, Vec<(String, RegistrationMessage)>> = HashMap::new();
+    
+    for (stream_id, msg) in batch {
+        let transfer = match rh::get_transfer_state(&mut conn, &msg.transfer_id).await? {
+            Some(t) => t,
+            None => {
+                warn!("Transfer {} not found", msg.transfer_id);
+                rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await?;
+                continue;
+            }
+        };
+
+        account_to_transfers
+            .entry(transfer.receiver_id.clone())
+            .or_insert_with(Vec::new)
+            .push((stream_id.clone(), msg.clone()));
+    }
+
+    if account_to_transfers.is_empty() {
+        return Ok(());
+    }
+
+    // Separate already-registered (fast path) from needs-registration
+    let mut fast_path_accounts = Vec::new();
+    let mut needs_registration = Vec::new();
+
+    for (account, transfers) in &account_to_transfers {
+        if rh::is_account_registered(&mut conn, account).await? {
+            debug!("Account {} already registered (fast path)", account);
+            fast_path_accounts.push((account.clone(), transfers.clone()));
+        } else {
+            needs_registration.push((account.clone(), transfers.clone()));
         }
-    };
+    }
 
-    let account = &transfer.receiver_id;
+    // Process fast path (already registered) - just enqueue for transfer
+    for (_account, transfers) in fast_path_accounts {
+        for (stream_id, msg) in transfers {
+            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+            rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+            rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
+        }
+    }
 
-    if rh::is_account_registered(&mut conn, account).await? {
-        debug!("Account {} already registered (fast path)", account);
-        rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-        rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
-        rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-        rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+    if needs_registration.is_empty() {
         return Ok(());
     }
 
-    let lock_key = format!("register_lock:{}", account);
-    let lock_value = Uuid::new_v4().to_string();
-    let acquired = rh::acquire_lock(&mut conn, &lock_key, &lock_value, 30).await?;
-
-    if !acquired {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        return Err(anyhow::anyhow!("Lock not acquired, will retry"));
+    // Batch register all unique accounts that need registration
+    // Final check: re-verify accounts aren't registered (race condition protection)
+    let mut final_needs_registration = Vec::new();
+    let mut newly_registered = Vec::new();
+    
+    for (account, transfers) in needs_registration {
+        if rh::is_account_registered(&mut conn, &account).await? {
+            // Registered by another worker while we were processing
+            debug!("Account {} registered by another worker during batch prep", account);
+            newly_registered.push((account, transfers));
+        } else {
+            final_needs_registration.push((account, transfers));
+        }
     }
-
-    if rh::is_account_registered(&mut conn, account).await? {
-        info!("Account {} registered by another worker", account);
-        rh::release_lock(&mut conn, &lock_key).await?;
-        rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-        rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
-        rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-        rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+    
+    // Process accounts that got registered by other workers
+    for (_account, transfers) in newly_registered {
+        for (stream_id, msg) in transfers {
+            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+            rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+            rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
+        }
+    }
+    
+    if final_needs_registration.is_empty() {
         return Ok(());
     }
-
-    info!("Registering account {} on-chain", account);
+    
+    let unique_accounts: Vec<AccountId> = final_needs_registration.iter().map(|(acc, _)| acc.clone()).collect();
+    
+    info!("Registering {} unique account(s) in batch", unique_accounts.len());
 
     let leased_key = ctx.runtime.access_key_pool.lease().await?;
-
     let nonce = ctx
         .runtime
         .nonce_manager
@@ -168,10 +209,10 @@ async fn process_registration(
     let result = ctx
         .runtime
         .rpc_client
-        .register_account(
+        .register_accounts_batch(
             &ctx.runtime.relay_account,
             &ctx.runtime.token,
-            account,
+            unique_accounts.clone(),
             &leased_key.secret_key,
             nonce,
         )
@@ -182,35 +223,50 @@ async fn process_registration(
     match result {
         Ok(tx_hash) => {
             let tx_hash_str = tx_hash.to_string();
-            info!("Registered {} with tx {}", account, tx_hash_str);
-            rh::mark_account_registered(&mut conn, account).await?;
-            rh::release_lock(&mut conn, &lock_key).await?;
-            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-            rh::log_event(
-                &mut conn,
-                &msg.transfer_id,
-                Event::new("REGISTERED").with_tx_hash(tx_hash_str),
-            )
-            .await?;
-            rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+            info!("Registered {} accounts with tx {}", unique_accounts.len(), tx_hash_str);
+
+            // Mark all accounts as registered and process their transfers
+            for (account, transfers) in final_needs_registration {
+                rh::mark_account_registered(&mut conn, &account).await?;
+
+                for (stream_id, msg) in transfers {
+                    rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+                    rh::log_event(
+                        &mut conn,
+                        &msg.transfer_id,
+                        Event::new("REGISTERED").with_tx_hash(tx_hash_str.clone()),
+                    )
+                    .await?;
+                    rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+                    rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+                    rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
+                }
+            }
+
             Ok(())
         }
         Err(e) => {
             let err_str = format!("{:?}", e);
 
+            // If accounts are already registered on-chain, treat as success
             if err_str.contains("already") || err_str.contains("exist") {
-                info!("Account {} already registered (on-chain)", account);
-                rh::mark_account_registered(&mut conn, account).await?;
-                rh::release_lock(&mut conn, &lock_key).await?;
-                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-                rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
-                rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-                rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+                info!("Batch registration: accounts already registered (on-chain)");
+
+                for (account, transfers) in final_needs_registration {
+                    rh::mark_account_registered(&mut conn, &account).await?;
+
+                    for (stream_id, msg) in transfers {
+                        rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+                        rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+                        rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+                        rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+                        rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
+                    }
+                }
+
                 Ok(())
             } else {
-                warn!("Failed to register {}: {:?}", account, e);
-                rh::release_lock(&mut conn, &lock_key).await?;
+                warn!("Failed to register batch: {:?}", e);
                 Err(e)
             }
         }
