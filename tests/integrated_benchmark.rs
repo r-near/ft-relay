@@ -9,11 +9,12 @@
 use ft_relay::{RedisSettings, RelayConfig};
 use near_crypto::SecretKey;
 use near_jsonrpc_client::{methods, JsonRpcClient};
-use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_jsonrpc_primitives::types::{query::QueryResponseKind, transactions::RpcSendTransactionRequest};
 use near_primitives::account::AccessKeyPermission;
 use near_primitives::action::{Action, AddKeyAction, DeployContractAction, FunctionCallAction};
 use near_primitives::transaction::{SignedTransaction, Transaction, TransactionV0};
 use near_primitives::types::{BlockReference, Finality};
+use near_primitives::views::TxExecutionStatus;
 use near_sandbox::{GenesisAccount, Sandbox, SandboxConfig};
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -101,18 +102,24 @@ async fn setup_ft_contract(
     let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
     let signed_tx = SignedTransaction::new(signature, transaction);
 
-    let broadcast_request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+    let broadcast_request = RpcSendTransactionRequest {
         signed_transaction: signed_tx,
+        wait_until: TxExecutionStatus::Final,
     };
     let response = client.call(broadcast_request).await?;
 
-    // Check if transaction succeeded
-    if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
-        // Wait a bit for state to settle
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        Ok(())
+    // Check if transaction succeeded - final_execution_outcome contains the actual execution status
+    if let Some(outcome) = response.final_execution_outcome {
+        match outcome.into_outcome().status {
+            near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
+                // Wait a bit for state to settle
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                Ok(())
+            }
+            status => Err(format!("Transaction failed: {:?}", status).into()),
+        }
     } else {
-        Err(format!("Transaction failed: {:?}", response.status).into())
+        Err("No execution outcome returned".into())
     }
 }
 
@@ -220,20 +227,28 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         let signature = owner_secret_key.sign(transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
 
-        let broadcast_request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+        let broadcast_request = RpcSendTransactionRequest {
             signed_transaction: signed_tx,
+            wait_until: TxExecutionStatus::Final,
         };
         let response = client.call(broadcast_request).await?;
 
-        if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
-            println!("  ✅ Key added successfully");
-            secret_keys.push(new_secret_key.to_string());
-            current_nonce += 1; // Increment nonce for next transaction
-            
-            // Wait for state to propagate - sandbox needs time
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+        if let Some(outcome) = response.final_execution_outcome {
+            match outcome.into_outcome().status {
+                near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
+                    println!("  ✅ Key added successfully");
+                    secret_keys.push(new_secret_key.to_string());
+                    current_nonce += 1; // Increment nonce for next transaction
+                    
+                    // Wait for state to propagate - sandbox needs time
+                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                }
+                status => {
+                    return Err(format!("Add key transaction failed: {:?}", status).into());
+                }
+            }
         } else {
-            return Err(format!("Add key transaction failed: {:?}", response.status).into());
+            return Err("No execution outcome returned for add key transaction".into());
         }
     }
 
