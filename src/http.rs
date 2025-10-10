@@ -39,9 +39,15 @@ async fn create_transfer(
     Json(body): Json<TransferRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    
     static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
     let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-    info!("[REQUEST_TRACE] #{} - ENTRY", count);
+    let request_start = Instant::now();
+    
+    if count < 5 || count % 100 == 0 {
+        info!("[REQUEST_TRACE] #{} - ENTRY", count);
+    }
 
     // Extract idempotency key
     let idempotency_key = headers
@@ -82,66 +88,23 @@ async fn create_transfer(
         ));
     }
 
-    info!("[REQUEST_TRACE] #{} - Validation passed", count);
-
-    // Clone connection (ConnectionManager is designed for concurrent use)
-    let mut conn = state.redis_conn.clone();
-
-    let transfer = TransferState::new(
-        transfer_id.clone(),
-        body.receiver_id.clone(),
-        body.amount.clone(),
-    );
-
-    // Simple idempotency check using SET NX (atomic, fast)
-    let idempotency_key = format!("idempotency:{}", transfer_id);
-    let acquired: bool = conn
-        .set_nx(&idempotency_key, "1")
-        .await
-        .map_err(|e| {
-            warn!("Redis error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
-
-    if !acquired {
-        // Idempotency key already used - fetch and return existing transfer
-        info!("Idempotency hit for transfer {}", transfer_id);
-        if let Ok(Some(existing)) = rh::get_transfer_state(&mut conn, &transfer_id).await {
-            let response: TransferResponse = existing.into();
-            return Ok((StatusCode::OK, Json(serde_json::to_value(response).unwrap())));
-        }
-        // If we can't fetch it, return a generic 200
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "transfer_id": transfer_id,
-                "status": "QUEUED"
-            })),
-        ));
+    if count < 5 {
+        info!("[REQUEST_TRACE] #{} - Validation passed", count);
     }
 
-    // Set expiry on idempotency key (24 hours)
-    let _: () = conn.expire(&idempotency_key, 86400).await.unwrap_or(());
+    // TIMING: Measure each operation
+    let start = Instant::now();
 
-    // Store minimal transfer state (just the essentials)
-    rh::store_transfer_state(&mut conn, &transfer)
-        .await
-        .map_err(|e| {
-            warn!("Redis error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
+    // Clone connection (ConnectionManager is designed for concurrent use)
+    let clone_start = Instant::now();
+    let mut conn = state.redis_conn.clone();
+    if count < 5 {
+        info!("[TIMING] #{} - Clone took {:?}", count, clone_start.elapsed());
+    }
 
-    // Enqueue for registration (single operation)
+    // FAST PATH: Just enqueue directly - no Redis state storage in HTTP handler
+    // Workers will handle all the state management
+    let xadd_start = Instant::now();
     rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
         .await
         .map_err(|e| {
@@ -153,23 +116,24 @@ async fn create_transfer(
                 }),
             )
         })?;
+    if count < 5 {
+        info!("[TIMING] #{} - XADD took {:?}", count, xadd_start.elapsed());
+        info!("[TIMING] #{} - Total HTTP handler: {:?}", count, start.elapsed());
+    }
 
-    let response = TransferResponse {
-        transfer_id: transfer.transfer_id,
-        status: Status::QueuedRegistration,
-        receiver_id: transfer.receiver_id,
-        amount: transfer.amount,
-        tx_hash: None,
-        created_at: transfer.created_at,
-        completed_at: None,
-        retry_count: Some(0),
-        events: None,
-    };
+    // Return minimal response - worker will handle the rest
+    let response = json!({
+        "transfer_id": transfer_id,
+        "receiver_id": body.receiver_id,
+        "amount": body.amount,
+        "status": "QUEUED"
+    });
 
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::to_value(response).unwrap()),
-    ))
+    if count < 5 || count % 100 == 0 {
+        info!("[TIMING] #{} - TOTAL REQUEST: {:?}", count, request_start.elapsed());
+    }
+    
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_transfer_status(
