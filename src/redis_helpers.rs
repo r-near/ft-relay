@@ -34,9 +34,13 @@ where C: ConnectionLike + AsyncCommands + Send + Sync,
 pub async fn get_transfer_state<C>(conn: &mut C, transfer_id: &str) -> Result<Option<TransferState>>
 where C: ConnectionLike + AsyncCommands + Send + Sync,
 {
+    use log::info;
+    info!("[REDIS_TRACE] get_transfer_state called for {}", transfer_id);
     let key = format!("transfer:{}", transfer_id);
     // Optimize: Just do hgetall, it returns empty map if key doesn't exist
+    info!("[REDIS_TRACE] About to call hgetall for key: {}", key);
     let data: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
+    info!("[REDIS_TRACE] hgetall completed, got {} fields", data.len());
     
     // If no data, key doesn't exist
     if data.is_empty() {
