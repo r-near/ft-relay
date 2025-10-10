@@ -335,6 +335,18 @@ where
     C: ConnectionLike + AsyncCommands + Send + Sync,
     T: DeserializeOwned,
 {
+    // Check stream length before we start (total messages in stream)
+    let stream_len: usize = redis::cmd("XLEN")
+        .arg(stream_key)
+        .query_async(conn)
+        .await
+        .unwrap_or(0);
+    log::debug!(
+        "[BATCH] Stream {} has {} total messages before read",
+        stream_key,
+        stream_len
+    );
+    
     let start = std::time::Instant::now();
     let mut batch: Vec<(String, T)> = Vec::new();
 
@@ -378,6 +390,15 @@ where
     if batch.is_empty() {
         return Err(anyhow::anyhow!("No messages available"));
     }
+
+    log::debug!(
+        "[BATCH] Stream {} accumulated {} messages in {}ms (max: {}, linger: {}ms)",
+        stream_key,
+        batch.len(),
+        start.elapsed().as_millis(),
+        max_count,
+        linger_ms
+    );
 
     Ok(batch)
 }
