@@ -13,12 +13,12 @@ use crate::types::{AccountId, ErrorResponse, Event, Status, TransferRequest, Tra
 
 #[derive(Clone)]
 struct AppState {
-    redis_conn: redis::aio::ConnectionManager,
+    redis_conn: std::sync::Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     env: String,
 }
 
 pub fn build_router(
-    redis_conn: redis::aio::ConnectionManager,
+    redis_conn: std::sync::Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     env: String,
     _token: AccountId,
 ) -> Router {
@@ -85,17 +85,42 @@ async fn create_transfer(
     
     info!("[REQUEST_TRACE] #{} - Validation passed", count);
     
-    // CRITICAL ISSUE IDENTIFIED: Redis ConnectionManager blocks with high concurrency
-    // - ConnectionManager multiplexes over a SINGLE TCP connection
-    // - 100 concurrent requests × 4-5 Redis ops each = 400-500 queued operations  
-    // - All requests block waiting for the single connection
-    // 
-    // ROOT CAUSE: redis::aio::ConnectionManager is not designed for this load
-    // SOLUTION: Need connection pooling (e.g., deadpool-redis or bb8-redis)
-    //
-    // For benchmark: Skip Redis entirely to test HTTP throughput
+    // Lock the mutex to get exclusive access to the ConnectionManager
+    // This serializes Redis operations across all concurrent requests
+    let mut conn = state.redis_conn.lock().await;
     
     let transfer = TransferState::new(transfer_id.clone(), body.receiver_id.clone(), body.amount.clone());
+    
+    // Check for existing transfer (idempotency)
+    if let Some(existing) = rh::get_transfer_state(&mut *conn, &transfer_id).await.map_err(|e| {
+        warn!("[REQUEST_TRACE] #{} - Redis GET error: {:?}", count, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".to_string() }))
+    })? {
+        if existing.receiver_id != body.receiver_id || existing.amount != body.amount {
+            return Err((StatusCode::CONFLICT, Json(ErrorResponse { error: "Idempotency key already used with different parameters".to_string() })));
+        }
+        // Return existing transfer
+        let response: TransferResponse = existing.into();
+        return Ok((StatusCode::OK, Json(serde_json::to_value(response).unwrap())));
+    }
+    
+    // Store new transfer
+    rh::store_transfer_state(&mut *conn, &transfer).await.map_err(|e| {
+        warn!("[REQUEST_TRACE] #{} - Redis SET error: {:?}", count, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".to_string() }))
+    })?;
+    
+    // Enqueue for registration
+    rh::enqueue_registration(&mut *conn, &state.env, &transfer_id, 0).await.map_err(|e| {
+        warn!("[REQUEST_TRACE] #{} - Redis ENQUEUE error: {:?}", count, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".to_string() }))
+    })?;
+    
+    // Update status
+    rh::update_transfer_status(&mut *conn, &transfer_id, Status::QueuedRegistration).await.map_err(|e| {
+        warn!("[REQUEST_TRACE] #{} - Redis UPDATE error: {:?}", count, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".to_string() }))
+    })?;
 
     let response = TransferResponse {
         transfer_id: transfer.transfer_id,
@@ -109,16 +134,13 @@ async fn create_transfer(
         events: None,
     };
     
-    if count < 5 {
-        info!("[REQUEST_TRACE] #{} - Returning 201 (no Redis)", count);
-    }
     Ok((
         StatusCode::CREATED,
         Json(serde_json::to_value(response).unwrap()),
     ))
-    
-    /* OLD CODE with idempotency check - commented out
-    if let Some(existing) = existing_transfer {
+
+
+async fn get_transfer_status(
         if existing.receiver_id != body.receiver_id || existing.amount != body.amount {
             return Err((
                 StatusCode::CONFLICT,
