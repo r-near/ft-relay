@@ -22,7 +22,6 @@ pub struct VerificationWorkerRuntime {
 
 pub struct VerificationWorkerContext {
     pub runtime: Arc<VerificationWorkerRuntime>,
-    pub linger_ms: u64,
 }
 
 pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<()> {
@@ -45,82 +44,83 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
     loop {
         let mut conn = ctx.runtime.redis_conn.clone();
 
-        let batch: Vec<(String, VerificationMessage)> = match rh::pop_batch(
+        // Pop ONE message at a time (no batching benefit for individual RPC checks)
+        let messages: Vec<(String, VerificationMessage)> = match rh::pop_batch(
             &mut conn,
             &stream_key,
             &consumer_group,
             &consumer_name,
-            50,
-            ctx.linger_ms,
+            1, // Just one message
+            0, // Short block timeout
         )
         .await
         {
             Ok(b) => b,
             Err(e) => {
-                warn!("Error popping batch: {:?}", e);
+                debug!("No verification messages available: {:?}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
         };
 
-        for (stream_id, msg) in batch {
-            match verify_transaction(&ctx, &msg).await {
-                Ok(VerificationResult::Completed) => {
-                    let _ =
-                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
-                }
-                Ok(VerificationResult::Failed(reason)) => {
-                    warn!("Transfer {} failed: {}", msg.transfer_id, reason);
-                    let _ =
-                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
-                }
-                Ok(VerificationResult::Pending) => {
-                    let retry_count = msg.retry_count + 1;
+        if messages.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
 
-                    let _ =
-                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+        let (stream_id, msg) = &messages[0];
+        match verify_transaction(&ctx, msg).await {
+            Ok(VerificationResult::Completed) => {
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+            }
+            Ok(VerificationResult::Failed(reason)) => {
+                warn!("Transfer {} failed: {}", msg.transfer_id, reason);
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+            }
+            Ok(VerificationResult::Pending) => {
+                let retry_count = msg.retry_count + 1;
 
-                    if retry_count < MAX_VERIFICATION_RETRIES {
-                        let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
-                        let _ = rh::enqueue_verification(
-                            &mut conn,
-                            &ctx.runtime.env,
-                            &msg.transfer_id,
-                            &msg.tx_hash,
-                            retry_count,
-                        )
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+
+                if retry_count < MAX_VERIFICATION_RETRIES {
+                    let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
+                    let _ = rh::enqueue_verification(
+                        &mut conn,
+                        &ctx.runtime.env,
+                        &msg.transfer_id,
+                        &msg.tx_hash,
+                        retry_count,
+                    )
+                    .await;
+                } else {
+                    let _ = rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed)
                         .await;
-                    } else {
-                        let _ =
-                            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed)
-                                .await;
-                        let _ = rh::log_event(
-                            &mut conn,
-                            &msg.transfer_id,
-                            Event::new("FAILED").with_reason(format!(
-                                "Verification timeout after {} checks",
-                                retry_count
-                            )),
-                        )
-                        .await;
-                    }
+                    let _ = rh::log_event(
+                        &mut conn,
+                        &msg.transfer_id,
+                        Event::new("FAILED").with_reason(format!(
+                            "Verification timeout after {} checks",
+                            retry_count
+                        )),
+                    )
+                    .await;
                 }
-                Err(e) => {
-                    warn!("Error checking tx status for {}: {:?}", msg.transfer_id, e);
+            }
+            Err(e) => {
+                warn!("Error checking tx status for {}: {:?}", msg.transfer_id, e);
 
-                    let _ =
-                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
-                    let retry_count = msg.retry_count + 1;
-                    if retry_count < MAX_VERIFICATION_RETRIES {
-                        let _ = rh::enqueue_verification(
-                            &mut conn,
-                            &ctx.runtime.env,
-                            &msg.transfer_id,
-                            &msg.tx_hash,
-                            retry_count,
-                        )
-                        .await;
-                    }
+                let retry_count = msg.retry_count + 1;
+                if retry_count < MAX_VERIFICATION_RETRIES {
+                    let _ = rh::enqueue_verification(
+                        &mut conn,
+                        &ctx.runtime.env,
+                        &msg.transfer_id,
+                        &msg.tx_hash,
+                        retry_count,
+                    )
+                    .await;
                 }
             }
         }

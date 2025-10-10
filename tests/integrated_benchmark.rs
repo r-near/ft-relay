@@ -302,11 +302,11 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         account_id: ft_owner.account_id.to_string(),
         secret_keys,
         rpc_url: sandbox.rpc_addr.clone(),
-        batch_linger_ms: 100,        // Fast batching (100ms is enough with high load)
-        batch_submit_delay_ms: 0,    // No throttling needed for sandbox
-        max_inflight_batches: 500,   // High concurrency
-        max_workers: 3,              // 3 transfer workers
-        max_registration_workers: 5, // 5 registration workers (more uniform flow for dupes)
+        batch_linger_ms: 100, // Fast batching (100ms is enough with high load)
+        batch_submit_delay_ms: 0, // No throttling needed for sandbox
+        max_inflight_batches: 500, // High concurrency
+        max_workers: 3,       // 3 transfer workers
+        max_registration_workers: 1, // 5 registration workers (more uniform flow for dupes)
         max_verification_workers: 1, // 1 verification worker (no sleep needed, txs already Final)
         bind_addr: "127.0.0.1:18082".to_string(),
         redis,
@@ -802,7 +802,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 fn test_redis_settings() -> RedisSettings {
     RedisSettings::new(
         "redis://127.0.0.1:6379",
-        "unused",  // Old stream names not used anymore
+        "unused", // Old stream names not used anymore
         "unused",
         "unused",
         "unused",

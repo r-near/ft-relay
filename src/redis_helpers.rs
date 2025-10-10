@@ -214,17 +214,18 @@ where
         "#,
     );
 
-    let is_first: i32 = script.arg(account).arg(transfer_id).invoke_async(conn).await?;
+    let is_first: i32 = script
+        .arg(account)
+        .arg(transfer_id)
+        .invoke_async(conn)
+        .await?;
     Ok(is_first == 1)
 }
 
 /// Atomically complete account registration: mark as registered, get waiting transfers, cleanup.
 /// Returns list of transfer IDs that were waiting for this account.
 /// Uses Lua script to ensure atomicity - zero race window!
-pub async fn complete_account_registration<C>(
-    conn: &mut C,
-    account: &str,
-) -> Result<Vec<String>>
+pub async fn complete_account_registration<C>(conn: &mut C, account: &str) -> Result<Vec<String>>
 where
     C: ConnectionLike + AsyncCommands + Send + Sync,
 {
@@ -390,18 +391,6 @@ where
     C: ConnectionLike + AsyncCommands + Send + Sync,
     T: DeserializeOwned,
 {
-    // Check stream length before we start (total messages in stream)
-    let stream_len: usize = redis::cmd("XLEN")
-        .arg(stream_key)
-        .query_async(conn)
-        .await
-        .unwrap_or(0);
-    log::debug!(
-        "[BATCH] Stream {} has {} total messages before read",
-        stream_key,
-        stream_len
-    );
-    
     let start = std::time::Instant::now();
     let mut batch: Vec<(String, T)> = Vec::new();
 
@@ -410,10 +399,10 @@ where
     while batch.len() < max_count && start.elapsed().as_millis() < linger_ms as u128 {
         let remaining = max_count - batch.len();
         let time_left = linger_ms.saturating_sub(start.elapsed().as_millis() as u64);
-        
+
         // Use short block timeout (10ms) to keep checking for new messages
         let block_ms = time_left.min(10);
-        
+
         let mut additional = read_stream_batch(
             conn,
             stream_key,
@@ -423,7 +412,7 @@ where
             block_ms,
         )
         .await?;
-        
+
         // If we got messages, append them
         if !additional.is_empty() {
             batch.append(&mut additional);

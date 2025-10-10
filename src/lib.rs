@@ -168,10 +168,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
             env: env.to_string(),
         });
 
-        let ctx = verification_worker::VerificationWorkerContext {
-            runtime,
-            linger_ms: batch_linger_ms,
-        };
+        let ctx = verification_worker::VerificationWorkerContext { runtime };
 
         tokio::spawn(async move {
             if let Err(err) = verification_worker::verification_worker_loop(ctx).await {
