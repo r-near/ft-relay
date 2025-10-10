@@ -191,7 +191,7 @@ async fn verify_transaction(
 ) -> Result<VerificationResult> {
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    let tx_hash = CryptoHash::from_str(&msg.tx_hash)?;
+    let tx_hash = CryptoHash::from_str(&msg.tx_hash).map_err(|e| anyhow::anyhow!("Invalid tx hash: {:?}", e))?;
 
     match ctx
         .runtime

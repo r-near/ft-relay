@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use log::{debug, info};
-use near_crypto::{PublicKey, SecretKey, Signature};
+use near_crypto::{PublicKey, SecretKey};
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::hash::CryptoHash;
@@ -98,15 +98,15 @@ impl NearRpcClient {
 
         match self.client.call(request).await {
             Ok(response) => {
-                match response.final_execution_outcome {
-                    Some(outcome) => {
-                        match outcome.status {
-                            FinalExecutionStatus::SuccessValue(_) => Ok(TxStatus::Success(outcome)),
-                            FinalExecutionStatus::Failure(err) => Ok(TxStatus::Failed(format!("{:?}", err))),
-                            FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => Ok(TxStatus::Pending),
-                        }
+                let outcome = response.final_execution_outcome
+                    .ok_or_else(|| anyhow!("No execution outcome"))?;
+                let outcome_view = outcome.into_outcome();
+                match outcome_view.status {
+                    FinalExecutionStatus::SuccessValue(_) => {
+                        Ok(TxStatus::Success(outcome_view))
                     }
-                    None => Ok(TxStatus::Pending),
+                    FinalExecutionStatus::Failure(err) => Ok(TxStatus::Failed(format!("{:?}", err))),
+                    FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => Ok(TxStatus::Pending),
                 }
             }
             Err(e) => {
@@ -176,7 +176,7 @@ impl NearRpcClient {
             actions: vec![action],
         });
 
-        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+        let signature = secret_key.sign(&transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
         
         self.broadcast_tx(signed_tx).await
@@ -218,7 +218,7 @@ impl NearRpcClient {
             actions,
         });
 
-        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+        let signature = secret_key.sign(&transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
         
         self.broadcast_tx(signed_tx).await

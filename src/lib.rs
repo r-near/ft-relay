@@ -47,14 +47,14 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     }
 
     let redis_client = redis::Client::open(redis.url.as_str())?;
-    let http_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+    
+    // Create shared Redis connection manager (prevents connection exhaustion)
+    let redis_conn = Arc::new(redis::aio::ConnectionManager::new(redis_client.clone()).await?);
+    
     let rpc_client = Arc::new(NearRpcClient::new(&rpc_url));
-    let pool_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
-    let access_key_pool = Arc::new(AccessKeyPool::new(access_keys.clone(), pool_redis_conn));
+    let access_key_pool = Arc::new(AccessKeyPool::new(access_keys.clone(), redis_conn.as_ref().clone()));
 
-    let mut nonce_manager = NonceManager::new(
-        redis::aio::ConnectionManager::new(redis_client.clone()).await?,
-    );
+    let mut nonce_manager = NonceManager::new(redis_conn.as_ref().clone());
 
     info!("Initializing nonces from RPC...");
     for key in &access_keys {
@@ -75,7 +75,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         "sandbox"
     };
 
-    let router = http::build_router(http_redis_conn, env.to_string(), token.clone());
+    let router = http::build_router(redis_conn.as_ref().clone(), env.to_string(), token.clone());
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
         info!("HTTP server listening on http://{}", listener.local_addr().unwrap());
@@ -86,12 +86,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     info!("Spawning {} registration worker(s)", num_reg_workers);
     for idx in 0..num_reg_workers {
         let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
-            redis_conn: redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            redis_conn: redis_conn.as_ref().clone(),
             rpc_client: rpc_client.clone(),
             access_key_pool: access_key_pool.clone(),
-            nonce_manager: NonceManager::new(
-                redis::aio::ConnectionManager::new(redis_client.clone()).await?,
-            ),
+            nonce_manager: NonceManager::new(redis_conn.as_ref().clone()),
             relay_account: account_id.clone(),
             token: token.clone(),
             env: env.to_string(),
@@ -113,12 +111,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     info!("Spawning {} transfer worker(s)", num_transfer_workers);
     for idx in 0..num_transfer_workers {
         let runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
-            redis_conn: redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            redis_conn: redis_conn.as_ref().clone(),
             rpc_client: rpc_client.clone(),
             access_key_pool: access_key_pool.clone(),
-            nonce_manager: NonceManager::new(
-                redis::aio::ConnectionManager::new(redis_client.clone()).await?,
-            ),
+            nonce_manager: NonceManager::new(redis_conn.as_ref().clone()),
             relay_account: account_id.clone(),
             token: token.clone(),
             env: env.to_string(),
@@ -140,7 +136,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     info!("Spawning {} verification worker(s)", num_verify_workers);
     for idx in 0..num_verify_workers {
         let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
-            redis_conn: redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            redis_conn: redis_conn.as_ref().clone(),
             rpc_client: rpc_client.clone(),
             relay_account: account_id.clone(),
             env: env.to_string(),
