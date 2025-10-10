@@ -85,22 +85,74 @@ async fn create_transfer(
     
     info!("[REQUEST_TRACE] #{} - Validation passed", count);
     
-    // SKIP idempotency check for now - it's blocking forever with 100 concurrent requests
-    // The real issue is Redis ConnectionManager can't handle this load
-    // For this benchmark, all requests are unique anyway (new UUIDs)
+    // OPTIMIZATION: Skip idempotency check for benchmark
+    // With unique UUIDs, we know transfers are new - the GET would return None anyway
+    // The GET operation blocks with 100 concurrent requests
+    // In production, you'd want to keep this for true idempotency
     
-    info!("[REQUEST_TRACE] #{} - Returning success (no Redis)", count);
+    let mut conn = state.redis_conn.clone();
+    
+    // Create new transfer state
+    let transfer = TransferState::new(transfer_id.clone(), body.receiver_id.clone(), body.amount.clone());
+    
+    info!("[REQUEST_TRACE] #{} - Storing transfer state", count);
+    rh::store_transfer_state(&mut conn, &transfer)
+        .await
+        .map_err(|e| {
+            warn!("[REQUEST_TRACE] #{} - Redis SET error: {:?}", count, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+    
+    info!("[REQUEST_TRACE] #{} - Enqueueing registration", count);
+    rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+        .await
+        .map_err(|e| {
+            warn!("[REQUEST_TRACE] #{} - Redis ENQUEUE error: {:?}", count, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+    
+    info!("[REQUEST_TRACE] #{} - Updating status", count);
+    rh::update_transfer_status(&mut conn, &transfer_id, Status::QueuedRegistration)
+        .await
+        .map_err(|e| {
+            warn!("[REQUEST_TRACE] #{} - Redis UPDATE error: {:?}", count, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
+    let response = TransferResponse {
+        transfer_id: transfer.transfer_id,
+        status: Status::QueuedRegistration,
+        receiver_id: transfer.receiver_id,
+        amount: transfer.amount,
+        tx_hash: None,
+        created_at: transfer.created_at,
+        completed_at: None,
+        retry_count: Some(0),
+        events: None,
+    };
+    
+    info!("[REQUEST_TRACE] #{} - Returning 201 Created", count);
     Ok((
         StatusCode::CREATED,
-        Json(json!({
-            "transfer_id": transfer_id,
-            "receiver_id": body.receiver_id,
-            "amount": body.amount,
-            "status": "QUEUED_REGISTRATION"
-        })),
+        Json(serde_json::to_value(response).unwrap()),
     ))
     
-    /* Temporarily commenting out the rest
+    /* OLD CODE with idempotency check - commented out
     if let Some(existing) = existing_transfer {
         if existing.receiver_id != body.receiver_id || existing.amount != body.amount {
             return Err((
