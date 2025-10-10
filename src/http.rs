@@ -98,11 +98,37 @@ async fn create_transfer(
             )
         })?;
 
+    // Log RECEIVED event
+    rh::log_event(&mut conn, &transfer_id, Event::new("RECEIVED"))
+        .await
+        .map_err(|e| {
+            warn!("Failed to log event: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
     // Enqueue for registration
     rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
         .await
         .map_err(|e| {
             warn!("Failed to enqueue registration: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
+    // Log QUEUED_REGISTRATION event
+    rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
+        .await
+        .map_err(|e| {
+            warn!("Failed to log event: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
