@@ -154,8 +154,8 @@ async fn verify_transaction(
         }
     }
 
-    // Wait ~6 seconds (2-3 blocks) before first RPC check
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // No need to wait - transactions are submitted with wait_until: Final
+    // so they're already finalized when we get the verification message
 
     let tx_hash = CryptoHash::from_str(&msg.tx_hash)
         .map_err(|e| anyhow::anyhow!("Invalid tx hash: {:?}", e))?;
