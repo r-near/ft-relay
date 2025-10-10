@@ -3,10 +3,13 @@ use log::{debug, info};
 use near_crypto::{PublicKey, SecretKey};
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_jsonrpc_primitives::types::transactions::RpcSendTransactionRequest;
 use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::{Action, FunctionCallAction, SignedTransaction, Transaction};
 use near_primitives::types::{BlockReference, Finality};
-use near_primitives::views::{AccessKeyView, FinalExecutionOutcomeView, FinalExecutionStatus};
+use near_primitives::views::{
+    AccessKeyView, FinalExecutionOutcomeView, FinalExecutionStatus, TxExecutionStatus,
+};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,15 +82,21 @@ impl NearRpcClient {
         debug!("Broadcasting transaction: {}", tx_hash);
 
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
-        let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+        let request = RpcSendTransactionRequest {
             signed_transaction: signed_tx,
+            wait_until: TxExecutionStatus::Final,
         };
 
-        let outcome = self
+        let response = self
             .client
             .call(request)
             .await
             .map_err(|e| anyhow!("Failed to broadcast transaction: {:?}", e))?;
+
+        let outcome = response
+            .final_execution_outcome
+            .ok_or_else(|| anyhow!("No execution outcome returned"))?
+            .into_outcome();
 
         Ok((tx_hash, outcome))
     }
@@ -105,7 +114,7 @@ impl NearRpcClient {
                     .parse()
                     .map_err(|e| anyhow!("Invalid account ID: {:?}", e))?,
             },
-            wait_until: near_primitives::views::TxExecutionStatus::Final,
+            wait_until: TxExecutionStatus::Final,
         };
 
         match self.client.call(request).await {
