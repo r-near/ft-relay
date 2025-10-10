@@ -801,10 +801,9 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 fn test_redis_settings() -> RedisSettings {
     RedisSettings::new(
         "redis://127.0.0.1:6379",
-        "ftrelay:sandbox:reg",
-        "ftrelay:sandbox:xfer",
-        "ftrelay:sandbox:verify",
-        "ftrelay:registrations",
-        "ftrelay:registration_workers",
+        "unused",  // Old stream names not used anymore
+        "unused",
+        "unused",
+        "unused",
     )
 }
