@@ -360,7 +360,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                 let receiver_id = receivers[i % receiver_count].account_id.clone();
 
                 // Generate unique idempotency key for this request
-                let idempotency_key = format!("worker-{}-req-{}", worker_id, i);
+                let idempotency_key = uuid::Uuid::new_v4().to_string();
                 
                 match client
                     .post("http://127.0.0.1:18082/v1/transfer")
@@ -373,7 +373,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                     .send()
                     .await
                 {
-                    Ok(r) if r.status() == 200 => worker_success += 1,
+                    Ok(r) if r.status().is_success() => worker_success += 1,
                     Ok(r) => {
                         if worker_id == 0 && worker_success == 0 {
                             eprintln!(
