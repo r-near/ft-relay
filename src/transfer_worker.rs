@@ -147,41 +147,73 @@ async fn process_batch(
     drop(leased_key);
 
     match result {
-        Ok(tx_hash) => {
+        Ok((tx_hash, outcome)) => {
             let tx_hash_str = tx_hash.to_string();
-            info!(
-                "Submitted batch of {} transfers, tx: {}",
-                transfers.len(),
-                tx_hash_str
+            
+            // Check if transaction succeeded (already Final, no need to verify)
+            let is_success = matches!(
+                outcome.status,
+                near_primitives::views::FinalExecutionStatus::SuccessValue(_)
             );
 
-            for (stream_id, msg, _) in &transfers {
-                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Submitted).await?;
-                rh::update_tx_hash(&mut conn, &msg.transfer_id, &tx_hash_str).await?;
-                // Link this transfer to the tx hash (so verification worker can find all transfers in batch)
-                rh::add_transfer_to_tx(&mut conn, &tx_hash_str, &msg.transfer_id).await?;
-                rh::log_event(
-                    &mut conn,
-                    &msg.transfer_id,
-                    Event::new("SUBMITTED").with_tx_hash(tx_hash_str.clone()),
-                )
-                .await?;
-                rh::enqueue_verification(
-                    &mut conn,
-                    &ctx.runtime.env,
-                    &msg.transfer_id,
-                    &tx_hash_str,
-                    0,
-                )
-                .await?;
-                rh::log_event(
-                    &mut conn,
-                    &msg.transfer_id,
-                    Event::new("QUEUED_VERIFICATION"),
-                )
-                .await?;
+            if is_success {
+                info!(
+                    "Batch of {} transfers succeeded, tx: {}",
+                    transfers.len(),
+                    tx_hash_str
+                );
+            } else {
+                warn!(
+                    "Batch of {} transfers uncertain, tx: {} - will verify",
+                    transfers.len(),
+                    tx_hash_str
+                );
+            }
 
-                let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
+            if is_success {
+                // Transaction succeeded - mark as completed (skip verification)
+                for (stream_id, msg, _) in &transfers {
+                    rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Completed)
+                        .await?;
+                    rh::update_tx_hash(&mut conn, &msg.transfer_id, &tx_hash_str).await?;
+                    rh::add_transfer_to_tx(&mut conn, &tx_hash_str, &msg.transfer_id).await?;
+                    rh::log_event(
+                        &mut conn,
+                        &msg.transfer_id,
+                        Event::new("COMPLETED").with_tx_hash(tx_hash_str.clone()),
+                    )
+                    .await?;
+                    let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
+                }
+            } else {
+                // Transaction failed or uncertain - send to verification
+                for (stream_id, msg, _) in &transfers {
+                    rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Submitted)
+                        .await?;
+                    rh::update_tx_hash(&mut conn, &msg.transfer_id, &tx_hash_str).await?;
+                    rh::add_transfer_to_tx(&mut conn, &tx_hash_str, &msg.transfer_id).await?;
+                    rh::log_event(
+                        &mut conn,
+                        &msg.transfer_id,
+                        Event::new("SUBMITTED").with_tx_hash(tx_hash_str.clone()),
+                    )
+                    .await?;
+                    rh::enqueue_verification(
+                        &mut conn,
+                        &ctx.runtime.env,
+                        &msg.transfer_id,
+                        &tx_hash_str,
+                        0,
+                    )
+                    .await?;
+                    rh::log_event(
+                        &mut conn,
+                        &msg.transfer_id,
+                        Event::new("QUEUED_VERIFICATION"),
+                    )
+                    .await?;
+                    let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
+                }
             }
 
             Ok(())

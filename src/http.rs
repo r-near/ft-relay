@@ -111,11 +111,11 @@ async fn create_transfer(
             )
         })?;
 
-    // Enqueue for registration
-    rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+    // Check if receiver is already registered (fast path)
+    let is_registered = rh::is_account_registered(&mut conn, &body.receiver_id)
         .await
         .map_err(|e| {
-            warn!("Failed to enqueue registration: {:?}", e);
+            warn!("Failed to check registration: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -124,22 +124,61 @@ async fn create_transfer(
             )
         })?;
 
-    // Log QUEUED_REGISTRATION event
-    rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
-        .await
-        .map_err(|e| {
-            warn!("Failed to log event: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
+    let status = if is_registered {
+        // Already registered - skip registration queue, go directly to transfer
+        rh::enqueue_transfer(&mut conn, &state.env, &transfer_id, 0)
+            .await
+            .map_err(|e| {
+                warn!("Failed to enqueue transfer: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                    }),
+                )
+            })?;
+        rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_TRANSFER"))
+            .await
+            .map_err(|e| {
+                warn!("Failed to log event: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                    }),
+                )
+            })?;
+        Status::Registered
+    } else {
+        // Not registered - enqueue for registration
+        rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+            .await
+            .map_err(|e| {
+                warn!("Failed to enqueue registration: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                    }),
+                )
+            })?;
+        rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
+            .await
+            .map_err(|e| {
+                warn!("Failed to log event: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Internal server error".to_string(),
+                    }),
+                )
+            })?;
+        Status::QueuedRegistration
+    };
 
     let response = TransferResponse {
         transfer_id: transfer.transfer_id,
-        status: Status::QueuedRegistration,
+        status,
         receiver_id: transfer.receiver_id,
         amount: transfer.amount,
         tx_hash: None,

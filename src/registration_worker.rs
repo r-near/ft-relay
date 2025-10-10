@@ -221,8 +221,20 @@ async fn process_registration_batch(
     drop(leased_key);
 
     match result {
-        Ok(tx_hash) => {
+        Ok((tx_hash, outcome)) => {
             let tx_hash_str = tx_hash.to_string();
+            
+            // Check if transaction succeeded (already Final)
+            let is_success = matches!(
+                outcome.status,
+                near_primitives::views::FinalExecutionStatus::SuccessValue(_)
+            );
+
+            if !is_success {
+                warn!("Registration batch tx {} has uncertain status - will retry", tx_hash_str);
+                return Err(anyhow::anyhow!("Registration uncertain"));
+            }
+
             info!("Registered {} accounts with tx {}", unique_accounts.len(), tx_hash_str);
 
             // Mark all accounts as registered and process their transfers

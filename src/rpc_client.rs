@@ -69,21 +69,25 @@ impl NearRpcClient {
         Ok(block_hash)
     }
 
-    pub async fn broadcast_tx(&self, signed_tx: SignedTransaction) -> Result<CryptoHash> {
+    pub async fn broadcast_tx(
+        &self,
+        signed_tx: SignedTransaction,
+    ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let tx_hash = signed_tx.get_hash();
         info!("Broadcasting transaction: {}", tx_hash);
 
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
-        let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+        let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
             signed_transaction: signed_tx,
         };
 
-        self.client
+        let outcome = self
+            .client
             .call(request)
             .await
             .map_err(|e| anyhow!("Failed to broadcast transaction: {:?}", e))?;
 
-        Ok(tx_hash)
+        Ok((tx_hash, outcome))
     }
 
     pub async fn check_tx_status(
@@ -166,7 +170,7 @@ impl NearRpcClient {
         account_to_register: &AccountId,
         secret_key: &SecretKey,
         nonce: u64,
-    ) -> Result<CryptoHash> {
+    ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let block_hash = self.get_block_hash().await?;
 
         let args = serde_json::json!({
@@ -208,7 +212,7 @@ impl NearRpcClient {
         accounts_to_register: Vec<AccountId>,
         secret_key: &SecretKey,
         nonce: u64,
-    ) -> Result<CryptoHash> {
+    ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let block_hash = self.get_block_hash().await?;
 
         // Create one storage_deposit action per account
@@ -255,7 +259,7 @@ impl NearRpcClient {
         receivers: Vec<(AccountId, String)>,
         secret_key: &SecretKey,
         nonce: u64,
-    ) -> Result<CryptoHash> {
+    ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let block_hash = self.get_block_hash().await?;
 
         let actions: Vec<Action> = receivers
