@@ -158,6 +158,8 @@ async fn process_batch(
             for (stream_id, msg, _) in &transfers {
                 rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Submitted).await?;
                 rh::update_tx_hash(&mut conn, &msg.transfer_id, &tx_hash_str).await?;
+                // Link this transfer to the tx hash (so verification worker can find all transfers in batch)
+                rh::add_transfer_to_tx(&mut conn, &tx_hash_str, &msg.transfer_id).await?;
                 rh::log_event(
                     &mut conn,
                     &msg.transfer_id,
