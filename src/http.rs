@@ -115,12 +115,24 @@ async fn create_transfer(
                 }),
             ));
         }
-        // Return existing transfer
-        let response: TransferResponse = existing.into();
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::to_value(response).unwrap()),
-        ));
+        
+        // Return existing transfer (idempotency hit)
+        info!("Idempotency hit for transfer {}", transfer_id);
+        let mut response: TransferResponse = existing.into();
+        
+        // Include audit trail in response
+        if let Ok(events) = rh::get_events(&mut *conn, &transfer_id).await {
+            response.events = Some(events);
+        }
+        
+        // Return 201 if still in RECEIVED state, 200 otherwise
+        let status = if response.status == Status::Received {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        
+        return Ok((status, Json(serde_json::to_value(response).unwrap())));
     }
 
     // Store new transfer
@@ -128,6 +140,19 @@ async fn create_transfer(
         .await
         .map_err(|e| {
             warn!("[REQUEST_TRACE] #{} - Redis SET error: {:?}", count, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
+    // Log RECEIVED event
+    rh::log_event(&mut *conn, &transfer_id, Event::new("RECEIVED"))
+        .await
+        .map_err(|e| {
+            warn!("Failed to log RECEIVED event: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -149,7 +174,7 @@ async fn create_transfer(
             )
         })?;
 
-    // Update status
+    // Update status to QUEUED_REGISTRATION
     rh::update_transfer_status(&mut *conn, &transfer_id, Status::QueuedRegistration)
         .await
         .map_err(|e| {
@@ -161,6 +186,21 @@ async fn create_transfer(
                 }),
             )
         })?;
+
+    // Log QUEUED_REGISTRATION event
+    rh::log_event(&mut *conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
+        .await
+        .map_err(|e| {
+            warn!("Failed to log QUEUED_REGISTRATION event: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+    
+    info!("Created transfer {}", transfer_id);
 
     let response = TransferResponse {
         transfer_id: transfer.transfer_id,
