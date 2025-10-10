@@ -50,18 +50,17 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     let redis_client = redis::Client::open(redis.url.as_str())?;
 
-    // Create shared Redis connection manager wrapped in Arc<Mutex<>> for safe concurrent access
-    // ConnectionManager itself multiplexes over a single connection, so we need mutex to serialize operations
-    let conn_manager = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
-    let redis_conn = Arc::new(tokio::sync::Mutex::new(conn_manager.clone()));
+    // Create shared Redis connection manager
+    // ConnectionManager is designed for concurrent use - cloning it is safe and efficient
+    let redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
 
     let rpc_client = Arc::new(NearRpcClient::new(&rpc_url));
     let access_key_pool = Arc::new(AccessKeyPool::new(
         access_keys.clone(),
-        conn_manager.clone(),
+        redis_conn.clone(),
     ));
 
-    let mut nonce_manager = NonceManager::new(conn_manager.clone());
+    let mut nonce_manager = NonceManager::new(redis_conn.clone());
 
     info!("Initializing nonces from RPC...");
     for key in &access_keys {
@@ -103,10 +102,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     );
     for idx in 0..max_registration_workers {
         let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
-            redis_conn: conn_manager.clone(),
+            redis_conn: redis_conn.clone(),
             rpc_client: rpc_client.clone(),
             access_key_pool: access_key_pool.clone(),
-            nonce_manager: NonceManager::new(conn_manager.clone()),
+            nonce_manager: NonceManager::new(redis_conn.clone()),
             relay_account: account_id.clone(),
             token: token.clone(),
             env: env.to_string(),
@@ -130,10 +129,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     info!("Spawning {} transfer worker(s)", max_workers);
     for idx in 0..max_workers {
         let runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
-            redis_conn: conn_manager.clone(),
+            redis_conn: redis_conn.clone(),
             rpc_client: rpc_client.clone(),
             access_key_pool: access_key_pool.clone(),
-            nonce_manager: NonceManager::new(conn_manager.clone()),
+            nonce_manager: NonceManager::new(redis_conn.clone()),
             relay_account: account_id.clone(),
             token: token.clone(),
             env: env.to_string(),
@@ -157,7 +156,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     );
     for idx in 0..max_verification_workers {
         let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
-            redis_conn: conn_manager.clone(),
+            redis_conn: redis_conn.clone(),
             rpc_client: rpc_client.clone(),
             relay_account: account_id.clone(),
             env: env.to_string(),

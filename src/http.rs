@@ -15,12 +15,12 @@ use crate::types::{
 
 #[derive(Clone)]
 struct AppState {
-    redis_conn: std::sync::Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
+    redis_conn: redis::aio::ConnectionManager,
     env: String,
 }
 
 pub fn build_router(
-    redis_conn: std::sync::Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
+    redis_conn: redis::aio::ConnectionManager,
     env: String,
     _token: AccountId,
 ) -> Router {
@@ -84,9 +84,8 @@ async fn create_transfer(
 
     info!("[REQUEST_TRACE] #{} - Validation passed", count);
 
-    // Lock the mutex to get exclusive access to the ConnectionManager
-    // This serializes Redis operations across all concurrent requests
-    let mut conn = state.redis_conn.lock().await;
+    // Clone connection (ConnectionManager is designed for concurrent use)
+    let mut conn = state.redis_conn.clone();
 
     let transfer = TransferState::new(
         transfer_id.clone(),
@@ -94,52 +93,46 @@ async fn create_transfer(
         body.amount.clone(),
     );
 
-    // Check for existing transfer (idempotency)
-    if let Some(existing) = rh::get_transfer_state(&mut *conn, &transfer_id)
+    // Simple idempotency check using SET NX (atomic, fast)
+    let idempotency_key = format!("idempotency:{}", transfer_id);
+    let acquired: bool = conn
+        .set_nx(&idempotency_key, "1")
         .await
         .map_err(|e| {
-            warn!("[REQUEST_TRACE] #{} - Redis GET error: {:?}", count, e);
+            warn!("Redis error: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Internal server error".to_string(),
                 }),
             )
-        })?
-    {
-        if existing.receiver_id != body.receiver_id || existing.amount != body.amount {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: "Idempotency key already used with different parameters".to_string(),
-                }),
-            ));
-        }
-        
-        // Return existing transfer (idempotency hit)
+        })?;
+
+    if !acquired {
+        // Idempotency key already used - fetch and return existing transfer
         info!("Idempotency hit for transfer {}", transfer_id);
-        let mut response: TransferResponse = existing.into();
-        
-        // Include audit trail in response
-        if let Ok(events) = rh::get_events(&mut *conn, &transfer_id).await {
-            response.events = Some(events);
+        if let Ok(Some(existing)) = rh::get_transfer_state(&mut conn, &transfer_id).await {
+            let response: TransferResponse = existing.into();
+            return Ok((StatusCode::OK, Json(serde_json::to_value(response).unwrap())));
         }
-        
-        // Return 201 if still in RECEIVED state, 200 otherwise
-        let status = if response.status == Status::Received {
-            StatusCode::CREATED
-        } else {
-            StatusCode::OK
-        };
-        
-        return Ok((status, Json(serde_json::to_value(response).unwrap())));
+        // If we can't fetch it, return a generic 200
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "transfer_id": transfer_id,
+                "status": "QUEUED"
+            })),
+        ));
     }
 
-    // Store new transfer
-    rh::store_transfer_state(&mut *conn, &transfer)
+    // Set expiry on idempotency key (24 hours)
+    let _: () = conn.expire(&idempotency_key, 86400).await.unwrap_or(());
+
+    // Store minimal transfer state (just the essentials)
+    rh::store_transfer_state(&mut conn, &transfer)
         .await
         .map_err(|e| {
-            warn!("[REQUEST_TRACE] #{} - Redis SET error: {:?}", count, e);
+            warn!("Redis error: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -148,11 +141,11 @@ async fn create_transfer(
             )
         })?;
 
-    // Log RECEIVED event
-    rh::log_event(&mut *conn, &transfer_id, Event::new("RECEIVED"))
+    // Enqueue for registration (single operation)
+    rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
         .await
         .map_err(|e| {
-            warn!("Failed to log RECEIVED event: {:?}", e);
+            warn!("Redis XADD error: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -160,47 +153,6 @@ async fn create_transfer(
                 }),
             )
         })?;
-
-    // Enqueue for registration
-    rh::enqueue_registration(&mut *conn, &state.env, &transfer_id, 0)
-        .await
-        .map_err(|e| {
-            warn!("[REQUEST_TRACE] #{} - Redis ENQUEUE error: {:?}", count, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
-
-    // Update status to QUEUED_REGISTRATION
-    rh::update_transfer_status(&mut *conn, &transfer_id, Status::QueuedRegistration)
-        .await
-        .map_err(|e| {
-            warn!("[REQUEST_TRACE] #{} - Redis UPDATE error: {:?}", count, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
-
-    // Log QUEUED_REGISTRATION event
-    rh::log_event(&mut *conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
-        .await
-        .map_err(|e| {
-            warn!("Failed to log QUEUED_REGISTRATION event: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error".to_string(),
-                }),
-            )
-        })?;
-    
-    info!("Created transfer {}", transfer_id);
 
     let response = TransferResponse {
         transfer_id: transfer.transfer_id,
@@ -224,9 +176,9 @@ async fn get_transfer_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TransferResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut conn = state.redis_conn.lock().await;
+    let mut conn = state.redis_conn.clone();
 
-    let transfer = match rh::get_transfer_state(&mut *conn, &id).await {
+    let transfer = match rh::get_transfer_state(&mut conn, &id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err((
@@ -247,7 +199,7 @@ async fn get_transfer_status(
         }
     };
 
-    let events = rh::get_events(&mut *conn, &id).await.ok();
+    let events = rh::get_events(&mut conn, &id).await.ok();
 
     let mut response: TransferResponse = transfer.into();
     response.events = events;
@@ -256,9 +208,9 @@ async fn get_transfer_status(
 }
 
 async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut conn = state.redis_conn.lock().await;
+    let mut conn = state.redis_conn.clone();
 
-    let redis_status = match (*conn).ping::<()>().await {
+    let redis_status = match conn.ping::<()>().await {
         Ok(_) => "connected",
         Err(_) => "disconnected",
     };
