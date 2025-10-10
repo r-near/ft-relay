@@ -65,16 +65,19 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
         for (stream_id, msg) in batch {
             match verify_transaction(&ctx, &msg).await {
                 Ok(VerificationResult::Completed) => {
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
                 }
                 Ok(VerificationResult::Failed(reason)) => {
                     warn!("Transfer {} failed: {}", msg.transfer_id, reason);
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
                 }
                 Ok(VerificationResult::Pending) => {
                     let retry_count = msg.retry_count + 1;
-                    
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
                     if retry_count < MAX_VERIFICATION_RETRIES {
                         let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
@@ -87,31 +90,25 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
                         )
                         .await;
                     } else {
-                        let _ = rh::update_transfer_status(
-                            &mut conn,
-                            &msg.transfer_id,
-                            Status::Failed,
-                        )
-                        .await;
+                        let _ =
+                            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed)
+                                .await;
                         let _ = rh::log_event(
                             &mut conn,
                             &msg.transfer_id,
-                            Event::new("FAILED")
-                                .with_reason(format!(
-                                    "Verification timeout after {} checks",
-                                    retry_count
-                                )),
+                            Event::new("FAILED").with_reason(format!(
+                                "Verification timeout after {} checks",
+                                retry_count
+                            )),
                         )
                         .await;
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "Error checking tx status for {}: {:?}",
-                        msg.transfer_id, e
-                    );
-                    
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                    warn!("Error checking tx status for {}: {:?}", msg.transfer_id, e);
+
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
                     let retry_count = msg.retry_count + 1;
                     if retry_count < MAX_VERIFICATION_RETRIES {
@@ -140,14 +137,16 @@ async fn verify_transaction(
     msg: &VerificationMessage,
 ) -> Result<VerificationResult> {
     let mut conn = ctx.runtime.redis_conn.clone();
-    
+
     // Fast path: Check if tx_hash status is already cached in Redis
     // If cached as completed/failed, the first worker already updated ALL transfers
     // So we can just ACK and skip (no need to update again)
     if let Some(cached_status) = rh::get_tx_status(&mut conn, &msg.tx_hash).await? {
-        info!("Tx {} status already cached: {} (transfer {} already updated by first worker)", 
-              msg.tx_hash, cached_status, msg.transfer_id);
-        
+        info!(
+            "Tx {} status already cached: {} (transfer {} already updated by first worker)",
+            msg.tx_hash, cached_status, msg.transfer_id
+        );
+
         match cached_status.as_str() {
             "completed" => return Ok(VerificationResult::Completed),
             "failed" => return Ok(VerificationResult::Failed("Cached failure".to_string())),
@@ -170,30 +169,34 @@ async fn verify_transaction(
     {
         TxStatus::Success(_outcome) => {
             info!("Tx {} completed successfully", msg.tx_hash);
-            
+
             // Cache the result so other transfers skip RPC
             rh::set_tx_status(&mut conn, &msg.tx_hash, "completed").await?;
-            
+
             // Get all transfers for this tx and update them all
             let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
-            info!("Updating {} transfers for tx {}", transfer_ids.len(), msg.tx_hash);
-            
+            info!(
+                "Updating {} transfers for tx {}",
+                transfer_ids.len(),
+                msg.tx_hash
+            );
+
             for transfer_id in transfer_ids {
                 rh::update_transfer_status(&mut conn, &transfer_id, Status::Completed).await?;
                 rh::log_event(&mut conn, &transfer_id, Event::new("COMPLETED")).await?;
             }
-            
+
             Ok(VerificationResult::Completed)
         }
         TxStatus::Failed(reason) => {
             warn!("Tx {} failed on-chain: {}", msg.tx_hash, reason);
-            
+
             // Cache the result
             rh::set_tx_status(&mut conn, &msg.tx_hash, "failed").await?;
-            
+
             // Get all transfers for this tx and mark them as failed
             let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
-            
+
             for transfer_id in transfer_ids {
                 rh::update_transfer_status(&mut conn, &transfer_id, Status::Failed).await?;
                 rh::log_event(
@@ -203,7 +206,7 @@ async fn verify_transaction(
                 )
                 .await?;
             }
-            
+
             Ok(VerificationResult::Failed(reason))
         }
         TxStatus::Pending => {

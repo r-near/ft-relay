@@ -153,9 +153,12 @@ impl RelayConfigBuilder {
         let secret_keys = parse_secret_keys(&self.private_keys)?;
 
         let redis = RedisSettings::new(
-            self.redis_url.unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
-            self.redis_stream_key.unwrap_or_else(|| DEFAULT_REDIS_STREAM_KEY.to_string()),
-            self.redis_consumer_group.unwrap_or_else(|| DEFAULT_REDIS_CONSUMER_GROUP.to_string()),
+            self.redis_url
+                .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
+            self.redis_stream_key
+                .unwrap_or_else(|| DEFAULT_REDIS_STREAM_KEY.to_string()),
+            self.redis_consumer_group
+                .unwrap_or_else(|| DEFAULT_REDIS_CONSUMER_GROUP.to_string()),
             self.redis_registration_stream_key
                 .unwrap_or_else(|| DEFAULT_REDIS_REGISTRATION_STREAM_KEY.to_string()),
             self.redis_registration_consumer_group
@@ -169,10 +172,16 @@ impl RelayConfigBuilder {
             rpc_url: self.rpc_url,
             batch_linger_ms: self.batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
             batch_submit_delay_ms: self.batch_submit_delay_ms.unwrap_or(0),
-            max_inflight_batches: self.max_inflight_batches.unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
+            max_inflight_batches: self
+                .max_inflight_batches
+                .unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
             max_workers: self.max_workers.unwrap_or(DEFAULT_MAX_TRANSFER_WORKERS),
-            max_registration_workers: self.max_registration_workers.unwrap_or(DEFAULT_MAX_REGISTRATION_WORKERS),
-            max_verification_workers: self.max_verification_workers.unwrap_or(DEFAULT_MAX_VERIFICATION_WORKERS),
+            max_registration_workers: self
+                .max_registration_workers
+                .unwrap_or(DEFAULT_MAX_REGISTRATION_WORKERS),
+            max_verification_workers: self
+                .max_verification_workers
+                .unwrap_or(DEFAULT_MAX_VERIFICATION_WORKERS),
             bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
             redis,
         })

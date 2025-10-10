@@ -68,12 +68,17 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
         for (stream_id, msg) in batch {
             match process_registration(&ctx, &msg).await {
                 Ok(_) => {
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
                 }
                 Err(e) => {
-                    warn!("Error processing registration for {}: {:?}", msg.transfer_id, e);
-                    
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                    warn!(
+                        "Error processing registration for {}: {:?}",
+                        msg.transfer_id, e
+                    );
+
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
                     let retry_count = msg.retry_count + 1;
                     if retry_count < MAX_RETRIES {
@@ -86,12 +91,9 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
                         )
                         .await;
                     } else {
-                        let _ = rh::update_transfer_status(
-                            &mut conn,
-                            &msg.transfer_id,
-                            Status::Failed,
-                        )
-                        .await;
+                        let _ =
+                            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed)
+                                .await;
                         let _ = rh::log_event(
                             &mut conn,
                             &msg.transfer_id,
@@ -184,20 +186,24 @@ async fn process_registration(
             rh::mark_account_registered(&mut conn, account).await?;
             rh::release_lock(&mut conn, &lock_key).await?;
             rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED").with_tx_hash(tx_hash_str)).await?;
+            rh::log_event(
+                &mut conn,
+                &msg.transfer_id,
+                Event::new("REGISTERED").with_tx_hash(tx_hash_str),
+            )
+            .await?;
             rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
             rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
             Ok(())
         }
         Err(e) => {
             let err_str = format!("{:?}", e);
-            
+
             if err_str.contains("already") || err_str.contains("exist") {
                 info!("Account {} already registered (on-chain)", account);
                 rh::mark_account_registered(&mut conn, account).await?;
                 rh::release_lock(&mut conn, &lock_key).await?;
-                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered)
-                    .await?;
+                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
                 rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
                 rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
                 rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;

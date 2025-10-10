@@ -5,8 +5,8 @@ mod nonce_manager;
 pub mod redis_helpers;
 mod registration_worker;
 mod rpc_client;
-pub mod types;
 mod transfer_worker;
+pub mod types;
 mod verification_worker;
 
 pub use access_key_pool::{AccessKeyPool, LeasedKey};
@@ -49,25 +49,33 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     }
 
     let redis_client = redis::Client::open(redis.url.as_str())?;
-    
+
     // Create shared Redis connection manager wrapped in Arc<Mutex<>> for safe concurrent access
     // ConnectionManager itself multiplexes over a single connection, so we need mutex to serialize operations
     let conn_manager = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
     let redis_conn = Arc::new(tokio::sync::Mutex::new(conn_manager.clone()));
-    
+
     let rpc_client = Arc::new(NearRpcClient::new(&rpc_url));
-    let access_key_pool = Arc::new(AccessKeyPool::new(access_keys.clone(), conn_manager.clone()));
+    let access_key_pool = Arc::new(AccessKeyPool::new(
+        access_keys.clone(),
+        conn_manager.clone(),
+    ));
 
     let mut nonce_manager = NonceManager::new(conn_manager.clone());
 
     info!("Initializing nonces from RPC...");
     for key in &access_keys {
         if !nonce_manager.is_initialized(&key.key_id).await? {
-            let access_key_view = rpc_client.get_access_key(&account_id, &key.public_key).await?;
+            let access_key_view = rpc_client
+                .get_access_key(&account_id, &key.public_key)
+                .await?;
             nonce_manager
                 .initialize_nonce(&key.key_id, access_key_view.nonce)
                 .await?;
-            info!("Initialized nonce for key {} to {}", key.key_id, access_key_view.nonce);
+            info!(
+                "Initialized nonce for key {} to {}",
+                key.key_id, access_key_view.nonce
+            );
         }
     }
 
@@ -82,11 +90,17 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     let router = http::build_router(redis_conn.clone(), env.to_string(), token.clone());
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-        info!("HTTP server listening on http://{}", listener.local_addr().unwrap());
+        info!(
+            "HTTP server listening on http://{}",
+            listener.local_addr().unwrap()
+        );
         axum::serve(listener, router).await.unwrap();
     });
 
-    info!("Spawning {} registration worker(s)", max_registration_workers);
+    info!(
+        "Spawning {} registration worker(s)",
+        max_registration_workers
+    );
     for idx in 0..max_registration_workers {
         let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
             redis_conn: conn_manager.clone(),
@@ -105,7 +119,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(err) = registration_worker::registration_worker_loop(ctx).await {
-                warn!("Registration worker {} terminated with error: {:?}", idx, err);
+                warn!(
+                    "Registration worker {} terminated with error: {:?}",
+                    idx, err
+                );
             }
         });
     }
@@ -134,7 +151,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         });
     }
 
-    info!("Spawning {} verification worker(s)", max_verification_workers);
+    info!(
+        "Spawning {} verification worker(s)",
+        max_verification_workers
+    );
     for idx in 0..max_verification_workers {
         let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
             redis_conn: conn_manager.clone(),
@@ -150,7 +170,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(err) = verification_worker::verification_worker_loop(ctx).await {
-                warn!("Verification worker {} terminated with error: {:?}", idx, err);
+                warn!(
+                    "Verification worker {} terminated with error: {:?}",
+                    idx, err
+                );
             }
         });
     }

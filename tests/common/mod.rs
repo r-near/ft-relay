@@ -317,7 +317,9 @@ impl TestnetHarness {
         if let Some(err) = first_error {
             let err_str = format!("{err:?}");
             if err_str.contains("rate limit") || err_str.contains("TooManyRequests") {
-                eprintln!("⚠️  Teardown hit rate limits - test accounts will auto-expire on testnet");
+                eprintln!(
+                    "⚠️  Teardown hit rate limits - test accounts will auto-expire on testnet"
+                );
                 Ok(())
             } else {
                 Err(err)

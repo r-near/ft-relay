@@ -102,14 +102,17 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         batch_linger_ms: 500,
         batch_submit_delay_ms: 0, // No throttling - submit as fast as possible, rely on retries
         max_inflight_batches: 1000, // High concurrency to maximize throughput
-        max_workers: 10, // Many workers to process batches quickly
+        max_workers: 10,          // Many workers to process batches quickly
         bind_addr: bind_addr.clone(),
         redis: redis.clone(),
     };
 
     println!("Server Configuration:");
     println!("  Batch linger: {}ms", config.batch_linger_ms);
-    println!("  Batch submit delay: {}ms (throttling)", config.batch_submit_delay_ms);
+    println!(
+        "  Batch submit delay: {}ms (throttling)",
+        config.batch_submit_delay_ms
+    );
     println!("  Max inflight batches: {}", config.max_inflight_batches);
     println!("  Access keys: {}\n", config.secret_keys.len());
 
@@ -449,13 +452,13 @@ async fn print_reconciliation_report(
 
     // Try to get transaction statuses
     let tx_keys: Vec<String> = conn.keys("tx:status:*").await.unwrap_or_default();
-    
+
     let mut submitted = 0;
     let mut succeeded = 0;
     let mut timeout = 0;
     let mut failed = 0;
     let mut timeout_txs = Vec::new();
-    
+
     for key in tx_keys {
         if let Ok(value) = conn.get::<_, String>(&key).await {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(&value) {
@@ -487,11 +490,11 @@ async fn print_reconciliation_report(
     println!("  Timeout:           {}", timeout);
     println!("  Failed:            {}", failed);
     println!();
-    
+
     println!("🎯 Transfer Summary:");
     println!("  Expected tokens:   {}", expected_tokens);
     println!("  On-chain tokens:   {}", actual_tokens);
-    
+
     if actual_tokens > expected_tokens {
         let duplicates = actual_tokens - expected_tokens;
         println!("  ⚠️  Duplicates:       +{}", duplicates);
@@ -501,22 +504,28 @@ async fn print_reconciliation_report(
     } else {
         println!("  ✅ Perfect match!");
     }
-    
+
     if timeout > 0 {
         println!();
         println!("⏱️  Timeout Details:");
         let total_timeout_transfers: usize = timeout_txs.iter().map(|(_, count)| count).sum();
-        println!("  {} transaction(s) timed out ({} transfers)", timeout, total_timeout_transfers);
-        
+        println!(
+            "  {} transaction(s) timed out ({} transfers)",
+            timeout, total_timeout_transfers
+        );
+
         for (i, (tx_hash, count)) in timeout_txs.iter().enumerate().take(3) {
             println!("    {}. {}... → {} transfers", i + 1, &tx_hash[..16], count);
         }
-        
+
         if actual_tokens > expected_tokens {
             let duplicates = actual_tokens - expected_tokens;
             println!();
             println!("  ⚠️  Analysis:");
-            println!("     - {} transfers timed out on RPC", total_timeout_transfers);
+            println!(
+                "     - {} transfers timed out on RPC",
+                total_timeout_transfers
+            );
             println!("     - Some likely succeeded on-chain despite timeout");
             println!("     - {} duplicates detected from retries", duplicates);
             println!("     - This is the RPC timeout issue we're tracking");

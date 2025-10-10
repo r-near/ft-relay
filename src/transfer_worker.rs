@@ -164,10 +164,20 @@ async fn process_batch(
                     Event::new("SUBMITTED").with_tx_hash(tx_hash_str.clone()),
                 )
                 .await?;
-                rh::enqueue_verification(&mut conn, &ctx.runtime.env, &msg.transfer_id, &tx_hash_str, 0)
-                    .await?;
-                rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_VERIFICATION"))
-                    .await?;
+                rh::enqueue_verification(
+                    &mut conn,
+                    &ctx.runtime.env,
+                    &msg.transfer_id,
+                    &tx_hash_str,
+                    0,
+                )
+                .await?;
+                rh::log_event(
+                    &mut conn,
+                    &msg.transfer_id,
+                    Event::new("QUEUED_VERIFICATION"),
+                )
+                .await?;
 
                 let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
             }

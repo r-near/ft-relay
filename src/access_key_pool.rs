@@ -17,7 +17,7 @@ impl AccessKeyPool {
 
     pub async fn lease(&self) -> Result<LeasedKey> {
         use rand::Rng;
-        
+
         loop {
             let idx = rand::rng().random_range(0..self.keys.len());
             let key = &self.keys[idx];

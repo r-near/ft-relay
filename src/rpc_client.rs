@@ -95,22 +95,29 @@ impl NearRpcClient {
         let request = methods::tx::RpcTransactionStatusRequest {
             transaction_info: methods::tx::TransactionInfo::TransactionId {
                 tx_hash: *tx_hash,
-                sender_account_id: sender.parse().map_err(|e| anyhow!("Invalid account ID: {:?}", e))?,
+                sender_account_id: sender
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid account ID: {:?}", e))?,
             },
             wait_until: near_primitives::views::TxExecutionStatus::Final,
         };
 
         match self.client.call(request).await {
             Ok(response) => {
-                let outcome = response.final_execution_outcome
+                let outcome = response
+                    .final_execution_outcome
                     .ok_or_else(|| anyhow!("No execution outcome"))?;
                 let outcome_view = outcome.into_outcome();
                 match outcome_view.status {
                     FinalExecutionStatus::SuccessValue(_) => {
                         Ok(TxStatus::Success(Box::new(outcome_view)))
                     }
-                    FinalExecutionStatus::Failure(err) => Ok(TxStatus::Failed(format!("{:?}", err))),
-                    FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => Ok(TxStatus::Pending),
+                    FinalExecutionStatus::Failure(err) => {
+                        Ok(TxStatus::Failed(format!("{:?}", err)))
+                    }
+                    FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => {
+                        Ok(TxStatus::Pending)
+                    }
                 }
             }
             Err(e) => {
@@ -133,7 +140,9 @@ impl NearRpcClient {
         let request = methods::query::RpcQueryRequest {
             block_reference: BlockReference::Finality(Finality::Final),
             request: near_primitives::views::QueryRequest::ViewAccessKey {
-                account_id: account.parse().map_err(|e| anyhow!("Invalid account ID: {:?}", e))?,
+                account_id: account
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid account ID: {:?}", e))?,
                 public_key: public_key.clone(),
             },
         };
@@ -173,17 +182,21 @@ impl NearRpcClient {
         }));
 
         let transaction = Transaction::V0(near_primitives::transaction::TransactionV0 {
-            signer_id: signer_account.parse().map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
+            signer_id: signer_account
+                .parse()
+                .map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
             public_key: secret_key.public_key(),
             nonce,
-            receiver_id: token.parse().map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
+            receiver_id: token
+                .parse()
+                .map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
             block_hash,
             actions: vec![action],
         });
 
         let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
-        
+
         self.broadcast_tx(signed_tx).await
     }
 
@@ -215,17 +228,21 @@ impl NearRpcClient {
             .collect();
 
         let transaction = Transaction::V0(near_primitives::transaction::TransactionV0 {
-            signer_id: signer_account.parse().map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
+            signer_id: signer_account
+                .parse()
+                .map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
             public_key: secret_key.public_key(),
             nonce,
-            receiver_id: token.parse().map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
+            receiver_id: token
+                .parse()
+                .map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
             block_hash,
             actions,
         });
 
         let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
-        
+
         self.broadcast_tx(signed_tx).await
     }
 }

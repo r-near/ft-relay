@@ -180,7 +180,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     let new_keys: Vec<SecretKey> = (0..2)
         .map(|_| SecretKey::from_random(near_crypto::KeyType::ED25519))
         .collect();
-    
+
     println!("Adding 2 new access keys in a single batch transaction...");
     for (i, key) in new_keys.iter().enumerate() {
         println!("  Key {}: {}", i + 1, key.public_key());
@@ -328,7 +328,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     });
 
     tokio::time::sleep(Duration::from_millis(2000)).await;
-    
+
     // Wait for server to be ready with health check
     let client = reqwest::Client::new();
     println!("Waiting for server to be ready...");
@@ -376,13 +376,18 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             let mut worker_errors = 0;
             for i in start_idx..end_idx {
                 if worker_id == 0 && i % 1000 == 0 {
-                    println!("Worker {} at request {}/{}", worker_id, i - start_idx, end_idx - start_idx);
+                    println!(
+                        "Worker {} at request {}/{}",
+                        worker_id,
+                        i - start_idx,
+                        end_idx - start_idx
+                    );
                 }
                 let receiver_id = receivers[i % receiver_count].account_id.clone();
 
                 // Generate unique idempotency key for this request
                 let idempotency_key = uuid::Uuid::new_v4().to_string();
-                
+
                 match client
                     .post("http://127.0.0.1:18082/v1/transfer")
                     .header("X-Idempotency-Key", &idempotency_key)
@@ -456,7 +461,10 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("  Total requests:  {}", total_requests);
     println!("  Accepted:        {}", total_success);
     println!("  Errors:          {}", total_errors);
-    println!("  Other:           {}", total_requests - total_success - total_errors);
+    println!(
+        "  Other:           {}",
+        total_requests - total_success - total_errors
+    );
     println!("  API duration:    {:.2}s", api_duration_secs);
     println!("  API throughput:  {:.2} req/sec", api_throughput);
     println!("  Target:          ≥100 req/sec");
