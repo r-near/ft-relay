@@ -149,6 +149,9 @@ async fn test_simple_redis_xadd_performance() {
 #[tokio::test]
 #[ignore]
 async fn test_http_endpoint_timing() {
+    use ft_relay::RelayConfig;
+    use near_workspaces::{network::Sandbox, Account, Contract, Worker};
+    
     println!("\n=== HTTP Endpoint Timing Test ===");
     
     // Flush Redis
@@ -161,10 +164,79 @@ async fn test_http_endpoint_timing() {
         .unwrap();
     println!("✅ Redis flushed");
     
-    // Note: This test requires server to be started manually
-    // Run: cargo run --bin ft-relay
-    println!("ℹ️  Make sure server is running on http://127.0.0.1:18082");
+    // Start sandbox
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let wasm = std::fs::read("./resources/fungible_token.wasm").unwrap();
+    let contract = worker.dev_deploy(&wasm).await.unwrap();
+    
+    let token_id = contract.id().clone();
+    let relay_account = worker.dev_create_account().await.unwrap();
+    
+    // Initialize FT contract
+    contract
+        .call("new_default_meta")
+        .args_json(serde_json::json!({
+            "owner_id": relay_account.id(),
+            "total_supply": "1000000000000000000000000000"
+        }))
+        .transact()
+        .await
+        .unwrap()
+        .unwrap();
+    
+    println!("✅ FT contract deployed at {}", token_id);
+    
+    // Generate 1 access key for simplicity
+    let key = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let pk = key.public_key();
+    
+    relay_account
+        .batch(relay_account.id())
+        .add_key(pk.clone(), near_workspaces::AccessKey {
+            nonce: 0,
+            permission: near_workspaces::AccessKeyPermission::FullAccess,
+        })
+        .transact()
+        .await
+        .unwrap()
+        .unwrap();
+    
+    println!("✅ Access key added");
+    
+    // Build config
+    let config = RelayConfig {
+        token: token_id.parse().unwrap(),
+        account_id: relay_account.id().parse().unwrap(),
+        secret_keys: vec![key.to_string()],
+        rpc_url: worker.rpc_addr(),
+        batch_linger_ms: 1000,
+        batch_submit_delay_ms: 0,
+        max_inflight_batches: 500,
+        max_workers: 1,
+        max_registration_workers: 1,
+        max_verification_workers: 1,
+        bind_addr: "127.0.0.1:18084".to_string(),
+        redis: ft_relay::RedisSettings {
+            url: redis_url.to_string(),
+            stream_key: "ftrelay:test".to_string(),
+            consumer_group: "ftrelay:test:group".to_string(),
+            registration_stream_key: "ftrelay:test:reg".to_string(),
+            registration_consumer_group: "ftrelay:test:reg:group".to_string(),
+            transfer_stream_key: "ftrelay:test:transfer".to_string(),
+            transfer_consumer_group: "ftrelay:test:transfer:group".to_string(),
+            verification_stream_key: "ftrelay:test:verification".to_string(),
+            verification_consumer_group: "ftrelay:test:verification:group".to_string(),
+        },
+    };
+    
+    // Start server
+    tokio::spawn(async move {
+        ft_relay::run(config).await.unwrap();
+    });
+    
+    // Wait for server
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    println!("✅ Server started on http://127.0.0.1:18084");
     
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -178,7 +250,7 @@ async fn test_http_endpoint_timing() {
     for i in 0..10 {
         let req_start = Instant::now();
         let response = http_client
-            .post("http://127.0.0.1:18082/v1/transfer")
+            .post("http://127.0.0.1:18084/v1/transfer")
             .header("X-Idempotency-Key", format!("seq-test-{}", i))
             .json(&serde_json::json!({
                 "receiver_id": "alice.near",
@@ -208,7 +280,7 @@ async fn test_http_endpoint_timing() {
         let handle = tokio::spawn(async move {
             let req_start = Instant::now();
             let response = client
-                .post("http://127.0.0.1:18082/v1/transfer")
+                .post("http://127.0.0.1:18084/v1/transfer")
                 .header("X-Idempotency-Key", format!("concurrent-test-{}", i))
                 .json(&serde_json::json!({
                     "receiver_id": "bob.near",
@@ -234,6 +306,8 @@ async fn test_http_endpoint_timing() {
     
     // Check Redis stream
     println!("\n--- Redis Stream Check ---");
-    let len: usize = conn.xlen("ftrelay:sandbox:reg").await.unwrap();
-    println!("  ftrelay:sandbox:reg: {} messages", len);
+    let len: usize = conn.xlen("ftrelay:test:reg").await.unwrap();
+    println!("  ftrelay:test:reg: {} messages", len);
+    
+    println!("\n✅ All tests completed!");
 }

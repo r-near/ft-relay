@@ -327,8 +327,6 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-
     // Wait for server to be ready with health check
     let client = reqwest::Client::new();
     println!("Waiting for server to be ready...");

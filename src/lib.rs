@@ -101,11 +101,13 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         max_registration_workers
     );
     for idx in 0..max_registration_workers {
+        // Each worker gets its OWN connection to avoid blocking the HTTP handler
+        let worker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
         let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
-            redis_conn: redis_conn.clone(),
+            redis_conn: worker_conn.clone(),
             rpc_client: rpc_client.clone(),
             access_key_pool: access_key_pool.clone(),
-            nonce_manager: NonceManager::new(redis_conn.clone()),
+            nonce_manager: NonceManager::new(worker_conn),
             relay_account: account_id.clone(),
             token: token.clone(),
             env: env.to_string(),
@@ -128,11 +130,13 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     info!("Spawning {} transfer worker(s)", max_workers);
     for idx in 0..max_workers {
+        // Each worker gets its OWN connection to avoid blocking the HTTP handler
+        let worker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
         let runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
-            redis_conn: redis_conn.clone(),
+            redis_conn: worker_conn.clone(),
             rpc_client: rpc_client.clone(),
             access_key_pool: access_key_pool.clone(),
-            nonce_manager: NonceManager::new(redis_conn.clone()),
+            nonce_manager: NonceManager::new(worker_conn),
             relay_account: account_id.clone(),
             token: token.clone(),
             env: env.to_string(),
@@ -155,8 +159,10 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         max_verification_workers
     );
     for idx in 0..max_verification_workers {
+        // Each worker gets its OWN connection to avoid blocking the HTTP handler
+        let worker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
         let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
-            redis_conn: redis_conn.clone(),
+            redis_conn: worker_conn,
             rpc_client: rpc_client.clone(),
             relay_account: account_id.clone(),
             env: env.to_string(),
