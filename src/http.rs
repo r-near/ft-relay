@@ -78,12 +78,18 @@ async fn create_transfer(
     // Clone connection (ConnectionManager is designed for concurrent use)
     let mut conn = state.redis_conn.clone();
 
-    // FAST PATH: Just enqueue directly - no Redis state storage in HTTP handler
-    // Workers will handle all the state management
-    rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+    // Create transfer state
+    let transfer = TransferState::new(
+        transfer_id.clone(),
+        body.receiver_id.clone(),
+        body.amount.clone(),
+    );
+
+    // Store transfer state (needed by workers)
+    rh::store_transfer_state(&mut conn, &transfer)
         .await
         .map_err(|e| {
-            warn!("Redis XADD error: {:?}", e);
+            warn!("Failed to store transfer state: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -92,15 +98,35 @@ async fn create_transfer(
             )
         })?;
 
-    // Return minimal response - worker will handle the rest
-    let response = json!({
-        "transfer_id": transfer_id,
-        "receiver_id": body.receiver_id,
-        "amount": body.amount,
-        "status": "QUEUED"
-    });
+    // Enqueue for registration
+    rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+        .await
+        .map_err(|e| {
+            warn!("Failed to enqueue registration: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
 
-    Ok((StatusCode::CREATED, Json(response)))
+    let response = TransferResponse {
+        transfer_id: transfer.transfer_id,
+        status: Status::QueuedRegistration,
+        receiver_id: transfer.receiver_id,
+        amount: transfer.amount,
+        tx_hash: None,
+        created_at: transfer.created_at,
+        completed_at: None,
+        retry_count: Some(0),
+        events: None,
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::to_value(response).unwrap()),
+    ))
 }
 
 async fn get_transfer_status(
