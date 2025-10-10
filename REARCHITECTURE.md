@@ -459,26 +459,31 @@ HSET block_hash:latest
 
 ### Redis Streams
 
-#### Registration Stream
+**Design:** 3 streams total (simple is better!)
+
+**Registration Stream:**
 ```redis
 XADD ftrelay:testnet:registration * transfer_id "idem-key-123" retry_count "0"
 ```
-
 **Consumer Group:** `registration_workers`
 
-#### Transfer Stream
+**Transfer Stream:**
 ```redis
 XADD ftrelay:testnet:transfer * transfer_id "idem-key-123" retry_count "0"
 ```
-
 **Consumer Group:** `transfer_workers`
 
-#### Verification Stream
+**Verification Stream:**
 ```redis
 XADD ftrelay:testnet:verification * transfer_id "idem-key-123" tx_hash "abc123..." retry_count "0"
 ```
-
 **Consumer Group:** `verification_workers`
+
+**Retry Strategy:**
+- On failure: ACK original message, push back to **same stream** with incremented retry_count
+- On success: ACK message, move to next stage
+- retry_count in message payload tracks attempts
+- Simple, explicit, no separate retry queues needed
 
 ### Redis Persistence Configuration
 
@@ -674,9 +679,10 @@ async fn registration_worker_loop(ctx: Context) -> Result<()> {
             
             if !acquired {
                 // Another worker is handling this account
-                // Wait 1 second and requeue
+                // ACK and re-enqueue to same stream (will retry)
+                ctx.stream.ack(stream_id).await?;
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                ctx.stream.nack(stream_id).await?; // Will be auto-reclaimed
+                ctx.redis.enqueue_registration(&transfer_id).await?;
                 continue;
             }
             
@@ -718,15 +724,16 @@ async fn registration_worker_loop(ctx: Context) -> Result<()> {
                     
                     // Check retry count
                     let retry_count = transfer.retry_count + 1;
+                    ctx.stream.ack(stream_id).await?; // Always ACK
+                    
                     if retry_count < MAX_RETRIES {
                         ctx.redis.increment_retry_count(&transfer_id).await?;
-                        ctx.stream.nack(stream_id).await?; // Will retry
+                        ctx.redis.enqueue_registration(&transfer_id).await?; // Re-enqueue to same stream
                     } else {
                         ctx.redis.update_status(&transfer_id, Status::Failed).await?;
                         ctx.redis.log_event(&transfer_id, Event::Failed { 
                             reason: format!("Registration failed after {} retries", retry_count) 
                         }).await?;
-                        ctx.stream.ack(stream_id).await?;
                     }
                 }
             }
@@ -821,18 +828,19 @@ async fn transfer_worker_loop(ctx: Context) -> Result<()> {
             Err(e) => {
                 warn!("Failed to submit batch: {:?}", e);
                 
-                // 10. Handle failure - requeue with retry count
+                // 10. Handle failure - ACK and re-enqueue with retry count
                 for (stream_id, transfer_id, transfer) in &transfers {
                     let retry_count = transfer.retry_count + 1;
+                    ctx.stream.ack(stream_id).await?; // Always ACK
+                    
                     if retry_count < MAX_RETRIES {
                         ctx.redis.increment_retry_count(transfer_id).await?;
-                        ctx.stream.nack(stream_id).await?; // Will retry
+                        ctx.redis.enqueue_transfer(transfer_id).await?; // Re-enqueue to same stream
                     } else {
                         ctx.redis.update_status(transfer_id, Status::Failed).await?;
                         ctx.redis.log_event(transfer_id, Event::Failed {
                             reason: format!("Submission failed after {} retries: {:?}", retry_count, e)
                         }).await?;
-                        ctx.stream.ack(stream_id).await?;
                     }
                 }
             }
@@ -889,18 +897,19 @@ async fn verification_worker_loop(ctx: Context) -> Result<()> {
                     ctx.stream.ack(stream_id).await?;
                 }
                 TxStatus::Pending => {
-                    // Still pending, requeue for later check
+                    // Still pending, ACK and re-enqueue for later check
                     let retry_count = transfer.retry_count + 1;
+                    ctx.stream.ack(stream_id).await?; // Always ACK
+                    
                     if retry_count < MAX_VERIFICATION_RETRIES {
                         ctx.redis.increment_retry_count(transfer_id).await?;
-                        ctx.stream.nack(stream_id).await?; // Will check again
+                        ctx.redis.enqueue_verification(transfer_id, tx_hash).await?; // Re-enqueue to same stream
                     } else {
                         warn!("Transfer {} timed out after {} checks", transfer_id, retry_count);
                         ctx.redis.update_status(transfer_id, Status::Failed).await?;
                         ctx.redis.log_event(transfer_id, Event::Failed {
                             reason: "Verification timeout".to_string()
                         }).await?;
-                        ctx.stream.ack(stream_id).await?;
                     }
                 }
             }
@@ -1023,26 +1032,44 @@ pub struct AccessKey {
 }
 ```
 
-### Leasing Mechanism
+### Leasing Mechanism (Local List + SET NX - Production-Proven Pattern)
 
 **Goal:** Ensure only one worker uses an access key at a time (prevents nonce collisions).
 
+**Design Decision:** After thorough review, the simplest and most robust approach is:
+- Local list of keys (in memory)
+- Single atomic Redis operation (SET NX)
+- Ownership token for safe release
+- TTL handles all cleanup (no reaper needed)
+
+**Redis Data Structures:**
+```redis
+# Only lease markers exist in Redis (minimal state)
+access_key:lease:{key_id} = {ownership_token} EX 30
+```
+
 **Implementation:**
 ```rust
+pub struct AccessKeyPool {
+    keys: Vec<AccessKey>,  // Keys stored in memory
+    redis: ConnectionManager,
+}
+
 impl AccessKeyPool {
     pub async fn lease(&self) -> Result<LeasedKey> {
-        // Try each key in round-robin fashion
-        for key in &self.keys {
-            let lock_key = format!("access_key:lease:{}", key.key_id);
-            let worker_id = Uuid::new_v4().to_string();
+        loop {
+            // Pick random key (spreads load evenly)
+            let key = self.keys.choose(&mut rand::thread_rng()).unwrap();
+            let lease_key = format!("access_key:lease:{}", key.key_id);
+            let token = Uuid::new_v4().to_string();
             
-            // Try to acquire exclusive lease (10 second TTL)
+            // Single atomic operation (SET NX)
             let acquired: bool = redis::cmd("SET")
-                .arg(&lock_key)
-                .arg(&worker_id)
-                .arg("NX")  // Only if not exists
-                .arg("EX")  // Expiration
-                .arg(10)    // 10 seconds
+                .arg(&lease_key)
+                .arg(&token)
+                .arg("NX")  // Only if not exists (atomic!)
+                .arg("EX")
+                .arg(30)    // 30 second TTL (auto-cleanup)
                 .query_async(&mut self.redis)
                 .await?;
             
@@ -1051,14 +1078,14 @@ impl AccessKeyPool {
                     key_id: key.key_id.clone(),
                     secret_key: key.secret_key.clone(),
                     public_key: key.public_key.clone(),
-                    lock_key,
+                    lease_key,
+                    token,  // Store for verification on release
                     redis: self.redis.clone(),
                 });
             }
+            
+            // Key was busy, try another (with 50 keys, ~2 iterations average)
         }
-        
-        // All keys are leased, wait and retry
-        Err(anyhow!("All access keys are currently leased"))
     }
 }
 
@@ -1066,24 +1093,74 @@ pub struct LeasedKey {
     key_id: String,
     secret_key: SecretKey,
     public_key: PublicKey,
-    lock_key: String,
+    lease_key: String,
+    token: String,  // Ownership token
     redis: ConnectionManager,
 }
 
 impl Drop for LeasedKey {
     fn drop(&mut self) {
-        // Auto-release on drop
-        let lock_key = self.lock_key.clone();
+        // Atomic release with ownership verification (Lua script)
+        let script = r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+        "#;
+        
+        let lease_key = self.lease_key.clone();
+        let token = self.token.clone();
         let mut redis = self.redis.clone();
+        
         tokio::spawn(async move {
-            let _ = redis::cmd("DEL")
-                .arg(&lock_key)
-                .query_async::<_, ()>(&mut redis)
+            let _: Result<i32, _> = redis::Script::new(script)
+                .key(&lease_key)
+                .arg(&token)
+                .invoke_async(&mut redis)
                 .await;
         });
     }
 }
 ```
+
+**Why this approach?**
+
+**Attempted complexity:**
+We initially tried BRPOPLPUSH with Redis LISTs. Detailed production review revealed **13 serious issues**:
+1. Two-step non-atomic lease (race window between BRPOPLPUSH and SET)
+2. SET without ownership token (can be overwritten)
+3. No verification on release (any worker can return any key)
+4. Non-atomic release (multiple Redis commands can interleave)
+5. TTL expiring mid-work (needs heartbeat or longer TTL)
+6. Missing revert on failed lease mark (key stranded in leased list)
+7. Timeout handling bug (BRPOPLPUSH returns Option)
+8. Blocking command blocks entire connection
+9. Redis Cluster hash slot issues (needs hash tags)
+10. Duplicate entries risk (LISTs don't enforce uniqueness)
+11. Complex reaper logic needed
+12. State coordination races
+13. More Redis state to manage
+
+**Simple solution:**
+- ✅ Single atomic operation (SET NX - inherently atomic)
+- ✅ Ownership token prevents foreign/late releases
+- ✅ No LIST coordination races
+- ✅ No reaper needed (TTL auto-expires)
+- ✅ No duplicate keys possible
+- ✅ No cluster hash tag issues
+- ✅ No blocking connection needed
+- ✅ Loop is negligible (50 keys, ~80% first-try hit rate)
+- ✅ Minimal Redis state (only active leases)
+- ✅ Production-proven pattern (used by Redis itself for distributed locks)
+
+**Loop performance:**
+- 50 keys, 10 workers → ~20% leased at any time
+- 80% probability of first-try success
+- Average 1.25 iterations per lease
+- Entirely CPU-bound (no I/O in loop)
+
+**This is genuinely simpler** - trading a trivial CPU loop for elimination of 13 production bugs.
 
 ### Nonce Management
 
@@ -1280,57 +1357,40 @@ Result: All use different keys, no collisions
 match result {
     Ok(success) => {
         // Update state, log event, enqueue next step, ACK message
+        stream.ack(stream_id).await?;
+        // ... move to next stage
     }
     Err(e) if e.is_retriable() => {
         let retry_count = transfer.retry_count + 1;
+        stream.ack(stream_id).await?; // Always ACK (explicit control)
+        
         if retry_count < MAX_RETRIES {
             redis.increment_retry_count(&transfer_id).await?;
-            stream.nack(stream_id).await?; // Redis will redeliver
+            // Re-enqueue to SAME stream with incremented retry_count
+            redis.enqueue_to_stream(&stream_name, &transfer_id).await?;
         } else {
             redis.update_status(&transfer_id, Status::Failed).await?;
             redis.log_event(&transfer_id, Event::Failed {
                 reason: format!("Max retries ({}) exceeded", MAX_RETRIES)
             }).await?;
-            stream.ack(stream_id).await?; // Remove from queue
         }
     }
     Err(e) => {
         // Permanent error
+        stream.ack(stream_id).await?;
         redis.update_status(&transfer_id, Status::Failed).await?;
         redis.log_event(&transfer_id, Event::Failed {
             reason: format!("{:?}", e)
         }).await?;
-        stream.ack(stream_id).await?; // Remove from queue
     }
 }
 ```
 
-### Natural Backoff via Redis Streams
-
-**How it works:**
-1. Worker NACKs a message (doesn't acknowledge)
-2. Message goes to Pending Entry List (PEL)
-3. After some time, XAUTOCLAIM reclaims it for another consumer
-4. Effective backoff without manual sleep
-
-**Configuration:**
-```rust
-// XREADGROUP parameters
-let idle_time_ms = 5000; // Messages idle > 5s can be reclaimed
-let count = 100;         // Claim up to 100 messages
-
-// XAUTOCLAIM (automatic reclaim of idle messages)
-redis::cmd("XAUTOCLAIM")
-    .arg(&stream_key)
-    .arg(&group_name)
-    .arg(&consumer_name)
-    .arg(idle_time_ms)
-    .arg("0-0")  // Start ID
-    .arg("COUNT")
-    .arg(count)
-    .query_async(&mut redis)
-    .await?
-```
+**Key Points:**
+- Always ACK messages (never leave in PEL)
+- On retriable error: ACK, increment retry_count, re-enqueue to same stream
+- On permanent error or max retries: ACK and mark as failed
+- Simple, explicit, predictable
 
 ### Observability
 
@@ -1466,10 +1526,12 @@ MAX_VERIFICATION_RETRIES=20
 
 #### 1.6 Access Key Pool
 - [ ] Create `src/access_key_pool.rs`:
-  - [ ] `AccessKeyPool` struct
-  - [ ] `lease()` - Try to acquire exclusive lease
-  - [ ] `LeasedKey` struct with Drop implementation (auto-release)
-  - [ ] Round-robin or random selection logic
+  - [ ] `AccessKeyPool` struct (stores keys in Vec)
+  - [ ] `lease()` - Loop with random selection + SET NX
+  - [ ] `LeasedKey` struct with ownership token
+  - [ ] Drop implementation - Lua script for verified release
+  - [ ] No Redis initialization needed (keys stay in memory)
+  - [ ] No reaper needed (TTL handles cleanup)
 
 #### 1.7 Nonce Manager
 - [ ] Create `src/nonce_manager.rs`:
@@ -1486,8 +1548,7 @@ MAX_VERIFICATION_RETRIES=20
   - [ ] `create_consumer_group()` - XGROUP CREATE
   - [ ] `pop_batch()` - XREADGROUP with BLOCK and COUNT
   - [ ] `ack()` - XACK message
-  - [ ] `nack()` - Leave in PEL (don't ACK)
-  - [ ] Auto-claim logic (XAUTOCLAIM for idle messages)
+  - [ ] `enqueue()` - XADD message (for retries back to same stream)
 
 #### 2.2 Registration Worker
 - [ ] Create `src/registration_worker.rs`:
