@@ -351,6 +351,7 @@ where
     let mut batch: Vec<(String, T)> = Vec::new();
 
     // Keep accumulating until batch is full or linger time expires
+    // ALWAYS wait the full linger time to give messages a chance to arrive
     while batch.len() < max_count && start.elapsed().as_millis() < linger_ms as u128 {
         let remaining = max_count - batch.len();
         let time_left = linger_ms.saturating_sub(start.elapsed().as_millis() as u64);
@@ -368,23 +369,12 @@ where
         )
         .await?;
         
-        if additional.is_empty() {
-            // No more messages available right now
-            if batch.is_empty() {
-                // If we have nothing at all, wait a bit longer
-                if time_left > 10 {
-                    continue;
-                } else {
-                    // Waited full linger time, nothing available
-                    return Err(anyhow::anyhow!("No messages available after linger"));
-                }
-            } else {
-                // We have some messages, that's good enough
-                break;
-            }
+        // If we got messages, append them
+        if !additional.is_empty() {
+            batch.append(&mut additional);
         }
-        
-        batch.append(&mut additional);
+        // If no messages right now, keep looping - more might arrive
+        // We ALWAYS wait the full linger period to accumulate
     }
 
     if batch.is_empty() {
