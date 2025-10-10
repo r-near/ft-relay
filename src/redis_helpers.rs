@@ -35,10 +35,13 @@ pub async fn get_transfer_state<C>(conn: &mut C, transfer_id: &str) -> Result<Op
 where C: ConnectionLike + AsyncCommands + Send + Sync,
 {
     let key = format!("transfer:{}", transfer_id);
-    let exists: bool = conn.exists(&key).await?;
-    if !exists { return Ok(None); }
-
+    // Optimize: Just do hgetall, it returns empty map if key doesn't exist
     let data: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
+    
+    // If no data, key doesn't exist
+    if data.is_empty() {
+        return Ok(None);
+    }
     let status_str = data.get("status").ok_or_else(|| anyhow::anyhow!("Missing status"))?;
     let status: Status = serde_json::from_str(&format!("\"{}\"", status_str))?;
     let receiver_id = data.get("receiver_id").ok_or_else(|| anyhow::anyhow!("Missing receiver"))?.clone();
