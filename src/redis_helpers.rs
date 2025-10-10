@@ -137,7 +137,12 @@ pub async fn mark_registered_and_push_to_stream<C>(
 where
     C: ConnectionLike + AsyncCommands + Send + Sync,
 {
+    if transfers.is_empty() {
+        return Ok(());
+    }
+    
     let registered_key = format!("registered:{}", token);
+    let transfer_count = transfers.len();
 
     let mut pipe = redis::pipe();
     pipe.atomic();
@@ -152,7 +157,15 @@ where
         pipe.set_ex(&status_key, "ready", 3600);
     }
 
-    pipe.query_async::<()>(conn).await?;
-
-    Ok(())
+    // Execute pipeline and check for errors
+    match pipe.query_async::<redis::Value>(conn).await {
+        Ok(value) => {
+            log::info!("✅ Moved {} transfers for {} to ready stream: {:?}", transfer_count, account_id, value);
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("❌ CRITICAL: Failed to move {} transfers for {} to ready stream: {:?}", transfer_count, account_id, e);
+            Err(e.into())
+        }
+    }
 }

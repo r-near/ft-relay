@@ -312,8 +312,16 @@ impl TestnetHarness {
             }
         }
 
+        // Don't fail the test if teardown encounters rate limits
+        // The test accounts will expire automatically on testnet
         if let Some(err) = first_error {
-            Err(err)
+            let err_str = format!("{err:?}");
+            if err_str.contains("rate limit") || err_str.contains("TooManyRequests") {
+                eprintln!("⚠️  Teardown hit rate limits - test accounts will auto-expire on testnet");
+                Ok(())
+            } else {
+                Err(err)
+            }
         } else {
             Ok(())
         }

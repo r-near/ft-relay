@@ -66,7 +66,7 @@ impl<T: StreamMessage> StreamQueue<T> {
         Ok(())
     }
 
-    /// Push a message to the stream
+    /// Push a message to the stream using the internal locked connection
     pub async fn push(&self, message: &T) -> Result<()> {
         let serialized = message.serialize()?;
         let mut conn = self.conn.lock().await;
@@ -77,6 +77,32 @@ impl<T: StreamMessage> StreamQueue<T> {
         )
         .await?;
         Ok(())
+    }
+
+    /// Push a message to the stream using an external connection (avoids lock contention)
+    pub async fn push_with_conn(
+        &self,
+        conn: &mut redis::aio::ConnectionManager,
+        message: &T,
+    ) -> Result<()> {
+        let serialized = message.serialize()?;
+        let result: redis::RedisResult<String> = conn.xadd(
+            &self.stream_key,
+            "*",
+            &[(T::field_name(), serialized.as_str())],
+        )
+        .await;
+        
+        match result {
+            Ok(id) => {
+                log::trace!("XADD succeeded: stream={}, id={}", self.stream_key, id);
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("❌ XADD FAILED: stream={}, error={:?}", self.stream_key, e);
+                Err(e.into())
+            }
+        }
     }
 
     /// Pop a batch of messages from the stream

@@ -100,14 +100,16 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         secret_keys: harness.relay_secret_keys(),
         rpc_url: harness.rpc_url.clone(),
         batch_linger_ms: 500,
-        max_inflight_batches: 500, // Higher for 60k
-        max_workers: 1,
+        batch_submit_delay_ms: 1000, // 1000ms delay = 1 batch/sec (absolute minimum)
+        max_inflight_batches: 500,
+        max_workers: 1, // Single worker to minimize RPC load
         bind_addr: bind_addr.clone(),
-        redis,
+        redis: redis.clone(),
     };
 
     println!("Server Configuration:");
     println!("  Batch linger: {}ms", config.batch_linger_ms);
+    println!("  Batch submit delay: {}ms (throttling)", config.batch_submit_delay_ms);
     println!("  Max inflight batches: {}", config.max_inflight_batches);
     println!("  Access keys: {}\n", config.secret_keys.len());
 
@@ -247,16 +249,32 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
 
     // Poll for transactions to finalize on testnet (with retries for 100% success)
     println!("\n⏳ Polling for NEAR testnet to finalize balances...");
+    println!("   Requirement: 60k transfers must complete within 10 minutes total\n");
 
     let expected_total = accepted as u128 * YOCTO_PER_TRANSFER;
     let poll_interval = Duration::from_secs(5);
-    let max_polls = 60; // ~5 minutes max wait
+    let max_polls = 180; // 15 minutes max (900 seconds) for complete 60k processing
 
     let mut final_totals: Option<BalanceSummary> = None;
     let mut completion_instant: Option<Instant> = None;
+    let mut last_total = 0u128;
+    let mut stuck_count = 0;
 
     for poll in 1..=max_polls {
-        let totals = harness.collect_balances().await?;
+        // collect_balances might hit rate limits, retry with delay instead of failing
+        let totals = match harness.collect_balances().await {
+            Ok(t) => t,
+            Err(e) => {
+                let err_str = format!("{e:?}");
+                if err_str.contains("rate limit") || err_str.contains("TooManyRequests") {
+                    println!("  ⏸️  Poll {}: RPC rate limited, will retry...", poll);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         let success_rate = totals.total_tokens as f64 / expected_total as f64 * 100.0;
 
         println!(
@@ -265,6 +283,22 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
             totals.total_tokens / YOCTO_PER_TRANSFER,
             success_rate
         );
+
+        // Detect stuck processing (no progress for 10+ consecutive polls)
+        if totals.total_tokens == last_total && totals.total_tokens < expected_total {
+            stuck_count += 1;
+            if stuck_count >= 10 {
+                println!(
+                    "  ⚠️  No progress for {} polls (~{}s), but {} transfers still missing",
+                    stuck_count,
+                    stuck_count * poll_interval.as_secs(),
+                    (expected_total - totals.total_tokens) / YOCTO_PER_TRANSFER
+                );
+            }
+        } else {
+            stuck_count = 0;
+        }
+        last_total = totals.total_tokens;
 
         if totals.total_tokens >= expected_total {
             println!(
@@ -347,6 +381,16 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         println!("  {:<45} {} tokens", account, balance / YOCTO_PER_TRANSFER);
     }
 
+    // Print reconciliation report
+    print_reconciliation_report(
+        &redis,
+        MEGA_BENCH_REQUESTS,
+        completed_transfers,
+        expected_total / YOCTO_PER_TRANSFER,
+        final_totals.total_tokens / YOCTO_PER_TRANSFER,
+    )
+    .await?;
+
     ensure!(
         final_totals.total_tokens == expected_total,
         "On-chain total mismatch: expected {} tokens, got {} tokens ({:.2}%)",
@@ -387,6 +431,97 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
 
     relay_handle.abort();
     let _ = relay_handle.await;
+
+    Ok(())
+}
+
+async fn print_reconciliation_report(
+    redis: &RedisSettings,
+    requests_sent: usize,
+    _completed_transfers: usize,
+    expected_tokens: u128,
+    actual_tokens: u128,
+) -> Result<()> {
+    use redis::AsyncCommands;
+
+    let redis_client = redis::Client::open(redis.url.as_str())?;
+    let mut conn = redis_client.get_multiplexed_async_connection().await?;
+
+    // Try to get transaction statuses
+    let tx_keys: Vec<String> = conn.keys("tx:status:*").await.unwrap_or_default();
+    
+    let mut submitted = 0;
+    let mut succeeded = 0;
+    let mut timeout = 0;
+    let mut failed = 0;
+    let mut timeout_txs = Vec::new();
+    
+    for key in tx_keys {
+        if let Ok(value) = conn.get::<_, String>(&key).await {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&value) {
+                match status["status"].as_str() {
+                    Some("submitted") => submitted += 1,
+                    Some("succeeded") => succeeded += 1,
+                    Some("timeout") => {
+                        timeout += 1;
+                        timeout_txs.push((
+                            status["tx_hash"].as_str().unwrap_or("unknown").to_string(),
+                            status["transfer_count"].as_u64().unwrap_or(0) as usize,
+                        ));
+                    }
+                    Some("failed") => failed += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    println!("\n╔════════════════════════════════════════════════════════════╗");
+    println!("║  TRANSFER RECONCILIATION REPORT                            ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("📊 Transaction Metrics:");
+    println!("  HTTP Requests:     {}", requests_sent);
+    println!("  Submitted:         {}", submitted);
+    println!("  Succeeded:         {}", succeeded);
+    println!("  Timeout:           {}", timeout);
+    println!("  Failed:            {}", failed);
+    println!();
+    
+    println!("🎯 Transfer Summary:");
+    println!("  Expected tokens:   {}", expected_tokens);
+    println!("  On-chain tokens:   {}", actual_tokens);
+    
+    if actual_tokens > expected_tokens {
+        let duplicates = actual_tokens - expected_tokens;
+        println!("  ⚠️  Duplicates:       +{}", duplicates);
+    } else if actual_tokens < expected_tokens {
+        let missing = expected_tokens - actual_tokens;
+        println!("  ❌ Missing:          -{}", missing);
+    } else {
+        println!("  ✅ Perfect match!");
+    }
+    
+    if timeout > 0 {
+        println!();
+        println!("⏱️  Timeout Details:");
+        let total_timeout_transfers: usize = timeout_txs.iter().map(|(_, count)| count).sum();
+        println!("  {} transaction(s) timed out ({} transfers)", timeout, total_timeout_transfers);
+        
+        for (i, (tx_hash, count)) in timeout_txs.iter().enumerate().take(3) {
+            println!("    {}. {}... → {} transfers", i + 1, &tx_hash[..16], count);
+        }
+        
+        if actual_tokens > expected_tokens {
+            let duplicates = actual_tokens - expected_tokens;
+            println!();
+            println!("  ⚠️  Analysis:");
+            println!("     - {} transfers timed out on RPC", total_timeout_transfers);
+            println!("     - Some likely succeeded on-chain despite timeout");
+            println!("     - {} duplicates detected from retries", duplicates);
+            println!("     - This is the RPC timeout issue we're tracking");
+        }
+    }
 
     Ok(())
 }

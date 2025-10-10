@@ -66,6 +66,7 @@ pub struct RelayConfig {
     pub secret_keys: Vec<String>,
     pub rpc_url: String,
     pub batch_linger_ms: u64,
+    pub batch_submit_delay_ms: u64, // Delay after each batch submission to throttle RPC usage
     pub max_inflight_batches: usize,
     pub max_workers: usize,
     pub bind_addr: String,
@@ -103,6 +104,8 @@ pub struct RelayConfigBuilder {
     rpc_url: String,
     #[serde(default)]
     batch_linger_ms: Option<u64>,
+    #[serde(default)]
+    batch_submit_delay_ms: Option<u64>,
     #[serde(default)]
     max_inflight_batches: Option<usize>,
     #[serde(default)]
@@ -145,6 +148,7 @@ impl RelayConfigBuilder {
             private_keys,
             rpc_url,
             batch_linger_ms,
+            batch_submit_delay_ms,
             max_inflight_batches,
             max_workers,
             bind_addr,
@@ -175,6 +179,7 @@ impl RelayConfigBuilder {
             secret_keys,
             rpc_url,
             batch_linger_ms: batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
+            batch_submit_delay_ms: batch_submit_delay_ms.unwrap_or(0), // Default: no delay
             max_inflight_batches: max_inflight_batches.unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
             max_workers: max_workers.unwrap_or(DEFAULT_MAX_TRANSFER_WORKERS),
             bind_addr: bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::{
     config::{MAX_GAS_PER_TX, STORAGE_DEPOSIT_AMOUNT, STORAGE_DEPOSIT_GAS_PER_ACTION},
     redis_helpers,
+    rpc_backoff,
     stream_queue::{RegistrationRequest, StreamQueue},
 };
 
@@ -37,12 +38,25 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
     info!("registration worker started: {}", consumer_name);
 
     loop {
-        // Pop a batch of registration requests from stream (with PEL autoclaim + lingering)
-        let batch = ctx
+        // Pop a batch of registration requests from stream (with PEL autoclaim + lingering) with retry on connection errors
+        let batch = match ctx
             .runtime
             .registration_queue
             .pop_batch(&consumer_name, MAX_REGISTRATIONS_PER_TX, ctx.linger_ms)
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("Connection reset") || err_str.contains("Broken pipe") {
+                    warn!("Connection error in registration worker loop, retrying in 1s: {:?}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
         if !batch.is_empty() {
             info!("claimed {} registration request(s)", batch.len());
@@ -103,15 +117,39 @@ async fn process_registration_batch_inner(
         })));
     }
 
+    // Check for RPC backoff before making any RPC calls
+    let mut conn = redis::aio::ConnectionManager::new(runtime.redis_client.clone()).await?;
+    if let Err(err) = rpc_backoff::check_and_wait_for_backoff(&mut conn).await {
+        warn!("backoff check failed: {err:?}");
+    }
+    
     // Submit transaction
-    let tx = near_api::Transaction::construct(
+    let tx_result = near_api::Transaction::construct(
         runtime.signer_account.clone(),
         runtime.token.clone(),
     )
     .add_actions(actions)
     .with_signer(runtime.signer.clone())
     .send_to(&runtime.network)
-    .await?;
+    .await;
+    
+    let tx = match tx_result {
+        Ok(t) => {
+            // Record RPC success for backoff recovery
+            let _ = rpc_backoff::record_success(&mut conn).await;
+            t
+        }
+        Err(err) => {
+            let err_str = err.to_string();
+            
+            // Check if this is a rate limit error
+            if err_str.contains("TooManyRequests") || err_str.contains("rate limit") {
+                let _ = rpc_backoff::record_rate_limit_hit(&mut conn).await;
+            }
+            
+            return Err(err.into());
+        }
+    };
 
     let tx_hash = tx.transaction_outcome.id.to_string();
 
@@ -136,7 +174,7 @@ async fn process_registration_batch_inner(
     }
 
     // Only pop pending transfers if tx succeeded
-    let mut conn = runtime.redis_client.get_multiplexed_async_connection().await?;
+    // (reuse conn from earlier)
     let token_str = runtime.token.to_string();
 
     // For each account, move pending transfers to ready stream

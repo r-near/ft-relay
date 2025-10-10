@@ -1,9 +1,10 @@
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use near_api::{NetworkConfig, Signer};
 use near_api_types::AccountId;
 use near_primitives::action::{Action, FunctionCallAction};
 use near_primitives::views::FinalExecutionOutcomeView;
+use redis::AsyncCommands;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -11,7 +12,9 @@ use uuid::Uuid;
 
 use crate::{
     config::{FT_TRANSFER_DEPOSIT, FT_TRANSFER_GAS_PER_ACTION, MAX_GAS_PER_TX},
+    observability::{BatchId, ObservabilityContext, TxStatus, TxStatusKind},
     redis_helpers,
+    rpc_backoff,
     stream_queue::StreamQueue,
     transfer_states::{ReadyToSend, Transfer},
 };
@@ -20,17 +23,20 @@ const MAX_NONCE_RETRIES: u32 = 3;
 
 pub struct TransferWorkerRuntime {
     pub redis_client: redis::Client,
+    pub redis_conn: redis::aio::ConnectionManager,
     pub ready_queue: Arc<StreamQueue<Transfer<ReadyToSend>>>,
     pub signer: Arc<Signer>,
     pub signer_account: AccountId,
     pub token: AccountId,
     pub network: NetworkConfig,
     pub semaphore: Arc<Semaphore>,
+    pub obs_ctx: Arc<ObservabilityContext>,
 }
 
 pub struct TransferWorkerContext {
     pub runtime: Arc<TransferWorkerRuntime>,
     pub linger_ms: u64,
+    pub batch_submit_delay_ms: u64, // Delay after each batch submission to throttle RPC
 }
 
 /// Transfer worker - processes ready transfers (accounts already registered)
@@ -41,15 +47,28 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
     info!("transfer worker started: {}", consumer_name);
 
     loop {
-        // Pull batch from ready stream
-        let batch = ctx
+        // Pull batch from ready stream with retry on connection errors
+        let batch = match ctx
             .runtime
             .ready_queue
             .pop_batch(&consumer_name, max_transfers_per_tx, ctx.linger_ms)
-            .await?;
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("Connection reset") || err_str.contains("Broken pipe") {
+                    warn!("Connection error in worker loop, retrying in 1s: {:?}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
         if !batch.is_empty() {
-            process_transfer_batch(ctx.runtime.clone(), batch).await;
+            process_transfer_batch(ctx.runtime.clone(), batch, ctx.batch_submit_delay_ms).await;
         }
     }
 }
@@ -57,9 +76,12 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
 async fn process_transfer_batch(
     runtime: Arc<TransferWorkerRuntime>,
     batch: Vec<(String, Transfer<ReadyToSend>)>,
+    batch_submit_delay_ms: u64,
 ) {
     tokio::spawn(async move {
         let _permit = runtime.semaphore.acquire().await.unwrap();
+        let batch_id = BatchId::new();
+        let transfer_count = batch.len();
 
         // Build transfer actions
         let mut actions = Vec::new();
@@ -83,22 +105,28 @@ async fn process_transfer_batch(
         }
 
         // Submit transaction
-        match submit_with_nonce_retry(
+        let result = submit_with_nonce_retry(
             &runtime.signer,
             &runtime.signer_account,
             &runtime.token,
             actions,
             &runtime.network,
+            batch_id,
+            transfer_count,
+            &runtime.obs_ctx,
         )
-        .await
-        {
+        .await;
+
+        match result {
             Ok(outcome) => {
                 let tx_hash = outcome.transaction_outcome.id.to_string();
+                info!("✅ Batch {} submitted: tx_hash={}", batch_id, tx_hash);
 
                 // Check overall transaction status
                 match &outcome.status {
                     near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
-                        info!("tx {} succeeded: {} transfers", tx_hash, batch.len());
+                        runtime.obs_ctx.inc_metric("succeeded").await;
+                        info!("tx {} succeeded: {} transfers (batch: {})", tx_hash, batch.len(), batch_id);
 
                         // All transfers succeeded - collect IDs
                         let redis_ids: Vec<String> =
@@ -117,6 +145,34 @@ async fn process_transfer_batch(
                             }
                         };
 
+                        // Check for duplicates and mark all transfers as completed (batched for efficiency)
+                        let transfer_data: Vec<(String, String)> = batch
+                            .iter()
+                            .map(|(_, t)| (t.data().transfer_id.clone(), tx_hash.clone()))
+                            .collect();
+                        
+                        match runtime.obs_ctx.check_and_mark_batch(&transfer_data).await {
+                            Ok(duplicates) => {
+                                if !duplicates.is_empty() {
+                                    for (transfer_id, existing_tx) in &duplicates {
+                                        warn!(
+                                            "⚠️  DUPLICATE: transfer {} already completed by tx {}... (batch: unknown), now completed again by tx {}... (batch: {})",
+                                            transfer_id,
+                                            &existing_tx[..16.min(existing_tx.len())],
+                                            &tx_hash[..16.min(tx_hash.len())],
+                                            batch_id
+                                        );
+                                        runtime.obs_ctx.inc_metric("duplicates").await;
+                                    }
+                                    warn!("⚠️  Batch {} had {} duplicate transfers!", batch_id, duplicates.len());
+                                }
+                            }
+                            Err(err) => {
+                                warn!("failed to check/mark batch duplicates: {err:?}");
+                            }
+                        }
+                        
+                        // Also set in old status format for compatibility
                         let token_str = runtime.token.to_string();
                         if let Err(err) = redis_helpers::set_transfers_completed(
                             &mut conn,
@@ -135,10 +191,12 @@ async fn process_transfer_batch(
                         }
                     }
                     near_primitives::views::FinalExecutionStatus::Failure(tx_err) => {
+                        runtime.obs_ctx.inc_metric("failed").await;
                         warn!(
-                            "tx {} failed ({} transfers): {:?}",
+                            "tx {} failed ({} transfers, batch: {}): {:?}",
                             tx_hash,
                             batch.len(),
+                            batch_id,
                             tx_err
                         );
 
@@ -156,33 +214,71 @@ async fn process_transfer_batch(
                                 "batch failed with error, will retry with backoff: {:?}",
                                 tx_err
                             );
-                            handle_transfer_retry(&runtime, &batch).await;
+                            handle_transfer_retry(&runtime, &batch, batch_id).await;
                         }
                     }
                     status => {
                         warn!("tx {} unexpected status: {:?}", tx_hash, status);
-                        handle_transfer_retry(&runtime, &batch).await;
+                        handle_transfer_retry(&runtime, &batch, batch_id).await;
                     }
                 }
             }
-            Err(err) => {
-                let err_str = err.to_string();
+            Err(submission_err) => {
+                let tx_hash = submission_err.tx_hash.clone();
+                let err_str = submission_err.error.to_string();
 
-                // "Expired" means transaction was included in a block but execution may have failed
-                // Don't retry - nonce was consumed
-                // On-chain verification will count any tokens that actually transferred
-                if err_str.contains("Expired") {
-                    warn!("batch expired (nonce consumed): {err:?}");
-                    let redis_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-                    if let Err(ack_err) = runtime.ready_queue.ack(&redis_ids).await {
-                        warn!("failed to ack expired batch: {ack_err:?}");
-                    }
+                // PreSign failures happen before blockchain submission - safe to retry
+                if err_str.contains("PreSignError") {
+                    runtime.obs_ctx.inc_metric("failed").await;
+                    warn!("Batch {} presign failed ({} transfers) - will retry", batch_id, transfer_count);
+                    handle_transfer_retry(&runtime, &batch, batch_id).await;
                 } else {
-                    // Other errors (network, etc.) are safe to retry
-                    warn!("failed to submit batch, will retry: {err:?}");
-                    handle_transfer_retry(&runtime, &batch).await;
+                    // All other errors happened AFTER transaction submission
+                    // We have a tx_hash from the submission error
+                    // FINANCIAL SAFETY: Hand off to status checker for async verification
+                    
+                    info!("Batch {} (tx_hash={}) has ambiguous status, enqueueing for verification...", batch_id, tx_hash);
+                    
+                    // Create pending verification batch
+                    let transfer_data: Vec<crate::transfer_states::TransferData> = batch.iter()
+                        .map(|(_, t)| t.data().clone())
+                        .collect();
+                    
+                    let pending = crate::status_checker::PendingVerificationBatch {
+                        batch_id: batch_id.to_string(),
+                        tx_hash: tx_hash.clone(),
+                        attempts: 0,
+                        submitted_at: chrono::Utc::now().timestamp(),
+                        transfer_data,
+                    };
+                    
+                    // Enqueue for async verification (non-blocking)
+                    match crate::status_checker::enqueue_for_verification(
+                        &mut runtime.redis_conn.clone(),
+                        &runtime.token,
+                        pending,
+                    ).await {
+                        Ok(_) => {
+                            info!("✅ Batch {} enqueued for async verification", batch_id);
+                            // ACK from ready queue - status checker will handle it from here
+                            let redis_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+                            if let Err(ack_err) = runtime.ready_queue.ack(&redis_ids).await {
+                                warn!("failed to ack batch sent to verification: {ack_err:?}");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to enqueue batch {} for verification: {:?} - will retry batch", batch_id, e);
+                            runtime.obs_ctx.inc_metric("failed").await;
+                            handle_transfer_retry(&runtime, &batch, batch_id).await;
+                        }
+                    }
                 }
             }
+        }
+        
+        // Apply throttling delay if configured (to stay under RPC rate limits)
+        if batch_submit_delay_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(batch_submit_delay_ms)).await;
         }
     });
 }
@@ -193,7 +289,7 @@ async fn handle_unregistered_retry(
     runtime: &Arc<TransferWorkerRuntime>,
     batch: &[(String, Transfer<ReadyToSend>)],
 ) {
-    const MAX_REGISTRATION_RETRY_ATTEMPTS: u32 = 3;
+    const MAX_REGISTRATION_RETRY_ATTEMPTS: u32 = 10;
 
     let mut conn = match runtime.redis_client.get_multiplexed_async_connection().await {
         Ok(c) => c,
@@ -263,8 +359,9 @@ async fn handle_unregistered_retry(
 async fn handle_transfer_retry(
     runtime: &Arc<TransferWorkerRuntime>,
     batch: &[(String, Transfer<ReadyToSend>)],
+    original_batch_id: BatchId,
 ) {
-    const MAX_RETRY_ATTEMPTS: u32 = 5;
+    const MAX_RETRY_ATTEMPTS: u32 = 10;
 
     let mut redis_ids_to_ack = Vec::new();
     let mut exhausted_count = 0;
@@ -283,6 +380,13 @@ async fn handle_transfer_retry(
             } else {
                 requeued_count += 1;
                 redis_ids_to_ack.push(redis_id.clone());
+                
+                // Track that this transfer is being retried from original_batch_id
+                let transfer_id = &transfer.data().transfer_id;
+                let retry_marker = format!("retry:{}:{}", original_batch_id, transfer_id);
+                if let Ok(mut conn) = runtime.redis_client.get_multiplexed_async_connection().await {
+                    let _: Result<(), _> = conn.set_ex::<_, _, ()>(&retry_marker, "retrying", 3600).await;
+                }
             }
         } else {
             exhausted_count += 1;
@@ -310,16 +414,38 @@ async fn handle_transfer_retry(
     }
 }
 
+// Transaction verification moved to status_checker module for async processing
+
+// Custom error type that includes tx_hash for verification
+#[derive(Debug)]
+struct SubmissionError {
+    tx_hash: String,
+    error: anyhow::Error,
+}
+
 async fn submit_with_nonce_retry(
     signer: &Arc<Signer>,
     signer_account: &AccountId,
     token: &AccountId,
     actions: Vec<Action>,
     network: &NetworkConfig,
-) -> Result<FinalExecutionOutcomeView> {
+    batch_id: BatchId,
+    transfer_count: usize,
+    obs_ctx: &Arc<ObservabilityContext>,
+) -> Result<FinalExecutionOutcomeView, SubmissionError> {
     let mut nonce_retry = 0;
 
     loop {
+        // Check for RPC backoff before making any RPC calls
+        // Use a temporary Redis connection for backoff check
+        if let Ok(redis_client) = redis::Client::open("redis://127.0.0.1:6379") {
+            if let Ok(mut conn) = redis::aio::ConnectionManager::new(redis_client).await {
+                if let Err(err) = rpc_backoff::check_and_wait_for_backoff(&mut conn).await {
+                    warn!("backoff check failed: {err:?}");
+                }
+            }
+        }
+        
         // Presign the transaction so we can get the hash before sending
         let tx_builder = near_api::Transaction::construct(signer_account.clone(), token.clone())
             .add_actions(actions.clone())
@@ -328,8 +454,27 @@ async fn submit_with_nonce_retry(
         let presigned = match tx_builder.presign_with(network).await {
             Ok(p) => p,
             Err(err) => {
-                warn!("failed to presign transaction: {err:?}");
-                return Err(err.into());
+                let err_str = err.to_string();
+                
+                // Check if this is a rate limit error
+                if err_str.contains("TooManyRequests") || err_str.contains("rate limit") {
+                    if let Ok(redis_client) = redis::Client::open("redis://127.0.0.1:6379") {
+                        if let Ok(mut conn) = redis::aio::ConnectionManager::new(redis_client).await {
+                            let _ = rpc_backoff::record_rate_limit_hit(&mut conn).await;
+                        }
+                    }
+                    warn!("Batch {} presign failed ({} transfers) - will retry", batch_id, transfer_count);
+                } else {
+                    warn!("failed to presign transaction: {err:?}");
+                }
+                
+                // Presign failures happen BEFORE blockchain submission
+                // Mark as retriable by wrapping in a custom error type
+                // The outer handler will see "PreSignError" and can safely retry
+                return Err(SubmissionError {
+                    tx_hash: "unknown".to_string(),
+                    error: anyhow::anyhow!("PreSignError: {}", err_str),
+                });
             }
         };
 
@@ -341,23 +486,72 @@ async fn submit_with_nonce_retry(
             _ => "unknown".to_string(),
         };
 
+        // Track submission
+        obs_ctx.inc_metric("submitted").await;
+        let submitted_at = chrono::Utc::now().timestamp();
+        let _ = obs_ctx.track_tx_status(TxStatus {
+            tx_hash: tx_hash.clone(),
+            batch_id: batch_id.to_string(),
+            transfer_count,
+            status: TxStatusKind::Submitted,
+            submitted_at,
+            completed_at: None,
+            error: None,
+            verified_onchain: false,
+        }).await;
+
         let result = presigned.send_to(network).await;
 
         match result {
             Ok(tx) => {
+                // Record RPC success for backoff recovery
+                if let Ok(redis_client) = redis::Client::open("redis://127.0.0.1:6379") {
+                    if let Ok(mut conn) = redis::aio::ConnectionManager::new(redis_client).await {
+                        let _ = rpc_backoff::record_success(&mut conn).await;
+                    }
+                }
+                
+                // Update to succeeded
+                let _ = obs_ctx.track_tx_status(TxStatus {
+                    tx_hash: tx_hash.clone(),
+                    batch_id: batch_id.to_string(),
+                    transfer_count,
+                    status: TxStatusKind::Succeeded,
+                    submitted_at,
+                    completed_at: Some(chrono::Utc::now().timestamp()),
+                    error: None,
+                    verified_onchain: false,
+                }).await;
                 return Ok(tx);
             }
             Err(err) => {
                 let err_str = err.to_string();
-                warn!("transaction {} failed: {err:?}", tx_hash);
+                
+                // Check if this is a rate limit error
+                if err_str.contains("TooManyRequests") || err_str.contains("rate limit") {
+                    if let Ok(redis_client) = redis::Client::open("redis://127.0.0.1:6379") {
+                        if let Ok(mut conn) = redis::aio::ConnectionManager::new(redis_client).await {
+                            let _ = rpc_backoff::record_rate_limit_hit(&mut conn).await;
+                        }
+                    }
+                }
 
                 // Check if it's an InvalidNonce error
                 if err_str.contains("InvalidNonce") && nonce_retry < MAX_NONCE_RETRIES {
                     nonce_retry += 1;
-                    warn!(
-                        "InvalidNonce detected (retry {}/{}), forcing nonce resync from chain",
-                        nonce_retry, MAX_NONCE_RETRIES
-                    );
+                    
+                    // Only log first retry at WARN, rest at DEBUG
+                    if nonce_retry == 1 {
+                        warn!(
+                            "InvalidNonce for batch {} (retry {}/{}), resyncing nonce",
+                            batch_id, nonce_retry, MAX_NONCE_RETRIES
+                        );
+                    } else {
+                        debug!(
+                            "Nonce resync retry {}/{} for batch {}",
+                            nonce_retry, MAX_NONCE_RETRIES, batch_id
+                        );
+                    }
 
                     // Force nonce resync
                     match signer.get_public_key().await {
@@ -367,8 +561,10 @@ async fn submit_with_nonce_retry(
                                 .await
                             {
                                 warn!("failed to resync nonce: {fetch_err:?}");
+                            } else if nonce_retry == 1 {
+                                info!("Nonce resynced for batch {}", batch_id);
                             } else {
-                                info!("nonce resync successful, retrying transaction");
+                                debug!("Nonce resynced for batch {}", batch_id);
                             }
                         }
                         Err(e) => {
@@ -382,7 +578,32 @@ async fn submit_with_nonce_retry(
                 }
 
                 // Not a nonce issue or retries exhausted
-                return Err(err.into());
+                // Track failure
+                let status_kind = if err_str.contains("TimeoutError") {
+                    TxStatusKind::Timeout
+                } else {
+                    TxStatusKind::Failed
+                };
+                
+                let _ = obs_ctx.track_tx_status(TxStatus {
+                    tx_hash: tx_hash.clone(),
+                    batch_id: batch_id.to_string(),
+                    transfer_count,
+                    status: status_kind,
+                    submitted_at,
+                    completed_at: Some(chrono::Utc::now().timestamp()),
+                    error: Some(err_str.clone()),
+                    verified_onchain: false,
+                }).await;
+                
+                if !err_str.contains("InvalidNonce") {
+                    warn!("transaction {} failed (batch: {}): {}", tx_hash, batch_id, err_str);
+                }
+                
+                return Err(SubmissionError {
+                    tx_hash: tx_hash.clone(),
+                    error: err.into(),
+                });
             }
         }
     }

@@ -176,6 +176,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         secret_keys,
         rpc_url: sandbox.rpc_addr.clone(),
         batch_linger_ms: 1000,     // Fast batching
+        batch_submit_delay_ms: 0,  // No throttling needed for sandbox
         max_inflight_batches: 500, // High concurrency
         max_workers: 3,
         bind_addr: "127.0.0.1:18082".to_string(),
@@ -308,6 +309,105 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     // Check if server is still running
     if server_handle.is_finished() {
         panic!("❌ Server task died during benchmark!");
+    }
+
+    // Verify Redis received all accepted requests
+    println!("\n╔════════════════════════════════════════════════════════════╗");
+    println!("║  REDIS QUEUE VERIFICATION                                  ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    
+    // Wait for all HTTP requests to be added to Redis AND
+    // for registration workers AND transfer workers to finish processing
+    println!("  Waiting for all workers to complete processing...");
+    
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    
+    // Poll until count stabilizes (indicating all workers finished)
+    let mut prev_count = 0u64;
+    let mut stable_count = 0;
+    for _ in 0..60 {  // Max 60 seconds
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        let stream_info: redis::Value = redis::cmd("XINFO")
+            .arg("STREAM")
+            .arg("ftrelay:ready")
+            .query_async(&mut redis_conn)
+            .await?;
+        
+        let mut entries_added = 0u64;
+        if let redis::Value::Array(info) = stream_info {
+            for i in (0..info.len()).step_by(2) {
+                if let Some(redis::Value::BulkString(key)) = info.get(i) {
+                    if key == b"entries-added" {
+                        if let Some(redis::Value::Int(count)) = info.get(i + 1) {
+                            entries_added = *count as u64;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if entries_added == prev_count {
+            stable_count += 1;
+            if stable_count >= 3 {  // Stable for 3 seconds
+                println!("  Count stabilized at {} entries", entries_added);
+                break;
+            }
+        } else {
+            stable_count = 0;
+        }
+        prev_count = entries_added;
+        
+        if entries_added >= total_success as u64 {
+            println!("  All {} entries accounted for!", total_success);
+            break;
+        }
+    }
+    
+    // Get stream info to see total entries added
+    let stream_info: redis::Value = redis::cmd("XINFO")
+        .arg("STREAM")
+        .arg("ftrelay:ready")
+        .query_async(&mut redis_conn)
+        .await?;
+    
+    let mut entries_added = 0u64;
+    if let redis::Value::Array(info) = stream_info {
+        for i in (0..info.len()).step_by(2) {
+            if let Some(redis::Value::BulkString(key)) = info.get(i) {
+                if key == b"entries-added" {
+                    if let Some(redis::Value::Int(count)) = info.get(i + 1) {
+                        entries_added = *count as u64;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    let pending_count: u64 = redis::cmd("XLEN")
+        .arg("ftrelay:ready")
+        .query_async(&mut redis_conn)
+        .await?;
+    
+    println!("  HTTP 200 responses:  {}", total_success);
+    println!("  Redis entries added: {}", entries_added);
+    println!("  Currently pending:   {}", pending_count);
+    
+    if entries_added != total_success as u64 {
+        println!("  Status:              ❌ MISMATCH");
+        panic!(
+            "❌ Redis verification failed: {} HTTP requests accepted but only {} entries in Redis (lost {} transfers)",
+            total_success,
+            entries_added,
+            total_success as u64 - entries_added
+        );
+    } else {
+        println!("  Status:              ✅ VERIFIED");
     }
 
     println!("\n⏳ Waiting for NEAR to finalize balances...");

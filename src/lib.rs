@@ -1,12 +1,16 @@
 mod config;
 pub mod http;
+pub mod observability;
 pub mod redis_helpers;
 mod registration_worker;
+mod rpc_backoff;
+mod status_checker;
 pub mod stream_queue;
 pub mod transfer_states;
 mod transfer_worker;
 
 pub use config::{CliArgs, RedisSettings, RelayConfig, RelayConfigBuilder};
+pub use observability::{BatchId, ObservabilityContext};
 
 use std::sync::Arc;
 
@@ -22,6 +26,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         secret_keys,
         rpc_url,
         batch_linger_ms,
+        batch_submit_delay_ms,
         max_inflight_batches,
         max_workers,
         bind_addr,
@@ -90,6 +95,15 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(max_inflight_batches));
 
+    // Create observability context
+    let obs_ctx = Arc::new(observability::ObservabilityContext::new(redis_client.clone()));
+    
+    // Start periodic summary logger
+    let obs_ctx_clone = obs_ctx.clone();
+    tokio::spawn(async move {
+        observability::summary_logger_task(obs_ctx_clone).await;
+    });
+
     // Spawn registration worker(s)
     let registration_runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
         redis_client: redis_client.clone(),
@@ -117,21 +131,46 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         });
     }
 
+    // Spawn status checker workers (for async transaction verification)
+    // Use separate connection manager to avoid exhausting Redis connections
+    let status_checker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+    let status_checker_runtime = Arc::new(status_checker::StatusCheckerRuntime {
+        redis_conn: status_checker_conn,
+        ready_queue: ready_queue.clone(),
+        network: network.clone(),
+        obs_ctx: obs_ctx.clone(),
+        token: token.clone(),
+    });
+
+    let num_status_checkers = (max_workers / 2).max(2); // At least 2 status checkers
+    info!("spawning {} status checker worker(s)", num_status_checkers);
+    for _idx in 0..num_status_checkers {
+        let runtime = status_checker_runtime.clone();
+        tokio::spawn(async move {
+            status_checker::status_checker_task(runtime).await;
+        });
+    }
+
     // Spawn transfer workers
+    // Use separate connection manager for enqueuing to verification queue
+    let transfer_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
     let transfer_runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
         redis_client: redis_client.clone(),
+        redis_conn: transfer_redis_conn,
         ready_queue: ready_queue.clone(),
         signer: signer.clone(),
         signer_account: account_id.clone(),
         token: token.clone(),
         network: network.clone(),
         semaphore: semaphore.clone(),
+        obs_ctx: obs_ctx.clone(),
     });
 
     info!("spawning {} transfer worker(s)", max_workers);
     for idx in 0..max_workers {
         let ctx = transfer_worker::TransferWorkerContext {
             linger_ms: batch_linger_ms,
+            batch_submit_delay_ms,
             runtime: transfer_runtime.clone(),
         };
 

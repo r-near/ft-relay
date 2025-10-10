@@ -21,6 +21,19 @@ pub struct PendingRegistration;
 pub struct ReadyToSend;
 
 #[derive(Debug, Clone)]
+pub struct Submitted {
+    pub tx_hash: String,
+    pub submitted_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingVerification {
+    pub tx_hash: String,
+    pub submitted_at: i64,
+    pub verification_attempts: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct Failed;
 
 /// Transfer in a specific state
@@ -82,6 +95,14 @@ impl Transfer<ReadyToSend> {
         }
     }
 
+    /// Transition to Submitted after transaction is sent
+    pub fn mark_submitted(self, tx_hash: String, submitted_at: i64) -> Transfer<Submitted> {
+        Transfer {
+            data: self.data,
+            _state: PhantomData::<Submitted>,
+        }
+    }
+
     /// Transition to Failed state (e.g., after tx submission failure)
     pub fn mark_failed(mut self) -> Transfer<Failed> {
         self.data.attempts += 1;
@@ -102,6 +123,61 @@ impl Transfer<ReadyToSend> {
         Transfer {
             data: self.data,
             _state: PhantomData,
+        }
+    }
+}
+
+impl Transfer<Submitted> {
+    /// Get the tx_hash for this submitted transfer
+    pub fn tx_hash(&self) -> &str {
+        // We need to store this in the state marker
+        // For now, we'll modify the approach
+        unimplemented!("Need to refactor to store state data")
+    }
+
+    /// Transaction succeeded - mark as completed
+    pub fn mark_completed(self) -> TransferData {
+        self.data
+    }
+
+    /// Transaction returned ambiguous error - needs verification
+    pub fn needs_verification(self, tx_hash: String, submitted_at: i64) -> Transfer<PendingVerification> {
+        Transfer {
+            data: self.data,
+            _state: PhantomData::<PendingVerification>,
+        }
+    }
+}
+
+impl Transfer<PendingVerification> {
+    /// Get verification info
+    pub fn verification_info(&self) -> (&str, u32) {
+        // Need to refactor to store in state
+        unimplemented!("Need to refactor to store state data")
+    }
+
+    /// Verified as succeeded on-chain
+    pub fn verified_success(self) -> TransferData {
+        self.data
+    }
+
+    /// Verified as failed on-chain - retry
+    pub fn verified_failed(self) -> Transfer<ReadyToSend> {
+        Transfer {
+            data: self.data,
+            _state: PhantomData,
+        }
+    }
+
+    /// Could not verify yet - increment attempts
+    pub fn retry_verification(self, max_attempts: u32) -> Option<Transfer<PendingVerification>> {
+        if self.data.attempts >= max_attempts {
+            None // Give up
+        } else {
+            Some(Transfer {
+                data: self.data,
+                _state: PhantomData,
+            })
         }
     }
 }
