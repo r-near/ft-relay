@@ -200,6 +200,54 @@ impl NearRpcClient {
         self.broadcast_tx(signed_tx).await
     }
 
+    /// Register multiple accounts in a single transaction (batch storage_deposit)
+    pub async fn register_accounts_batch(
+        &self,
+        signer_account: &AccountId,
+        token: &AccountId,
+        accounts_to_register: Vec<AccountId>,
+        secret_key: &SecretKey,
+        nonce: u64,
+    ) -> Result<CryptoHash> {
+        let block_hash = self.get_block_hash().await?;
+
+        // Create one storage_deposit action per account
+        let mut actions = Vec::new();
+        for account in accounts_to_register {
+            let args = serde_json::json!({
+                "account_id": account,
+                "registration_only": true,
+            });
+
+            let action = Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name: "storage_deposit".to_string(),
+                args: args.to_string().into_bytes(),
+                gas: STORAGE_DEPOSIT_GAS_PER_ACTION,
+                deposit: STORAGE_DEPOSIT_AMOUNT,
+            }));
+
+            actions.push(action);
+        }
+
+        let transaction = Transaction::V0(near_primitives::transaction::TransactionV0 {
+            signer_id: signer_account
+                .parse()
+                .map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
+            public_key: secret_key.public_key(),
+            nonce,
+            receiver_id: token
+                .parse()
+                .map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
+            block_hash,
+            actions,
+        });
+
+        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+        let signed_tx = SignedTransaction::new(signature, transaction);
+
+        self.broadcast_tx(signed_tx).await
+    }
+
     pub async fn submit_batch_transfer(
         &self,
         signer_account: &AccountId,
