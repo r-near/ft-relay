@@ -184,15 +184,38 @@ enum VerificationResult {
     Failed(String),
     Pending,
 }
-
 async fn verify_transaction(
     ctx: &VerificationWorkerContext,
     msg: &VerificationMessage,
 ) -> Result<VerificationResult> {
+    let mut conn = ctx.runtime.redis_conn.clone();
+    
+    // Fast path: Check if tx_hash status is already cached in Redis
+    if let Some(cached_status) = rh::get_tx_status(&mut conn, &msg.tx_hash).await? {
+        info!("Tx {} status cached: {}", msg.tx_hash, cached_status);
+        
+        match cached_status.as_str() {
+            "completed" => {
+                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Completed).await?;
+                rh::log_event(&mut conn, &msg.transfer_id, Event::new("COMPLETED")).await?;
+                return Ok(VerificationResult::Completed);
+            }
+            "failed" => {
+                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed).await?;
+                rh::log_event(&mut conn, &msg.transfer_id, Event::new("FAILED").with_reason("Cached failure".to_string())).await?;
+                return Ok(VerificationResult::Failed("Cached failure".to_string()));
+            }
+            _ => {} // "pending" - fall through to RPC check
+        }
+    }
+
+    // Wait ~6 seconds (2-3 blocks) before first RPC check
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    let tx_hash = CryptoHash::from_str(&msg.tx_hash).map_err(|e| anyhow::anyhow!("Invalid tx hash: {:?}", e))?;
+    let tx_hash = CryptoHash::from_str(&msg.tx_hash)
+        .map_err(|e| anyhow::anyhow!("Invalid tx hash: {:?}", e))?;
 
+    // Check RPC once for this tx_hash
     match ctx
         .runtime
         .rpc_client
@@ -200,29 +223,46 @@ async fn verify_transaction(
         .await?
     {
         TxStatus::Success(_outcome) => {
-            info!("Transfer {} completed successfully", msg.transfer_id);
+            info!("Tx {} completed successfully", msg.tx_hash);
             
-            let mut conn = ctx.runtime.redis_conn.clone();
-            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Completed).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("COMPLETED")).await?;
+            // Cache the result so other transfers skip RPC
+            rh::set_tx_status(&mut conn, &msg.tx_hash, "completed").await?;
+            
+            // Get all transfers for this tx and update them all
+            let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
+            info!("Updating {} transfers for tx {}", transfer_ids.len(), msg.tx_hash);
+            
+            for transfer_id in transfer_ids {
+                rh::update_transfer_status(&mut conn, &transfer_id, Status::Completed).await?;
+                rh::log_event(&mut conn, &transfer_id, Event::new("COMPLETED")).await?;
+            }
             
             Ok(VerificationResult::Completed)
         }
         TxStatus::Failed(reason) => {
-            warn!("Transfer {} failed on-chain: {}", msg.transfer_id, reason);
+            warn!("Tx {} failed on-chain: {}", msg.tx_hash, reason);
             
-            let mut conn = ctx.runtime.redis_conn.clone();
-            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed).await?;
-            rh::log_event(
-                &mut conn,
-                &msg.transfer_id,
-                Event::new("FAILED").with_reason(reason.clone()),
-            )
-            .await?;
+            // Cache the result
+            rh::set_tx_status(&mut conn, &msg.tx_hash, "failed").await?;
+            
+            // Get all transfers for this tx and mark them as failed
+            let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
+            
+            for transfer_id in transfer_ids {
+                rh::update_transfer_status(&mut conn, &transfer_id, Status::Failed).await?;
+                rh::log_event(
+                    &mut conn,
+                    &transfer_id,
+                    Event::new("FAILED").with_reason(reason.clone()),
+                )
+                .await?;
+            }
             
             Ok(VerificationResult::Failed(reason))
         }
         TxStatus::Pending => {
+            // Cache as pending (short lived)
+            rh::set_tx_status(&mut conn, &msg.tx_hash, "pending").await?;
             Ok(VerificationResult::Pending)
         }
     }

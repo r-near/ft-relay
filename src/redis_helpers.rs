@@ -166,3 +166,41 @@ where C: ConnectionLike + AsyncCommands + Send + Sync,
     conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())]).await?;
     Ok(())
 }
+
+// Track which transfers are associated with a tx_hash
+pub async fn add_transfer_to_tx<C>(conn: &mut C, tx_hash: &str, transfer_id: &str) -> Result<()>
+where C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let key = format!("tx:{}:transfers", tx_hash);
+    conn.sadd::<_, _, ()>(&key, transfer_id).await?;
+    conn.expire::<_, ()>(&key, 86400).await?;  // 24 hour TTL
+    Ok(())
+}
+
+// Get all transfers associated with a tx_hash
+pub async fn get_tx_transfers<C>(conn: &mut C, tx_hash: &str) -> Result<Vec<String>>
+where C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let key = format!("tx:{}:transfers", tx_hash);
+    let members: Vec<String> = conn.smembers(&key).await?;
+    Ok(members)
+}
+
+// Store tx_hash verification status (to avoid re-checking RPC)
+pub async fn set_tx_status<C>(conn: &mut C, tx_hash: &str, status: &str) -> Result<()>
+where C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let key = format!("tx:{}:status", tx_hash);
+    conn.set::<_, _, ()>(&key, status).await?;
+    conn.expire::<_, ()>(&key, 86400).await?;  // 24 hour TTL
+    Ok(())
+}
+
+// Get tx_hash verification status (returns None if not cached)
+pub async fn get_tx_status<C>(conn: &mut C, tx_hash: &str) -> Result<Option<String>>
+where C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let key = format!("tx:{}:status", tx_hash);
+    let status: Option<String> = conn.get(&key).await?;
+    Ok(status)
+}
