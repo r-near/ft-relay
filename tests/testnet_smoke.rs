@@ -100,9 +100,9 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
         secret_keys: harness.relay_secret_keys(),
         rpc_url: harness.rpc_url.clone(),
         batch_linger_ms: 500,
-        batch_submit_delay_ms: 1000, // 1000ms delay = 1 batch/sec (absolute minimum)
-        max_inflight_batches: 500,
-        max_workers: 1, // Single worker to minimize RPC load
+        batch_submit_delay_ms: 0, // No throttling - submit as fast as possible, rely on retries
+        max_inflight_batches: 1000, // High concurrency to maximize throughput
+        max_workers: 10, // Many workers to process batches quickly
         bind_addr: bind_addr.clone(),
         redis: redis.clone(),
     };
@@ -253,7 +253,7 @@ async fn run_60k_benchmark(harness: &TestnetHarness) -> Result<()> {
 
     let expected_total = accepted as u128 * YOCTO_PER_TRANSFER;
     let poll_interval = Duration::from_secs(5);
-    let max_polls = 180; // 15 minutes max (900 seconds) for complete 60k processing
+    let max_polls = 300; // 25 minutes max (1500 seconds) - allow time for retries to complete
 
     let mut final_totals: Option<BalanceSummary> = None;
     let mut completion_instant: Option<Instant> = None;

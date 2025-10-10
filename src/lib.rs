@@ -1,23 +1,24 @@
+mod access_key_pool;
 mod config;
 pub mod http;
-pub mod observability;
+mod nonce_manager;
 pub mod redis_helpers;
 mod registration_worker;
-mod rpc_backoff;
-mod status_checker;
-pub mod stream_queue;
-pub mod transfer_states;
+mod rpc_client;
+pub mod types;
 mod transfer_worker;
+mod verification_worker;
 
+pub use access_key_pool::{AccessKeyPool, LeasedKey};
 pub use config::{CliArgs, RedisSettings, RelayConfig, RelayConfigBuilder};
-pub use observability::{BatchId, ObservabilityContext};
-
-use std::sync::Arc;
+pub use nonce_manager::NonceManager;
+pub use rpc_client::{NearRpcClient, TxStatus};
+pub use types::*;
 
 use anyhow::Result;
 use log::{info, warn};
-use near_api::{NetworkConfig, RPCEndpoint, Signer};
-use tokio::{signal, sync::Semaphore};
+use std::sync::Arc;
+use tokio::signal;
 
 pub async fn run(config: RelayConfig) -> Result<()> {
     let RelayConfig {
@@ -26,162 +27,140 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         secret_keys,
         rpc_url,
         batch_linger_ms,
-        batch_submit_delay_ms,
-        max_inflight_batches,
+        batch_submit_delay_ms: _,
+        max_inflight_batches: _,
         max_workers,
         bind_addr,
         redis,
     } = config;
 
-    let network = NetworkConfig {
-        rpc_endpoints: vec![RPCEndpoint::new(rpc_url.parse()?)],
-        ..NetworkConfig::testnet()
+    info!("Starting FT Relay Service");
+    info!("Token: {}", token);
+    info!("Relay account: {}", account_id);
+    info!("Access keys: {}", secret_keys.len());
+    info!("RPC URL: {}", rpc_url);
+
+    let mut access_keys = Vec::new();
+    for key_str in &secret_keys {
+        let secret_key: near_crypto::SecretKey = key_str.parse()?;
+        access_keys.push(AccessKey::from_secret_key(secret_key));
+    }
+
+    let redis_client = redis::Client::open(redis.url.as_str())?;
+    let http_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+    let rpc_client = Arc::new(NearRpcClient::new(&rpc_url));
+    let pool_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+    let access_key_pool = Arc::new(AccessKeyPool::new(access_keys.clone(), pool_redis_conn));
+
+    let mut nonce_manager = NonceManager::new(
+        redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+    );
+
+    info!("Initializing nonces from RPC...");
+    for key in &access_keys {
+        if !nonce_manager.is_initialized(&key.key_id).await? {
+            let access_key_view = rpc_client.get_access_key(&account_id, &key.public_key).await?;
+            nonce_manager
+                .initialize_nonce(&key.key_id, access_key_view.nonce)
+                .await?;
+            info!("Initialized nonce for key {} to {}", key.key_id, access_key_view.nonce);
+        }
+    }
+
+    let env = if token.contains(".testnet") {
+        "testnet"
+    } else if token.contains(".near") {
+        "mainnet"
+    } else {
+        "sandbox"
     };
 
-    // Create Redis client for shared operations
-    let redis_client = redis::Client::open(redis.url.as_str())?;
-
-    // Create connection manager for HTTP server (prevents connection exhaustion under load)
-    let http_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
-
-    // Create ready transfer stream queue
-    let ready_queue = Arc::new(
-        stream_queue::StreamQueue::new(
-            &redis.url,
-            redis.stream_key.clone(),
-            redis.consumer_group.clone(),
-        )
-        .await?,
-    );
-
-    // Create registration request stream queue
-    let registration_stream_key = format!("registration_requests:{}", token);
-    let registration_consumer_group = format!("registration_requests:{}:group", token);
-    let registration_queue = Arc::new(
-        stream_queue::StreamQueue::new(
-            &redis.url,
-            registration_stream_key,
-            registration_consumer_group,
-        )
-        .await?,
-    );
-
-    let router = http::build_router(
-        http_redis_conn,
-        ready_queue.clone(),
-        registration_queue.clone(),
-        token.clone(),
-    );
-
+    let router = http::build_router(http_redis_conn, env.to_string(), token.clone());
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-        info!("listening on http://{}", listener.local_addr().unwrap());
+        info!("HTTP server listening on http://{}", listener.local_addr().unwrap());
         axum::serve(listener, router).await.unwrap();
     });
 
-    // Create shared signer pool with all keys
-    let first_key = secret_keys[0].parse()?;
-    let signer = Signer::new(Signer::from_secret_key(first_key))?;
+    let num_reg_workers = 5;
+    info!("Spawning {} registration worker(s)", num_reg_workers);
+    for idx in 0..num_reg_workers {
+        let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
+            redis_conn: redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            rpc_client: rpc_client.clone(),
+            access_key_pool: access_key_pool.clone(),
+            nonce_manager: NonceManager::new(
+                redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            ),
+            relay_account: account_id.clone(),
+            token: token.clone(),
+            env: env.to_string(),
+        });
 
-    for key_str in secret_keys.iter().skip(1) {
-        let key_signer = Signer::from_secret_key(key_str.parse()?);
-        signer.add_signer_to_pool(key_signer).await?;
-    }
-
-    info!(
-        "initialized shared signer pool with {} key(s)",
-        secret_keys.len()
-    );
-
-    let semaphore = Arc::new(Semaphore::new(max_inflight_batches));
-
-    // Create observability context
-    let obs_ctx = Arc::new(observability::ObservabilityContext::new(redis_client.clone()));
-    
-    // Start periodic summary logger
-    let obs_ctx_clone = obs_ctx.clone();
-    tokio::spawn(async move {
-        observability::summary_logger_task(obs_ctx_clone).await;
-    });
-
-    // Spawn registration worker(s)
-    let registration_runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
-        redis_client: redis_client.clone(),
-        registration_queue: registration_queue.clone(),
-        ready_queue: ready_queue.clone(),
-        signer: signer.clone(),
-        signer_account: account_id.clone(),
-        token: token.clone(),
-        network: network.clone(),
-    });
-
-    info!(
-        "spawning {} registration worker(s)",
-        config::DEFAULT_MAX_REGISTRATION_WORKERS
-    );
-    for idx in 0..config::DEFAULT_MAX_REGISTRATION_WORKERS {
         let ctx = registration_worker::RegistrationWorkerContext {
-            runtime: registration_runtime.clone(),
+            runtime,
             linger_ms: batch_linger_ms,
         };
+
         tokio::spawn(async move {
             if let Err(err) = registration_worker::registration_worker_loop(ctx).await {
-                warn!("registration worker {idx} terminated with error: {err:?}");
+                warn!("Registration worker {} terminated with error: {:?}", idx, err);
             }
         });
     }
 
-    // Spawn status checker workers (for async transaction verification)
-    // Use separate connection manager to avoid exhausting Redis connections
-    let status_checker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
-    let status_checker_runtime = Arc::new(status_checker::StatusCheckerRuntime {
-        redis_conn: status_checker_conn,
-        ready_queue: ready_queue.clone(),
-        network: network.clone(),
-        obs_ctx: obs_ctx.clone(),
-        token: token.clone(),
-    });
-
-    let num_status_checkers = (max_workers / 2).max(2); // At least 2 status checkers
-    info!("spawning {} status checker worker(s)", num_status_checkers);
-    for _idx in 0..num_status_checkers {
-        let runtime = status_checker_runtime.clone();
-        tokio::spawn(async move {
-            status_checker::status_checker_task(runtime).await;
+    let num_transfer_workers = max_workers;
+    info!("Spawning {} transfer worker(s)", num_transfer_workers);
+    for idx in 0..num_transfer_workers {
+        let runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
+            redis_conn: redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            rpc_client: rpc_client.clone(),
+            access_key_pool: access_key_pool.clone(),
+            nonce_manager: NonceManager::new(
+                redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            ),
+            relay_account: account_id.clone(),
+            token: token.clone(),
+            env: env.to_string(),
         });
-    }
 
-    // Spawn transfer workers
-    // Use separate connection manager for enqueuing to verification queue
-    let transfer_redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
-    let transfer_runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
-        redis_client: redis_client.clone(),
-        redis_conn: transfer_redis_conn,
-        ready_queue: ready_queue.clone(),
-        signer: signer.clone(),
-        signer_account: account_id.clone(),
-        token: token.clone(),
-        network: network.clone(),
-        semaphore: semaphore.clone(),
-        obs_ctx: obs_ctx.clone(),
-    });
-
-    info!("spawning {} transfer worker(s)", max_workers);
-    for idx in 0..max_workers {
         let ctx = transfer_worker::TransferWorkerContext {
+            runtime,
             linger_ms: batch_linger_ms,
-            batch_submit_delay_ms,
-            runtime: transfer_runtime.clone(),
         };
 
         tokio::spawn(async move {
             if let Err(err) = transfer_worker::transfer_worker_loop(ctx).await {
-                warn!("transfer worker {idx} terminated with error: {err:?}");
+                warn!("Transfer worker {} terminated with error: {:?}", idx, err);
             }
         });
     }
 
+    let num_verify_workers = 5;
+    info!("Spawning {} verification worker(s)", num_verify_workers);
+    for idx in 0..num_verify_workers {
+        let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
+            redis_conn: redis::aio::ConnectionManager::new(redis_client.clone()).await?,
+            rpc_client: rpc_client.clone(),
+            relay_account: account_id.clone(),
+            env: env.to_string(),
+        });
+
+        let ctx = verification_worker::VerificationWorkerContext {
+            runtime,
+            linger_ms: batch_linger_ms,
+        };
+
+        tokio::spawn(async move {
+            if let Err(err) = verification_worker::verification_worker_loop(ctx).await {
+                warn!("Verification worker {} terminated with error: {:?}", idx, err);
+            }
+        });
+    }
+
+    info!("All workers started. Press Ctrl+C to shutdown.");
+
     signal::ctrl_c().await?;
-    info!("shutdown signal received, exiting");
+    info!("Shutdown signal received, exiting");
     Ok(())
 }

@@ -1,30 +1,26 @@
 use anyhow::Result;
 use log::{info, warn};
-use near_api::{NetworkConfig, Signer};
-use near_api_types::AccountId;
-use near_primitives::action::{Action, FunctionCallAction};
-use serde_json::json;
-use std::collections::HashSet;
+use redis::aio::ConnectionManager;
 use std::sync::Arc;
+use std::time::Duration;
+use uuid::Uuid;
 
-use crate::{
-    config::{MAX_GAS_PER_TX, STORAGE_DEPOSIT_AMOUNT, STORAGE_DEPOSIT_GAS_PER_ACTION},
-    redis_helpers,
-    rpc_backoff,
-    stream_queue::{RegistrationRequest, StreamQueue},
-};
+use crate::access_key_pool::AccessKeyPool;
+use crate::nonce_manager::NonceManager;
+use crate::redis_helpers as rh;
+use crate::rpc_client::NearRpcClient;
+use crate::types::{AccountId, Event, RegistrationMessage, Status};
 
-const MAX_REGISTRATIONS_PER_TX: usize =
-    (MAX_GAS_PER_TX / STORAGE_DEPOSIT_GAS_PER_ACTION) as usize;
+const MAX_RETRIES: u32 = 10;
 
 pub struct RegistrationWorkerRuntime {
-    pub redis_client: redis::Client,
-    pub registration_queue: Arc<StreamQueue<RegistrationRequest>>,
-    pub ready_queue: Arc<StreamQueue<crate::transfer_states::Transfer<crate::transfer_states::ReadyToSend>>>,
-    pub signer: Arc<Signer>,
-    pub signer_account: AccountId,
+    pub redis_conn: ConnectionManager,
+    pub rpc_client: Arc<NearRpcClient>,
+    pub access_key_pool: Arc<AccessKeyPool>,
+    pub nonce_manager: NonceManager,
+    pub relay_account: AccountId,
     pub token: AccountId,
-    pub network: NetworkConfig,
+    pub env: String,
 }
 
 pub struct RegistrationWorkerContext {
@@ -32,235 +28,223 @@ pub struct RegistrationWorkerContext {
     pub linger_ms: u64,
 }
 
-/// Registration worker - processes registration requests from the stream
 pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<()> {
-    let consumer_name = format!("registration-{}", ::uuid::Uuid::new_v4());
-    info!("registration worker started: {}", consumer_name);
+    let consumer_name = format!("registration-{}", Uuid::new_v4());
+    let stream_key = format!("ftrelay:{}:reg", ctx.runtime.env);
+    let consumer_group = format!("ftrelay:{}:reg_workers", ctx.runtime.env);
+
+    let mut conn = ctx.runtime.redis_conn.clone();
+    let _: Result<String, _> = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(&stream_key)
+        .arg(&consumer_group)
+        .arg("0")
+        .arg("MKSTREAM")
+        .query_async(&mut conn)
+        .await;
+
+    info!("Registration worker {} started", consumer_name);
 
     loop {
-        // Pop a batch of registration requests from stream (with PEL autoclaim + lingering) with retry on connection errors
-        let batch = match ctx
-            .runtime
-            .registration_queue
-            .pop_batch(&consumer_name, MAX_REGISTRATIONS_PER_TX, ctx.linger_ms)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("Connection reset") || err_str.contains("Broken pipe") {
-                    warn!("Connection error in registration worker loop, retrying in 1s: {:?}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    continue;
-                } else {
-                    return Err(e);
-                }
-            }
+        let mut conn = ctx.runtime.redis_conn.clone();
+
+        let result: Result<redis::streams::StreamReadReply, _> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(&consumer_group)
+            .arg(&consumer_name)
+            .arg("COUNT")
+            .arg(50)
+            .arg("BLOCK")
+            .arg(ctx.linger_ms as usize)
+            .arg("STREAMS")
+            .arg(&stream_key)
+            .arg(">")
+            .query_async(&mut conn)
+            .await;
+
+        let reply = match result {
+            Ok(r) => r,
+            Err(_) => continue,
         };
 
-        if !batch.is_empty() {
-            info!("claimed {} registration request(s)", batch.len());
-            process_registration_batch(&ctx.runtime, batch).await;
-        }
-    }
-}
+        for stream in reply.keys {
+            for id_data in stream.ids {
+                let stream_id = id_data.id.clone();
 
-async fn process_registration_batch(
-    runtime: &Arc<RegistrationWorkerRuntime>,
-    batch: Vec<(String, RegistrationRequest)>,
-) {
-    let runtime = runtime.clone();
-    tokio::spawn(async move {
-        if let Err(err) = process_registration_batch_inner(&runtime, &batch).await {
-            warn!("registration batch failed: {err:?}");
-            handle_registration_retry(&runtime, &batch).await;
-        }
-    });
-}
+                let data = match id_data.map.get("data") {
+                    Some(redis::Value::BulkString(bytes)) => {
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => continue,
+                };
 
-async fn process_registration_batch_inner(
-    runtime: &Arc<RegistrationWorkerRuntime>,
-    batch: &[(String, RegistrationRequest)],
-) -> Result<()> {
-    info!("registering {} account(s)", batch.len());
+                let msg: RegistrationMessage = match serde_json::from_str(data) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _: Result<(), _> = redis::cmd("XACK")
+                            .arg(&stream_key)
+                            .arg(&consumer_group)
+                            .arg(&stream_id)
+                            .query_async(&mut conn)
+                            .await;
+                        continue;
+                    }
+                };
 
-    // Extract account_ids and redis_ids
-    let redis_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-    let account_ids: Vec<String> = batch
-        .iter()
-        .map(|(_, req)| req.account_id.clone())
-        .collect();
+                match process_registration(&ctx, &msg).await {
+                    Ok(_) => {
+                        let _: Result<(), _> = redis::cmd("XACK")
+                            .arg(&stream_key)
+                            .arg(&consumer_group)
+                            .arg(&stream_id)
+                            .query_async(&mut conn)
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Error processing registration for {}: {:?}", msg.transfer_id, e);
+                        
+                        let _: Result<(), _> = redis::cmd("XACK")
+                            .arg(&stream_key)
+                            .arg(&consumer_group)
+                            .arg(&stream_id)
+                            .query_async(&mut conn)
+                            .await;
 
-    // Build transaction with storage_deposit actions
-    let mut actions = Vec::new();
-    let mut unique_accounts: HashSet<String> = HashSet::new();
-
-    for account_id in &account_ids {
-        // Deduplicate within batch
-        if unique_accounts.contains(account_id) {
-            continue;
-        }
-        unique_accounts.insert(account_id.clone());
-
-        let deposit_args = json!({
-            "account_id": account_id,
-            "registration_only": true
-        })
-        .to_string()
-        .into_bytes();
-
-        actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
-            method_name: "storage_deposit".to_string(),
-            args: deposit_args,
-            gas: STORAGE_DEPOSIT_GAS_PER_ACTION,
-            deposit: STORAGE_DEPOSIT_AMOUNT,
-        })));
-    }
-
-    // Check for RPC backoff before making any RPC calls
-    let mut conn = redis::aio::ConnectionManager::new(runtime.redis_client.clone()).await?;
-    if let Err(err) = rpc_backoff::check_and_wait_for_backoff(&mut conn).await {
-        warn!("backoff check failed: {err:?}");
-    }
-    
-    // Submit transaction
-    let tx_result = near_api::Transaction::construct(
-        runtime.signer_account.clone(),
-        runtime.token.clone(),
-    )
-    .add_actions(actions)
-    .with_signer(runtime.signer.clone())
-    .send_to(&runtime.network)
-    .await;
-    
-    let tx = match tx_result {
-        Ok(t) => {
-            // Record RPC success for backoff recovery
-            let _ = rpc_backoff::record_success(&mut conn).await;
-            t
-        }
-        Err(err) => {
-            let err_str = err.to_string();
-            
-            // Check if this is a rate limit error
-            if err_str.contains("TooManyRequests") || err_str.contains("rate limit") {
-                let _ = rpc_backoff::record_rate_limit_hit(&mut conn).await;
+                        let retry_count = msg.retry_count + 1;
+                        if retry_count < MAX_RETRIES {
+                            let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
+                            let _ = rh::enqueue_registration(
+                                &mut conn,
+                                &ctx.runtime.env,
+                                &msg.transfer_id,
+                                retry_count,
+                            )
+                            .await;
+                        } else {
+                            let _ = rh::update_transfer_status(
+                                &mut conn,
+                                &msg.transfer_id,
+                                Status::Failed,
+                            )
+                            .await;
+                            let _ = rh::log_event(
+                                &mut conn,
+                                &msg.transfer_id,
+                                Event::new("FAILED").with_reason(format!(
+                                    "Registration failed after {} retries",
+                                    retry_count
+                                )),
+                            )
+                            .await;
+                        }
+                    }
+                }
             }
-            
-            return Err(err.into());
+        }
+    }
+}
+
+async fn process_registration(
+    ctx: &RegistrationWorkerContext,
+    msg: &RegistrationMessage,
+) -> Result<()> {
+    let mut conn = ctx.runtime.redis_conn.clone();
+
+    let transfer = match rh::get_transfer_state(&mut conn, &msg.transfer_id).await? {
+        Some(t) => t,
+        None => {
+            warn!("Transfer {} not found", msg.transfer_id);
+            return Ok(());
         }
     };
 
-    let tx_hash = tx.transaction_outcome.id.to_string();
+    let account = &transfer.receiver_id;
 
-    // Check if transaction succeeded
-    use near_primitives::views::FinalExecutionStatus;
-    match &tx.status {
-        FinalExecutionStatus::SuccessValue(_) => {
-            info!(
-                "storage_deposit tx succeeded: {} ({} accounts)",
-                tx_hash,
-                unique_accounts.len()
-            );
-        }
-        FinalExecutionStatus::Failure(err) => {
-            warn!("storage_deposit tx failed: {} - {:?}", tx_hash, err);
-            return Err(anyhow::anyhow!("storage_deposit tx failed: {:?}", err));
-        }
-        status => {
-            warn!("storage_deposit tx unexpected status: {:?}", status);
-            return Err(anyhow::anyhow!("unexpected tx status: {:?}", status));
-        }
+    if rh::is_account_registered(&mut conn, account).await? {
+        info!("Account {} already registered (fast path)", account);
+        rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+        rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+        rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+        rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+        return Ok(());
     }
 
-    // Only pop pending transfers if tx succeeded
-    // (reuse conn from earlier)
-    let token_str = runtime.token.to_string();
+    let lock_key = format!("register_lock:{}", account);
+    let lock_value = Uuid::new_v4().to_string();
+    let acquired = rh::acquire_lock(&mut conn, &lock_key, &lock_value, 30).await?;
 
-    // For each account, move pending transfers to ready stream
-    for account_id in &unique_accounts {
-        // Get all pending transfers for this account
-        let pending_transfers =
-            redis_helpers::pop_pending_transfers(&mut conn, &token_str, account_id).await?;
+    if !acquired {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        return Err(anyhow::anyhow!("Lock not acquired, will retry"));
+    }
 
-        if pending_transfers.is_empty() {
-            continue;
-        }
+    if rh::is_account_registered(&mut conn, account).await? {
+        info!("Account {} registered by another worker", account);
+        rh::release_lock(&mut conn, &lock_key).await?;
+        rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+        rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+        rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+        rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+        return Ok(());
+    }
 
-        info!(
-            "moving {} pending transfer(s) for {} to ready stream",
-            pending_transfers.len(),
-            account_id
-        );
+    info!("Registering account {} on-chain", account);
 
-        // Transform to ReadyToSend
-        let ready_transfers: Vec<crate::transfer_states::Transfer<crate::transfer_states::ReadyToSend>> = pending_transfers
-            .into_iter()
-            .map(|t| t.mark_registered())
-            .collect();
+    let leased_key = ctx.runtime.access_key_pool.lease().await?;
 
-        // Mark as registered and enqueue all transfers atomically
-        redis_helpers::mark_registered_and_push_to_stream(
-            &mut conn,
-            &token_str,
-            runtime.ready_queue.stream_key(),
-            account_id,
-            ready_transfers,
-        )
+    let nonce = ctx
+        .runtime
+        .nonce_manager
+        .clone()
+        .get_next_nonce(&leased_key.key_id)
         .await?;
-    }
 
-    // Remove accounts from pending registration set (cleanup for deduplication)
-    let pending_reg_key = format!("registration_pending:{}", token_str);
-    let account_ids_vec: Vec<&str> = unique_accounts.iter().map(|s| s.as_str()).collect();
-    if !account_ids_vec.is_empty() {
-        use redis::AsyncCommands;
-        let _: () = conn.srem(&pending_reg_key, &account_ids_vec).await?;
-    }
+    let result = ctx
+        .runtime
+        .rpc_client
+        .register_account(
+            &ctx.runtime.relay_account,
+            &ctx.runtime.token,
+            account,
+            &leased_key.secret_key,
+            nonce,
+        )
+        .await;
 
-    // ACK all registration requests after successful processing
-    runtime.registration_queue.ack(&redis_ids).await?;
+    drop(leased_key);
 
-    Ok(())
-}
-
-/// Handle failed registration attempts by explicitly re-enqueuing
-/// Note: RegistrationRequest doesn't track attempts since registration is idempotent
-async fn handle_registration_retry(
-    runtime: &Arc<RegistrationWorkerRuntime>,
-    batch: &[(String, RegistrationRequest)],
-) {
-    let mut redis_ids_to_ack = Vec::new();
-    let mut requeued_count = 0;
-
-    for (redis_id, request) in batch {
-        // Re-push to registration queue for retry
-        if let Err(err) = runtime.registration_queue.push(request).await {
-            warn!(
-                "failed to re-enqueue registration for {}: {err:?}",
-                request.account_id
-            );
-        } else {
-            requeued_count += 1;
-            redis_ids_to_ack.push(redis_id.clone());
+    match result {
+        Ok(tx_hash) => {
+            info!("Registered {} with tx {}", account, tx_hash);
+            rh::mark_account_registered(&mut conn, account).await?;
+            rh::release_lock(&mut conn, &lock_key).await?;
+            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+            rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+            Ok(())
         }
-    }
-
-    // Log summary
-    if requeued_count > 0 {
-        info!(
-            "re-enqueued {} registration request(s) for retry",
-            requeued_count
-        );
-    }
-
-    // ACK all at once
-    if !redis_ids_to_ack.is_empty() {
-        if let Err(err) = runtime.registration_queue.ack(&redis_ids_to_ack).await {
-            warn!(
-                "failed to ack {} registrations: {err:?}",
-                redis_ids_to_ack.len()
-            );
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            
+            if err_str.contains("already") || err_str.contains("exist") {
+                info!("Account {} already registered (on-chain)", account);
+                rh::mark_account_registered(&mut conn, account).await?;
+                rh::release_lock(&mut conn, &lock_key).await?;
+                rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered)
+                    .await?;
+                rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+                rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
+                rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+                Ok(())
+            } else {
+                warn!("Failed to register {}: {:?}", account, e);
+                rh::release_lock(&mut conn, &lock_key).await?;
+                Err(e)
+            }
         }
     }
 }
