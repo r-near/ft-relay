@@ -40,7 +40,9 @@ impl NearRpcClient {
         {
             let cache = self.block_hash_cache.read().await;
             if let Some((hash, cached_at)) = *cache {
-                if cached_at.elapsed() < Duration::from_secs(3600) {
+                // Reduced from 3600s to 1s to prevent expiration during high load
+                // Sandbox creates new block per tx, so stale hash = expired tx after ~100 blocks
+                if cached_at.elapsed() < Duration::from_millis(500) {
                     debug!("Using cached block hash");
                     return Ok(hash);
                 }

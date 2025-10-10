@@ -177,6 +177,17 @@ where
     Ok(())
 }
 
+/// Atomically add account to pending registrations set.
+/// Returns true if this is the FIRST time (account was added), false if already pending.
+pub async fn mark_account_pending_registration<C>(conn: &mut C, account: &str) -> Result<bool>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    // SADD returns the number of elements added (1 = new, 0 = already exists)
+    let added: i32 = conn.sadd("pending_registrations", account).await?;
+    Ok(added == 1)
+}
+
 pub async fn acquire_lock<C>(
     conn: &mut C,
     lock_key: &str,

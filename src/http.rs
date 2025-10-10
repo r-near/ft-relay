@@ -150,11 +150,11 @@ async fn create_transfer(
             })?;
         Status::Registered
     } else {
-        // Not registered - enqueue for registration
-        rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+        // Not registered - check if already pending (atomic check-and-add)
+        let is_first_request = rh::mark_account_pending_registration(&mut conn, &body.receiver_id)
             .await
             .map_err(|e| {
-                warn!("Failed to enqueue registration: {:?}", e);
+                warn!("Failed to mark pending: {:?}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -162,17 +162,45 @@ async fn create_transfer(
                     }),
                 )
             })?;
-        rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
-            .await
-            .map_err(|e| {
-                warn!("Failed to log event: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Internal server error".to_string(),
-                    }),
-                )
-            })?;
+
+        if is_first_request {
+            // First request for this account - queue for registration
+            rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to enqueue registration: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Internal server error".to_string(),
+                        }),
+                    )
+                })?;
+            rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
+                .await
+                .map_err(|e| {
+                    warn!("Failed to log event: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Internal server error".to_string(),
+                        }),
+                    )
+                })?;
+        } else {
+            // Already pending - another request queued it, just log
+            rh::log_event(&mut conn, &transfer_id, Event::new("PENDING_REGISTRATION"))
+                .await
+                .map_err(|e| {
+                    warn!("Failed to log event: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Internal server error".to_string(),
+                        }),
+                    )
+                })?;
+        }
         Status::QueuedRegistration
     };
 
