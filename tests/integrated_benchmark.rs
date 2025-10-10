@@ -307,7 +307,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         max_inflight_batches: 500,   // High concurrency
         max_workers: 3,              // 3 transfer workers
         max_registration_workers: 5, // 5 registration workers (more uniform flow for dupes)
-        max_verification_workers: 1, // 1 verification worker
+        max_verification_workers: 10, // 10 verification workers (need to verify ~200 txs * 6sec each)
         bind_addr: "127.0.0.1:18082".to_string(),
         redis,
     };
