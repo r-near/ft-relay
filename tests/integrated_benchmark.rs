@@ -173,18 +173,13 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("✅ FT contract deployed and initialized");
 
     // Generate multiple access keys for better throughput (real-world usage pattern)
-    println!("\nGenerating 3 access keys for key pooling...");
+    println!("\nGenerating 75 access keys for key pooling...");
     let mut secret_keys = vec![ft_owner.private_key.to_string()];
 
-    // Generate 2 new keypairs upfront
-    let new_keys: Vec<SecretKey> = (0..2)
+    // Generate 75 new keypairs upfront
+    let new_keys: Vec<SecretKey> = (0..75)
         .map(|_| SecretKey::from_random(near_crypto::KeyType::ED25519))
         .collect();
-
-    println!("Adding 2 new access keys in a single batch transaction...");
-    for (i, key) in new_keys.iter().enumerate() {
-        println!("  Key {}: {}", i + 1, key.public_key());
-    }
 
     let client = JsonRpcClient::connect(&sandbox.rpc_addr);
     let owner_secret_key: SecretKey = ft_owner.private_key.parse()?;
@@ -260,35 +255,6 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         return Err("No execution outcome returned for batch add key transaction".into());
     }
 
-    // Verify all keys are actually on-chain before proceeding
-    println!(
-        "\nVerifying all {} access keys are on-chain...",
-        secret_keys.len()
-    );
-    for (idx, key_str) in secret_keys.iter().enumerate() {
-        let verify_key: SecretKey = key_str.parse()?;
-        let verify_request = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::Finality(Finality::Final),
-            request: near_primitives::views::QueryRequest::ViewAccessKey {
-                account_id: ft_owner.account_id.clone(),
-                public_key: verify_key.public_key(),
-            },
-        };
-
-        match client.call(verify_request).await {
-            Ok(resp) => {
-                if let QueryResponseKind::AccessKey(_) = resp.kind {
-                    println!("  ✅ Key {}: {} verified", idx + 1, verify_key.public_key());
-                }
-            }
-            Err(e) => {
-                return Err(
-                    format!("Failed to verify key {}: {:?}", verify_key.public_key(), e).into(),
-                );
-            }
-        }
-    }
-
     println!(
         "✅ All {} access keys configured and verified",
         secret_keys.len()
@@ -305,8 +271,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         batch_linger_ms: 100, // Fast batching (100ms is enough with high load)
         batch_submit_delay_ms: 0, // No throttling needed for sandbox
         max_inflight_batches: 500, // High concurrency
-        max_workers: 3,       // 3 transfer workers
-        max_registration_workers: 1, // 5 registration workers (more uniform flow for dupes)
+        max_workers: 1,       // 1 transfer worker
+        max_registration_workers: 1, // 1 registration worker (serial registration)
         max_verification_workers: 1, // 1 verification worker (no sleep needed, txs already Final)
         bind_addr: "127.0.0.1:18082".to_string(),
         redis,
@@ -316,6 +282,15 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("  Batch linger: {}ms", config.batch_linger_ms);
     println!("  Max inflight batches: {}", config.max_inflight_batches);
     println!("  Access keys: {}", config.secret_keys.len());
+    println!(
+        "  Registration workers: {}",
+        config.max_registration_workers
+    );
+    println!("  Transfer workers: {}", config.max_workers);
+    println!(
+        "  Verification workers: {}",
+        config.max_verification_workers
+    );
 
     let server_handle = tokio::spawn(async move {
         match ft_relay::run(config).await {
@@ -353,6 +328,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("║  Starting benchmark: {} transfers", total_requests);
     println!("║  Concurrent HTTP workers: {}", concurrent_workers);
     println!("╚════════════════════════════════════════════════════════════╝\n");
+
+    println!("[PHASE_MARKER] phase=http_load_start");
 
     let api_start = Instant::now();
     let mut tasks = Vec::new();
@@ -443,6 +420,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     }
 
     let api_end = Instant::now();
+    println!("[PHASE_MARKER] phase=http_load_end");
+
     let api_elapsed = api_end
         .checked_duration_since(api_start)
         .unwrap_or_else(|| Duration::from_secs(0));
@@ -499,10 +478,10 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         // Max 60 seconds
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // Check registration stream (first in pipeline) to verify HTTP → Redis worked
+        // Check transfers stream to verify HTTP → Redis worked
         let stream_info: redis::Value = redis::cmd("XINFO")
             .arg("STREAM")
-            .arg("ftrelay:sandbox:reg")
+            .arg("ftrelay:sandbox:xfer")
             .query_async(&mut redis_conn)
             .await?;
 

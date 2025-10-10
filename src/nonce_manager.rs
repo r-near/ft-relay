@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::info;
+use log::debug;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 
@@ -30,7 +30,7 @@ impl NonceManager {
             .await?;
 
         if set {
-            info!("Initialized nonce for key {} to {}", key_id, initial_nonce);
+            debug!("Initialized nonce for key {} to {}", key_id, initial_nonce);
         }
 
         Ok(())

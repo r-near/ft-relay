@@ -16,7 +16,7 @@ pub use rpc_client::{NearRpcClient, TxStatus};
 pub use types::*;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::sync::Arc;
 use tokio::signal;
 
@@ -48,17 +48,12 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         access_keys.push(AccessKey::from_secret_key(secret_key));
     }
 
-    let redis_client = redis::Client::open(redis.url.as_str())?;
-
-    // Create shared Redis connection manager
-    // ConnectionManager is designed for concurrent use - cloning it is safe and efficient
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+    // Create separate Redis client for HTTP handler (independent TCP connection)
+    let http_redis_client = redis::Client::open(redis.url.as_str())?;
+    let redis_conn = redis::aio::ConnectionManager::new(http_redis_client).await?;
 
     let rpc_client = Arc::new(NearRpcClient::new(&rpc_url));
-    let access_key_pool = Arc::new(AccessKeyPool::new(
-        access_keys.clone(),
-        redis_conn.clone(),
-    ));
+    let access_key_pool = Arc::new(AccessKeyPool::new(access_keys.clone(), redis_conn.clone()));
 
     let mut nonce_manager = NonceManager::new(redis_conn.clone());
 
@@ -71,7 +66,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
             nonce_manager
                 .initialize_nonce(&key.key_id, access_key_view.nonce)
                 .await?;
-            info!(
+            debug!(
                 "Initialized nonce for key {} to {}",
                 key.key_id, access_key_view.nonce
             );
@@ -101,8 +96,9 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         max_registration_workers
     );
     for idx in 0..max_registration_workers {
-        // Each worker gets its OWN connection to avoid blocking the HTTP handler
-        let worker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+        // Each worker gets its OWN Redis client (separate TCP connection, not multiplexed)
+        let worker_redis_client = redis::Client::open(redis.url.as_str())?;
+        let worker_conn = redis::aio::ConnectionManager::new(worker_redis_client).await?;
         let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
             redis_conn: worker_conn.clone(),
             rpc_client: rpc_client.clone(),
@@ -130,8 +126,9 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     info!("Spawning {} transfer worker(s)", max_workers);
     for idx in 0..max_workers {
-        // Each worker gets its OWN connection to avoid blocking the HTTP handler
-        let worker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+        // Each worker gets its OWN Redis client (separate TCP connection, not multiplexed)
+        let worker_redis_client = redis::Client::open(redis.url.as_str())?;
+        let worker_conn = redis::aio::ConnectionManager::new(worker_redis_client).await?;
         let runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
             redis_conn: worker_conn.clone(),
             rpc_client: rpc_client.clone(),
@@ -159,8 +156,9 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         max_verification_workers
     );
     for idx in 0..max_verification_workers {
-        // Each worker gets its OWN connection to avoid blocking the HTTP handler
-        let worker_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+        // Each worker gets its OWN Redis client (separate TCP connection, not multiplexed)
+        let worker_redis_client = redis::Client::open(redis.url.as_str())?;
+        let worker_conn = redis::aio::ConnectionManager::new(worker_redis_client).await?;
         let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
             redis_conn: worker_conn,
             rpc_client: rpc_client.clone(),

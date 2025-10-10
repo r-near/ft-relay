@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use redis::aio::ConnectionManager;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -46,8 +46,10 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
     info!("Transfer worker {} started", consumer_name);
 
     loop {
+        let loop_start = std::time::Instant::now();
         let mut conn = ctx.runtime.redis_conn.clone();
 
+        let pop_start = std::time::Instant::now();
         let batch: Vec<(String, TransferMessage)> = match rh::pop_batch(
             &mut conn,
             &stream_key,
@@ -58,7 +60,12 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
         )
         .await
         {
-            Ok(b) => b,
+            Ok(b) => {
+                let pop_duration = pop_start.elapsed();
+                debug!("[METRIC] op=pop_batch duration_ms={} msg_count={}", pop_duration.as_millis(), b.len());
+                debug!("[TIMING] pop_batch took {}ms for {} messages", pop_duration.as_millis(), b.len());
+                b
+            }
             Err(e) => {
                 warn!("Error popping batch: {:?}", e);
                 continue;
@@ -69,7 +76,12 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
             continue;
         }
 
+        let batch_process_start = std::time::Instant::now();
         process_batch(&ctx, &stream_key, &consumer_group, batch).await?;
+        let batch_process_duration = batch_process_start.elapsed();
+        let loop_duration = loop_start.elapsed();
+        debug!("[METRIC] op=batch_process duration_ms={}", batch_process_duration.as_millis());
+        debug!("[METRIC] op=loop_total duration_ms={}", loop_duration.as_millis());
     }
 }
 
@@ -79,25 +91,39 @@ async fn process_batch(
     consumer_group: &str,
     batch: Vec<(String, TransferMessage)>,
 ) -> Result<()> {
+    let batch_start = std::time::Instant::now();
+    debug!("[METRIC] op=process_batch_start batch_size={}", batch.len());
     let mut conn = ctx.runtime.redis_conn.clone();
 
+    let fetch_start = std::time::Instant::now();
+    
+    // Use pipelining to fetch all transfer states in ONE request (10-100x faster!)
+    let transfer_ids: Vec<String> = batch.iter().map(|(_, msg)| msg.transfer_id.clone()).collect();
+    let states = rh::get_transfer_states_batch(&mut conn, &transfer_ids).await?;
+    
     let mut transfers = Vec::new();
-    for (stream_id, msg) in &batch {
-        match rh::get_transfer_state(&mut conn, &msg.transfer_id).await? {
-            Some(transfer) => transfers.push((stream_id.clone(), msg.clone(), transfer)),
+    for ((stream_id, msg), state) in batch.iter().zip(states.iter()) {
+        match state {
+            Some(transfer) => transfers.push((stream_id.clone(), msg.clone(), transfer.clone())),
             None => {
                 warn!("Transfer {} not found", msg.transfer_id);
                 let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
             }
         }
     }
+    let fetch_duration = fetch_start.elapsed();
+    debug!("[METRIC] op=fetch_states duration_ms={} count={}", fetch_duration.as_millis(), transfers.len());
+    debug!("[TIMING] Fetched {} transfer states in {}ms (pipelined)", transfers.len(), fetch_duration.as_millis());
 
     if transfers.is_empty() {
         return Ok(());
     }
 
-    info!("Processing batch of {} transfers", transfers.len());
+    debug!("Processing batch of {} transfers", transfers.len());
+    let build_transfers_duration = batch_start.elapsed();
+    debug!("[METRIC] op=build_transfers duration_ms={} count={}", build_transfers_duration.as_millis(), transfers.len());
 
+    let lease_start = std::time::Instant::now();
     let leased_key = match ctx.runtime.access_key_pool.lease().await {
         Ok(key) => key,
         Err(e) => {
@@ -120,6 +146,10 @@ async fn process_batch(
         }
     };
 
+    let lease_duration = lease_start.elapsed();
+    debug!("[METRIC] op=key_lease duration_ms={}", lease_duration.as_millis());
+    debug!("[TIMING] Key lease took {}ms", lease_duration.as_millis());
+
     let nonce = ctx
         .runtime
         .nonce_manager
@@ -132,6 +162,7 @@ async fn process_batch(
         receivers.push((transfer.receiver_id.clone(), transfer.amount.clone()));
     }
 
+    let rpc_start = std::time::Instant::now();
     let result = ctx
         .runtime
         .rpc_client
@@ -143,6 +174,9 @@ async fn process_batch(
             nonce,
         )
         .await;
+    let rpc_duration = rpc_start.elapsed();
+    debug!("[METRIC] op=rpc_broadcast duration_ms={} batch_size={}", rpc_duration.as_millis(), transfers.len());
+    debug!("[TIMING] RPC broadcast took {}ms", rpc_duration.as_millis());
 
     drop(leased_key);
 
@@ -172,19 +206,53 @@ async fn process_batch(
 
             if is_success {
                 // Transaction succeeded - mark as completed (skip verification)
+                let redis_update_start = std::time::Instant::now();
+                
+                // Pipeline ALL Redis updates for the batch (one round-trip instead of 900!)
+                let mut pipe = redis::pipe();
+                pipe.atomic(); // Execute all commands together
+                
+                let now = chrono::Utc::now().to_rfc3339();
                 for (stream_id, msg, _) in &transfers {
-                    rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Completed)
-                        .await?;
-                    rh::update_tx_hash(&mut conn, &msg.transfer_id, &tx_hash_str).await?;
-                    rh::add_transfer_to_tx(&mut conn, &tx_hash_str, &msg.transfer_id).await?;
-                    rh::log_event(
-                        &mut conn,
-                        &msg.transfer_id,
-                        Event::new("COMPLETED").with_tx_hash(tx_hash_str.clone()),
-                    )
-                    .await?;
-                    let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
+                    let transfer_key = format!("transfer:{}", msg.transfer_id);
+                    let event_key = format!("transfer:{}:ev", msg.transfer_id);
+                    let tx_transfers_key = format!("tx:{}:transfers", tx_hash_str);
+                    
+                    // Update transfer status (2 HSETs)
+                    pipe.hset(&transfer_key, "status", "Completed");
+                    pipe.hset(&transfer_key, "updated_at", &now);
+                    pipe.hset(&transfer_key, "completed_at", &now);
+                    
+                    // Update tx_hash (1 HSET)
+                    pipe.hset(&transfer_key, "tx_hash", &tx_hash_str);
+                    
+                    // Add transfer to tx mapping (1 SADD + 1 EXPIRE)
+                    pipe.sadd(&tx_transfers_key, &msg.transfer_id);
+                    pipe.expire(&tx_transfers_key, 86400);
+                    
+                    // Log event (1 LPUSH + 1 EXPIRE)
+                    let event = Event::new("COMPLETED").with_tx_hash(tx_hash_str.clone());
+                    let serialized = serde_json::to_string(&event)?;
+                    pipe.lpush(&event_key, serialized);
+                    pipe.expire(&event_key, 86400);
+                    
+                    // ACK message (1 XACK)
+                    pipe.cmd("XACK")
+                        .arg(stream_key)
+                        .arg(consumer_group)
+                        .arg(stream_id);
                 }
+                
+                // Execute entire pipeline in ONE network round-trip!
+                pipe.query_async::<()>(&mut conn).await?;
+                
+                let redis_update_duration = redis_update_start.elapsed();
+                debug!("[METRIC] op=redis_updates duration_ms={} count={}", redis_update_duration.as_millis(), transfers.len());
+                debug!("[TIMING] Pipelined Redis updates for {} transfers took {}ms ({:.1}ms per transfer)", 
+                    transfers.len(), 
+                    redis_update_duration.as_millis(),
+                    redis_update_duration.as_millis() as f64 / transfers.len() as f64
+                );
             } else {
                 // Transaction failed or uncertain - send to verification
                 for (stream_id, msg, _) in &transfers {

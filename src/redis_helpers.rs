@@ -4,9 +4,7 @@ use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 
-use crate::types::{
-    Event, RegistrationMessage, Status, TransferMessage, TransferState, VerificationMessage,
-};
+use crate::types::{Event, Status, TransferMessage, TransferState, VerificationMessage};
 
 pub async fn store_transfer_state<C>(conn: &mut C, state: &TransferState) -> Result<()>
 where
@@ -40,12 +38,115 @@ where
     Ok(())
 }
 
+/// Fetch multiple transfer states in one pipelined request (10-100x faster than sequential)
+pub async fn get_transfer_states_batch<C>(
+    conn: &mut C,
+    transfer_ids: &[String],
+) -> Result<Vec<Option<TransferState>>>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    if transfer_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pipeline_start = std::time::Instant::now();
+
+    // Build pipeline with all HGETALL commands
+    let mut pipe = redis::pipe();
+    for transfer_id in transfer_ids {
+        let key = format!("transfer:{}", transfer_id);
+        pipe.hgetall(&key);
+    }
+
+    // Execute pipeline (single round-trip for all fetches!)
+    let results: Vec<std::collections::HashMap<String, String>> = pipe.query_async(conn).await?;
+
+    let pipeline_duration = pipeline_start.elapsed();
+    log::debug!(
+        "[REDIS_TIMING] Pipelined HGETALL for {} transfer states took {}ms ({:.1}ms per transfer)",
+        transfer_ids.len(),
+        pipeline_duration.as_millis(),
+        pipeline_duration.as_millis() as f64 / transfer_ids.len() as f64
+    );
+
+    // Parse results
+    let mut states = Vec::new();
+    for (transfer_id, data) in transfer_ids.iter().zip(results.iter()) {
+        if data.is_empty() {
+            states.push(None);
+            continue;
+        }
+
+        let status_str = match data.get("status") {
+            Some(s) => s,
+            None => {
+                states.push(None);
+                continue;
+            }
+        };
+        let status: Status = serde_json::from_str(&format!("\"{}\"", status_str))?;
+        let receiver_id = match data.get("receiver_id") {
+            Some(r) => r.clone(),
+            None => {
+                states.push(None);
+                continue;
+            }
+        };
+        let amount = match data.get("amount") {
+            Some(a) => a.clone(),
+            None => {
+                states.push(None);
+                continue;
+            }
+        };
+        let created_at = match data.get("created_at") {
+            Some(c) => c.parse()?,
+            None => {
+                states.push(None);
+                continue;
+            }
+        };
+        let updated_at = data
+            .get("updated_at")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| Utc::now());
+        let retry_count = data
+            .get("retry_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        states.push(Some(TransferState {
+            transfer_id: transfer_id.clone(),
+            status,
+            receiver_id,
+            amount,
+            tx_hash: data.get("tx_hash").cloned(),
+            created_at,
+            updated_at,
+            completed_at: data.get("completed_at").and_then(|s| s.parse().ok()),
+            retry_count,
+            error_message: data.get("error_message").cloned(),
+        }));
+    }
+
+    Ok(states)
+}
+
 pub async fn get_transfer_state<C>(conn: &mut C, transfer_id: &str) -> Result<Option<TransferState>>
 where
     C: ConnectionLike + AsyncCommands + Send + Sync,
 {
+    let hgetall_start = std::time::Instant::now();
     let key = format!("transfer:{}", transfer_id);
     let data: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
+    let hgetall_duration = hgetall_start.elapsed();
+    if hgetall_duration.as_millis() > 5 {
+        log::debug!(
+            "[REDIS_TIMING] HGETALL for transfer state took {}ms",
+            hgetall_duration.as_millis()
+        );
+    }
 
     // If no data, key doesn't exist
     if data.is_empty() {
@@ -292,6 +393,7 @@ pub async fn enqueue_transfer<C>(
 where
     C: ConnectionLike + AsyncCommands + Send + Sync,
 {
+    let xadd_start = std::time::Instant::now();
     let stream_key = format!("ftrelay:{}:xfer", env);
     let msg = TransferMessage {
         transfer_id: transfer_id.to_string(),
@@ -300,6 +402,67 @@ where
     let serialized = serde_json::to_string(&msg)?;
     conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())])
         .await?;
+    let xadd_duration = xadd_start.elapsed();
+    if xadd_duration.as_millis() > 10 {
+        log::debug!(
+            "[REDIS_TIMING] XADD to transfer stream took {}ms",
+            xadd_duration.as_millis()
+        );
+    }
+    Ok(())
+}
+
+/// Efficiently forward a batch of transfers to the ready-for-transfer stream
+/// Also updates status and logs events in a single pipelined round trip.
+pub async fn forward_transfers_batch<C>(
+    conn: &mut C,
+    env: &str,
+    transfer_ids: &[String],
+) -> Result<()>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    if transfer_ids.is_empty() {
+        return Ok(());
+    }
+
+    let stream_key = format!("ftrelay:{}:xfer", env);
+    let now = Utc::now().to_rfc3339();
+    let registered_event = serde_json::to_string(&Event::new("REGISTERED"))?;
+    let queued_event = serde_json::to_string(&Event::new("QUEUED_TRANSFER"))?;
+
+    let mut pipe = redis::pipe();
+    for transfer_id in transfer_ids {
+        let state_key = format!("transfer:{}", transfer_id);
+        let ev_key = format!("transfer:{}:ev", transfer_id);
+
+        // Update status + timestamps
+        pipe.hset(&state_key, "status", Status::Registered.as_str()).ignore();
+        pipe.hset(&state_key, "updated_at", &now).ignore();
+
+        // Log REGISTERED event
+        pipe.lpush(&ev_key, &registered_event).ignore();
+
+        // Enqueue to transfer stream
+        let msg = TransferMessage {
+            transfer_id: transfer_id.clone(),
+            retry_count: 0,
+        };
+        let serialized = serde_json::to_string(&msg)?;
+        pipe.cmd("XADD")
+            .arg(&stream_key)
+            .arg("*")
+            .arg("data")
+            .arg(&serialized)
+            .ignore();
+
+        // Log QUEUED_TRANSFER event
+        pipe.lpush(&ev_key, &queued_event).ignore();
+        // Keep events key TTL consistent with single push path
+        pipe.cmd("EXPIRE").arg(&ev_key).arg(86400).ignore();
+    }
+
+    pipe.query_async::<()>(conn).await?;
     Ok(())
 }
 
@@ -393,6 +556,16 @@ where
 {
     let start = std::time::Instant::now();
     let mut batch: Vec<(String, T)> = Vec::new();
+    let mut total_read_time_ms = 0u128;
+    let mut read_count = 0;
+
+    // // Check queue depth before starting
+    // let queue_depth: u64 = redis::cmd("XLEN")
+    //     .arg(stream_key)
+    //     .query_async(conn)
+    //     .await
+    //     .unwrap_or(0);
+    // log::debug!("[METRIC] op=queue_depth depth={} stream={}", queue_depth, stream_key);
 
     // Keep accumulating until batch is full or linger time expires
     // ALWAYS wait the full linger time to give messages a chance to arrive
@@ -403,6 +576,7 @@ where
         // Use short block timeout (10ms) to keep checking for new messages
         let block_ms = time_left.min(10);
 
+        let read_start = std::time::Instant::now();
         let mut additional = read_stream_batch(
             conn,
             stream_key,
@@ -412,6 +586,9 @@ where
             block_ms,
         )
         .await?;
+        let read_duration = read_start.elapsed();
+        total_read_time_ms += read_duration.as_millis();
+        read_count += 1;
 
         // If we got messages, append them
         if !additional.is_empty() {
@@ -426,12 +603,11 @@ where
     }
 
     log::debug!(
-        "[BATCH] Stream {} accumulated {} messages in {}ms (max: {}, linger: {}ms)",
-        stream_key,
+        "[REDIS_TIMING] pop_batch: {} msgs in {}ms total ({} reads, {}ms in XREADGROUP)",
         batch.len(),
         start.elapsed().as_millis(),
-        max_count,
-        linger_ms
+        read_count,
+        total_read_time_ms
     );
 
     Ok(batch)

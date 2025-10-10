@@ -76,7 +76,7 @@ impl NearRpcClient {
         signed_tx: SignedTransaction,
     ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let tx_hash = signed_tx.get_hash();
-        info!("Broadcasting transaction: {}", tx_hash);
+        debug!("Broadcasting transaction: {}", tx_hash);
 
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {

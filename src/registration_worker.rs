@@ -50,6 +50,11 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
     loop {
         let mut conn = ctx.runtime.redis_conn.clone();
 
+        debug!(
+            "[REG_WORKER] {} polling for batch (linger: {}ms)",
+            consumer_name, ctx.linger_ms
+        );
+
         let batch: Vec<(String, RegistrationMessage)> = match rh::pop_batch(
             &mut conn,
             &stream_key,
@@ -60,9 +65,19 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
         )
         .await
         {
-            Ok(b) => b,
+            Ok(b) => {
+                debug!(
+                    "[REG_WORKER] {} got batch of {} registration job(s)",
+                    consumer_name,
+                    b.len()
+                );
+                b
+            }
             Err(e) => {
-                debug!("No registration messages: {:?}", e);
+                debug!(
+                    "[REG_WORKER] {} found no messages after {}ms wait",
+                    consumer_name, ctx.linger_ms
+                );
                 continue;
             }
         };
@@ -77,7 +92,8 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
                 warn!("Batch processing error: {:?}", e);
                 // Re-enqueue account registration jobs with retry
                 for (stream_id, msg) in &batch {
-                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
+                    let _ =
+                        rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
                     let retry_count = msg.retry_count + 1;
                     if retry_count < MAX_RETRIES {
                         // Re-queue the account registration job
@@ -87,10 +103,17 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
                         };
                         let serialized = serde_json::to_string(&registration_msg).unwrap();
                         let _: Result<String, _> = conn
-                            .xadd::<_, _, _, _, String>(&stream_key, "*", &[("data", serialized.as_str())])
+                            .xadd::<_, _, _, _, String>(
+                                &stream_key,
+                                "*",
+                                &[("data", serialized.as_str())],
+                            )
                             .await;
                     } else {
-                        warn!("Account {} registration failed after {} retries", msg.account, retry_count);
+                        warn!(
+                            "Account {} registration failed after {} retries",
+                            msg.account, retry_count
+                        );
                         // Note: Waiting transfers will remain in waiting list
                         // They can be manually recovered or will timeout
                     }
@@ -120,7 +143,11 @@ async fn process_registration_batch(
     }
 
     let accounts: Vec<AccountId> = account_to_jobs.keys().cloned().collect();
-    info!("Registering {} account(s) in batch", accounts.len());
+    info!(
+        "[REG_WORKER] Registering {} account(s) in batch: {:?}",
+        accounts.len(),
+        accounts
+    );
 
     // Register all accounts in one batch transaction (idempotent - blockchain handles "already exists")
     let leased_key = ctx.runtime.access_key_pool.lease().await?;
@@ -158,7 +185,11 @@ async fn process_registration_batch(
                 return Err(anyhow::anyhow!("Registration failed"));
             }
 
-            info!("Registered {} accounts with tx {}", accounts.len(), tx_hash);
+            info!(
+                "[REG_WORKER] ✅ Registered {} accounts with tx {}",
+                accounts.len(),
+                tx_hash
+            );
         }
         Err(e) => {
             let err_str = format!("{:?}", e);
@@ -171,23 +202,43 @@ async fn process_registration_batch(
     }
 
     // Atomically complete registration for all accounts (Lua script - no races!)
+    // Collect all waiting transfers across accounts and forward them in one pipelined shot
+    let mut all_waiting: Vec<String> = Vec::new();
     for (account, job_ids) in account_to_jobs {
         // Lua script atomically: marks registered + gets waiting transfers + cleans up
         let waiting_transfers = rh::complete_account_registration(&mut conn, &account).await?;
-        
+
         if !waiting_transfers.is_empty() {
-            debug!("Account {} has {} waiting transfers", account, waiting_transfers.len());
+            info!(
+                "[REG_WORKER] Account {} has {} waiting transfers",
+                account,
+                waiting_transfers.len()
+            );
+        } else {
+            debug!("[REG_WORKER] Account {} has no waiting transfers", account);
         }
-        
-        // Forward all waiting transfers to transfer stream
-        for transfer_id in waiting_transfers {
-            forward_transfer_to_ready_stream(ctx, &mut conn, &transfer_id).await?;
-        }
+
+        all_waiting.extend(waiting_transfers);
 
         // Ack all registration jobs for this account
         for job_id in job_ids {
             rh::ack_message(&mut conn, stream_key, consumer_group, &job_id).await?;
         }
+    }
+
+    if !all_waiting.is_empty() {
+        let start = std::time::Instant::now();
+        info!(
+            "[REG_WORKER] Forwarding {} waiting transfers across registered accounts",
+            all_waiting.len()
+        );
+        rh::forward_transfers_batch(&mut conn, &ctx.runtime.env, &all_waiting).await?;
+        let dur = start.elapsed();
+        info!(
+            "[REG_WORKER] Forwarded {} transfers in {}ms",
+            all_waiting.len(),
+            dur.as_millis()
+        );
     }
 
     Ok(())
