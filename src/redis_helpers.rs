@@ -243,6 +243,11 @@ where
     } else if batch.is_empty() {
         // If no messages at all, block longer to avoid busy-waiting
         batch = read_stream_batch(conn, stream_key, consumer_group, consumer_name, max_count, linger_ms).await?;
+        
+        // If still empty after blocking, return error to restart worker loop
+        if batch.is_empty() {
+            return Err(anyhow::anyhow!("No messages available after blocking"));
+        }
     }
 
     Ok(batch)

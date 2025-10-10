@@ -108,6 +108,8 @@ async fn setup_ft_contract(
 
     // Check if transaction succeeded
     if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
+        // Wait a bit for state to settle
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         Ok(())
     } else {
         Err(format!("Transaction failed: {:?}", response.status).into())
@@ -168,24 +170,24 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     let client = JsonRpcClient::connect(&sandbox.rpc_addr);
     let owner_secret_key: SecretKey = ft_owner.private_key.parse()?;
 
+    // Get initial nonce once
+    let access_key_request = methods::query::RpcQueryRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+        request: near_primitives::views::QueryRequest::ViewAccessKey {
+            account_id: ft_owner.account_id.clone(),
+            public_key: owner_secret_key.public_key(),
+        },
+    };
+    let access_key_response = client.call(access_key_request).await?;
+    let mut current_nonce = match access_key_response.kind {
+        QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
+        _ => return Err("Unexpected response type".into()),
+    };
+
     for _i in 1..3 {
         // Generate a new random keypair
         let new_secret_key = SecretKey::from_random(near_crypto::KeyType::ED25519);
         let new_public_key = new_secret_key.public_key();
-
-        // Get current nonce
-        let access_key_request = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::Finality(Finality::Final),
-            request: near_primitives::views::QueryRequest::ViewAccessKey {
-                account_id: ft_owner.account_id.clone(),
-                public_key: owner_secret_key.public_key(),
-            },
-        };
-        let access_key_response = client.call(access_key_request).await?;
-        let nonce = match access_key_response.kind {
-            QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
-            _ => return Err("Unexpected response type".into()),
-        };
 
         // Get block hash
         let block_request = methods::block::RpcBlockRequest {
@@ -206,7 +208,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         let transaction = Transaction::V0(TransactionV0 {
             signer_id: ft_owner.account_id.clone(),
             public_key: owner_secret_key.public_key(),
-            nonce,
+            nonce: current_nonce,
             receiver_id: ft_owner.account_id.clone(),
             block_hash,
             actions: vec![add_key_action],
@@ -222,6 +224,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 
         if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
             secret_keys.push(new_secret_key.to_string());
+            current_nonce += 1; // Increment nonce for next transaction
         } else {
             return Err(format!("Add key transaction failed: {:?}", response.status).into());
         }
