@@ -19,6 +19,7 @@ use near_primitives::types::{BlockReference, Finality};
 use near_primitives::views::TxExecutionStatus;
 use near_sandbox::{GenesisAccount, Sandbox, SandboxConfig};
 use serde_json::json;
+use std::error::Error;
 use std::time::{Duration, Instant};
 
 const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
@@ -385,8 +386,11 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                         }
                     }
                     Err(e) => {
-                        if worker_id == 0 && worker_success == 0 {
-                            eprintln!("❌ Worker {} request error: {}", worker_id, e);
+                        if worker_id == 0 && worker_success < 5 {
+                            eprintln!("❌ Worker {} request error: {:?}", worker_id, e);
+                            if let Some(source) = e.source() {
+                                eprintln!("   Caused by: {:?}", source);
+                            }
                         }
                     }
                 }
