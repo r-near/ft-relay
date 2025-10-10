@@ -184,10 +184,13 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         _ => return Err("Unexpected response type".into()),
     };
 
-    for _i in 1..3 {
+    for i in 1..3 {
+        println!("Adding access key {} of 2...", i);
+        
         // Generate a new random keypair
         let new_secret_key = SecretKey::from_random(near_crypto::KeyType::ED25519);
         let new_public_key = new_secret_key.public_key();
+        println!("  Generated key: {}", new_public_key);
 
         // Get block hash
         let block_request = methods::block::RpcBlockRequest {
@@ -223,14 +226,42 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         let response = client.call(broadcast_request).await?;
 
         if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
+            println!("  ✅ Key added successfully");
             secret_keys.push(new_secret_key.to_string());
             current_nonce += 1; // Increment nonce for next transaction
+            
+            // Wait for state to propagate - sandbox needs time
+            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
         } else {
             return Err(format!("Add key transaction failed: {:?}", response.status).into());
         }
     }
 
-    println!("✅ {} access keys configured", secret_keys.len());
+    // Verify all keys are actually on-chain before proceeding
+    println!("\nVerifying all {} access keys are on-chain...", secret_keys.len());
+    for (idx, key_str) in secret_keys.iter().enumerate() {
+        let verify_key: SecretKey = key_str.parse()?;
+        let verify_request = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: ft_owner.account_id.clone(),
+                public_key: verify_key.public_key(),
+            },
+        };
+        
+        match client.call(verify_request).await {
+            Ok(resp) => {
+                if let QueryResponseKind::AccessKey(_) = resp.kind {
+                    println!("  ✅ Key {}: {} verified", idx + 1, verify_key.public_key());
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to verify key {}: {:?}", verify_key.public_key(), e).into());
+            }
+        }
+    }
+    
+    println!("✅ All {} access keys configured and verified", secret_keys.len());
 
     // Start relay server with optimized config for high throughput
     let redis = test_redis_settings();
