@@ -35,16 +35,25 @@ pub fn build_router(
 }
 
 async fn create_transfer(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<TransferRequest>,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    _body: Json<TransferRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
     let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-    if count < 10 || count % 1000 == 0 {
-        info!("HTTP request #{} received", count);
-    }
+    info!("[REQUEST_TRACE] HTTP request #{} - ENTRY", count);
+    
+    // Early return to test if we can even reach here
+    Ok((
+        StatusCode::OK,
+        Json(json!({"test": "response", "request_num": count})),
+    ))
+    
+    /* Commented out for testing
+    let _state = _state;
+    let _headers = _headers;
+    let Json(_body) = _body;
     
     let idempotency_key = headers
         .get("X-Idempotency-Key")
@@ -200,6 +209,7 @@ async fn create_transfer(
         StatusCode::CREATED,
         Json(serde_json::to_value(response).unwrap()),
     ))
+    */
 }
 
 async fn get_transfer_status(
