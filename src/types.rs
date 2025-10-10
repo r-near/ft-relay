@@ -123,7 +123,7 @@ impl AccessKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrationMessage {
-    pub transfer_id: String,
+    pub account: String,  // Account to register (not transfer_id!)
     pub retry_count: u32,
 }
 

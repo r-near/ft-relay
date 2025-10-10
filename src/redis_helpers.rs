@@ -188,6 +188,69 @@ where
     Ok(added == 1)
 }
 
+/// Atomically add transfer to waiting list for account registration.
+/// Returns true if this is the FIRST transfer for this account (should queue registration).
+/// Uses Lua script to ensure atomicity - no race conditions!
+pub async fn add_transfer_waiting_for_registration<C>(
+    conn: &mut C,
+    account: &str,
+    transfer_id: &str,
+) -> Result<bool>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let script = redis::Script::new(
+        r#"
+        local account = ARGV[1]
+        local transfer_id = ARGV[2]
+        
+        -- Add to waiting list
+        redis.call('LPUSH', 'waiting_transfers:' .. account, transfer_id)
+        
+        -- Try to add to pending set (returns 1 if first, 0 if already exists)
+        local is_first = redis.call('SADD', 'pending_registration_accounts', account)
+        
+        return is_first
+        "#,
+    );
+
+    let is_first: i32 = script.arg(account).arg(transfer_id).invoke_async(conn).await?;
+    Ok(is_first == 1)
+}
+
+/// Atomically complete account registration: mark as registered, get waiting transfers, cleanup.
+/// Returns list of transfer IDs that were waiting for this account.
+/// Uses Lua script to ensure atomicity - zero race window!
+pub async fn complete_account_registration<C>(
+    conn: &mut C,
+    account: &str,
+) -> Result<Vec<String>>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let script = redis::Script::new(
+        r#"
+        local account = ARGV[1]
+        
+        -- Mark as registered
+        redis.call('SADD', 'registered_accounts', account)
+        redis.call('SREM', 'pending_registration_accounts', account)
+        
+        -- Get all waiting transfers
+        local waiting = redis.call('LRANGE', 'waiting_transfers:' .. account, 0, -1)
+        
+        -- Delete the waiting list
+        redis.call('DEL', 'waiting_transfers:' .. account)
+        
+        -- Return all waiting transfer IDs
+        return waiting
+        "#,
+    );
+
+    let waiting_transfers: Vec<String> = script.arg(account).invoke_async(conn).await?;
+    Ok(waiting_transfers)
+}
+
 pub async fn acquire_lock<C>(
     conn: &mut C,
     lock_key: &str,
@@ -216,27 +279,8 @@ where
     Ok(())
 }
 
-pub async fn enqueue_registration<C>(
-    conn: &mut C,
-    env: &str,
-    transfer_id: &str,
-    retry_count: u32,
-) -> Result<()>
-where
-    C: ConnectionLike + AsyncCommands + Send + Sync,
-{
-    let stream_key = format!("ftrelay:{}:reg", env);
-    let msg = RegistrationMessage {
-        transfer_id: transfer_id.to_string(),
-        retry_count,
-    };
-    let serialized = serde_json::to_string(&msg)?;
-    
-    conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())])
-        .await?;
-    
-    Ok(())
-}
+// Note: enqueue_registration removed - registration jobs now handled directly in HTTP handler
+// with Lua script for atomic deduplication
 
 pub async fn enqueue_transfer<C>(
     conn: &mut C,

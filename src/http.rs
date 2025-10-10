@@ -10,7 +10,8 @@ use serde_json::json;
 
 use crate::redis_helpers as rh;
 use crate::types::{
-    AccountId, ErrorResponse, Event, Status, TransferRequest, TransferResponse, TransferState,
+    AccountId, ErrorResponse, Event, RegistrationMessage, Status, TransferRequest,
+    TransferResponse, TransferState,
 };
 
 #[derive(Clone)]
@@ -150,11 +151,32 @@ async fn create_transfer(
             })?;
         Status::Registered
     } else {
-        // Not registered - check if already pending (atomic check-and-add)
-        let is_first_request = rh::mark_account_pending_registration(&mut conn, &body.receiver_id)
-            .await
-            .map_err(|e| {
-                warn!("Failed to mark pending: {:?}", e);
+        // Not registered - atomically add transfer to waiting list and check if first
+        // Lua script ensures no race conditions!
+        let is_first_request = rh::add_transfer_waiting_for_registration(
+            &mut conn,
+            &body.receiver_id,
+            &transfer_id,
+        )
+        .await
+        .map_err(|e| {
+            warn!("Failed to add to waiting list: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+        })?;
+
+        if is_first_request {
+            // First transfer for this account - enqueue ACCOUNT registration job
+            let registration_msg = RegistrationMessage {
+                account: body.receiver_id.clone(),
+                retry_count: 0,
+            };
+            let serialized = serde_json::to_string(&registration_msg).map_err(|e| {
+                warn!("Failed to serialize registration message: {:?}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -163,9 +185,9 @@ async fn create_transfer(
                 )
             })?;
 
-        if is_first_request {
-            // First request for this account - queue for registration
-            rh::enqueue_registration(&mut conn, &state.env, &transfer_id, 0)
+            let stream_key = format!("ftrelay:{}:reg", state.env);
+            let _: String = conn
+                .xadd(&stream_key, "*", &[("data", serialized)])
                 .await
                 .map_err(|e| {
                     warn!("Failed to enqueue registration: {:?}", e);
@@ -176,6 +198,7 @@ async fn create_transfer(
                         }),
                     )
                 })?;
+
             rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
                 .await
                 .map_err(|e| {
@@ -188,8 +211,8 @@ async fn create_transfer(
                     )
                 })?;
         } else {
-            // Already pending - another request queued it, just log
-            rh::log_event(&mut conn, &transfer_id, Event::new("PENDING_REGISTRATION"))
+            // Already pending - transfer added to waiting list, will be processed when registration completes
+            rh::log_event(&mut conn, &transfer_id, Event::new("WAITING_REGISTRATION"))
                 .await
                 .map_err(|e| {
                     warn!("Failed to log event: {:?}", e);

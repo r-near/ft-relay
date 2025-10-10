@@ -1,6 +1,7 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -74,29 +75,24 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
             Ok(()) => {}
             Err(e) => {
                 warn!("Batch processing error: {:?}", e);
-                // Re-enqueue with retry
+                // Re-enqueue account registration jobs with retry
                 for (stream_id, msg) in &batch {
                     let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
                     let retry_count = msg.retry_count + 1;
                     if retry_count < MAX_RETRIES {
-                        let _ = rh::enqueue_registration(
-                            &mut conn,
-                            &ctx.runtime.env,
-                            &msg.transfer_id,
+                        // Re-queue the account registration job
+                        let registration_msg = RegistrationMessage {
+                            account: msg.account.clone(),
                             retry_count,
-                        )
-                        .await;
+                        };
+                        let serialized = serde_json::to_string(&registration_msg).unwrap();
+                        let _: Result<String, _> = conn
+                            .xadd::<_, _, _, _, String>(&stream_key, "*", &[("data", serialized.as_str())])
+                            .await;
                     } else {
-                        let _ = rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed).await;
-                        let _ = rh::log_event(
-                            &mut conn,
-                            &msg.transfer_id,
-                            Event::new("FAILED").with_reason(format!(
-                                "Registration failed after {} retries",
-                                retry_count
-                            )),
-                        )
-                        .await;
+                        warn!("Account {} registration failed after {} retries", msg.account, retry_count);
+                        // Note: Waiting transfers will remain in waiting list
+                        // They can be manually recovered or will timeout
                     }
                 }
             }
@@ -104,7 +100,8 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
     }
 }
 
-/// Process a batch of registration requests with deduplication
+/// Process a batch of account registration jobs - SIMPLE VERSION
+/// Queue is naturally deduped by Lua script, so just register all and forward!
 async fn process_registration_batch(
     ctx: &RegistrationWorkerContext,
     batch: &[(String, RegistrationMessage)],
@@ -113,91 +110,19 @@ async fn process_registration_batch(
 ) -> Result<()> {
     let mut conn = ctx.runtime.redis_conn.clone();
 
-    // Group transfers by account (deduplication within batch)
-    let mut account_to_transfers: HashMap<AccountId, Vec<(String, RegistrationMessage)>> = HashMap::new();
-    
+    // Extract unique accounts from batch (only for deduping retries)
+    let mut account_to_jobs: HashMap<AccountId, Vec<String>> = HashMap::new();
     for (stream_id, msg) in batch {
-        let transfer = match rh::get_transfer_state(&mut conn, &msg.transfer_id).await? {
-            Some(t) => t,
-            None => {
-                warn!("Transfer {} not found", msg.transfer_id);
-                rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await?;
-                continue;
-            }
-        };
-
-        account_to_transfers
-            .entry(transfer.receiver_id.clone())
+        account_to_jobs
+            .entry(msg.account.clone())
             .or_insert_with(Vec::new)
-            .push((stream_id.clone(), msg.clone()));
+            .push(stream_id.clone());
     }
 
-    if account_to_transfers.is_empty() {
-        return Ok(());
-    }
+    let accounts: Vec<AccountId> = account_to_jobs.keys().cloned().collect();
+    info!("Registering {} account(s) in batch", accounts.len());
 
-    // Separate already-registered (fast path) from needs-registration
-    let mut fast_path_accounts = Vec::new();
-    let mut needs_registration = Vec::new();
-
-    for (account, transfers) in &account_to_transfers {
-        if rh::is_account_registered(&mut conn, account).await? {
-            debug!("Account {} already registered (fast path)", account);
-            fast_path_accounts.push((account.clone(), transfers.clone()));
-        } else {
-            needs_registration.push((account.clone(), transfers.clone()));
-        }
-    }
-
-    // Process fast path (already registered) - just enqueue for transfer
-    for (_account, transfers) in fast_path_accounts {
-        for (stream_id, msg) in transfers {
-            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
-            rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
-            rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
-        }
-    }
-
-    if needs_registration.is_empty() {
-        return Ok(());
-    }
-
-    // Batch register all unique accounts that need registration
-    // Final check: re-verify accounts aren't registered (race condition protection)
-    let mut final_needs_registration = Vec::new();
-    let mut newly_registered = Vec::new();
-    
-    for (account, transfers) in needs_registration {
-        if rh::is_account_registered(&mut conn, &account).await? {
-            // Registered by another worker while we were processing
-            debug!("Account {} registered by another worker during batch prep", account);
-            newly_registered.push((account, transfers));
-        } else {
-            final_needs_registration.push((account, transfers));
-        }
-    }
-    
-    // Process accounts that got registered by other workers
-    for (_account, transfers) in newly_registered {
-        for (stream_id, msg) in transfers {
-            rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
-            rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
-            rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
-        }
-    }
-    
-    if final_needs_registration.is_empty() {
-        return Ok(());
-    }
-    
-    let unique_accounts: Vec<AccountId> = final_needs_registration.iter().map(|(acc, _)| acc.clone()).collect();
-    
-    info!("Registering {} unique account(s) in batch", unique_accounts.len());
-
+    // Register all accounts in one batch transaction (idempotent - blockchain handles "already exists")
     let leased_key = ctx.runtime.access_key_pool.lease().await?;
     let nonce = ctx
         .runtime
@@ -212,7 +137,7 @@ async fn process_registration_batch(
         .register_accounts_batch(
             &ctx.runtime.relay_account,
             &ctx.runtime.token,
-            unique_accounts.clone(),
+            accounts.clone(),
             &leased_key.secret_key,
             nonce,
         )
@@ -220,67 +145,63 @@ async fn process_registration_batch(
 
     drop(leased_key);
 
+    // Check if registration succeeded (or was already registered)
     match result {
         Ok((tx_hash, outcome)) => {
-            let tx_hash_str = tx_hash.to_string();
-            
-            // Check if transaction succeeded (already Final)
             let is_success = matches!(
                 outcome.status,
                 near_primitives::views::FinalExecutionStatus::SuccessValue(_)
             );
 
             if !is_success {
-                warn!("Registration batch tx {} has uncertain status - will retry", tx_hash_str);
-                return Err(anyhow::anyhow!("Registration uncertain"));
+                warn!("Registration batch tx {} failed - will retry", tx_hash);
+                return Err(anyhow::anyhow!("Registration failed"));
             }
 
-            info!("Registered {} accounts with tx {}", unique_accounts.len(), tx_hash_str);
-
-            // Mark all accounts as registered and process their transfers
-            for (account, transfers) in final_needs_registration {
-                rh::mark_account_registered(&mut conn, &account).await?;
-
-                for (stream_id, msg) in transfers {
-                    rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-                    rh::log_event(
-                        &mut conn,
-                        &msg.transfer_id,
-                        Event::new("REGISTERED").with_tx_hash(tx_hash_str.clone()),
-                    )
-                    .await?;
-                    rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-                    rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
-                    rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
-                }
-            }
-
-            Ok(())
+            info!("Registered {} accounts with tx {}", accounts.len(), tx_hash);
         }
         Err(e) => {
             let err_str = format!("{:?}", e);
-
-            // If accounts are already registered on-chain, treat as success
-            if err_str.contains("already") || err_str.contains("exist") {
-                info!("Batch registration: accounts already registered (on-chain)");
-
-                for (account, transfers) in final_needs_registration {
-                    rh::mark_account_registered(&mut conn, &account).await?;
-
-                    for (stream_id, msg) in transfers {
-                        rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-                        rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
-                        rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
-                        rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
-                        rh::ack_message(&mut conn, stream_key, consumer_group, &stream_id).await?;
-                    }
-                }
-
-                Ok(())
-            } else {
-                warn!("Failed to register batch: {:?}", e);
-                Err(e)
+            // "Already exists" errors are fine - account was registered by another worker
+            if !err_str.contains("already") && !err_str.contains("exist") {
+                return Err(anyhow::anyhow!("Failed to register accounts: {:?}", e));
             }
+            debug!("Some accounts already registered (idempotent)");
         }
     }
+
+    // Atomically complete registration for all accounts (Lua script - no races!)
+    for (account, job_ids) in account_to_jobs {
+        // Lua script atomically: marks registered + gets waiting transfers + cleans up
+        let waiting_transfers = rh::complete_account_registration(&mut conn, &account).await?;
+        
+        if !waiting_transfers.is_empty() {
+            debug!("Account {} has {} waiting transfers", account, waiting_transfers.len());
+        }
+        
+        // Forward all waiting transfers to transfer stream
+        for transfer_id in waiting_transfers {
+            forward_transfer_to_ready_stream(ctx, &mut conn, &transfer_id).await?;
+        }
+
+        // Ack all registration jobs for this account
+        for job_id in job_ids {
+            rh::ack_message(&mut conn, stream_key, consumer_group, &job_id).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper: Forward a transfer to the ready-for-transfer stream
+async fn forward_transfer_to_ready_stream(
+    ctx: &RegistrationWorkerContext,
+    conn: &mut redis::aio::ConnectionManager,
+    transfer_id: &str,
+) -> Result<()> {
+    rh::update_transfer_status(conn, transfer_id, Status::Registered).await?;
+    rh::log_event(conn, transfer_id, Event::new("REGISTERED")).await?;
+    rh::enqueue_transfer(conn, &ctx.runtime.env, transfer_id, 0).await?;
+    rh::log_event(conn, transfer_id, Event::new("QUEUED_TRANSFER")).await?;
+    Ok(())
 }
