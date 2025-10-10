@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use log::{info, warn};
+use log::warn;
 use redis::AsyncCommands;
 use serde_json::json;
 

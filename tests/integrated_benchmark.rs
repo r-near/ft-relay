@@ -501,7 +501,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 
         let stream_info: redis::Value = redis::cmd("XINFO")
             .arg("STREAM")
-            .arg("ftrelay:ready")
+            .arg("ftrelay:sandbox:verify")
             .query_async(&mut redis_conn)
             .await?;
 
@@ -540,7 +540,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     // Get stream info to see total entries added
     let stream_info: redis::Value = redis::cmd("XINFO")
         .arg("STREAM")
-        .arg("ftrelay:ready")
+        .arg("ftrelay:sandbox:verify")
         .query_async(&mut redis_conn)
         .await?;
 
@@ -559,7 +559,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     }
 
     let pending_count: u64 = redis::cmd("XLEN")
-        .arg("ftrelay:ready")
+        .arg("ftrelay:sandbox:verify")
         .query_async(&mut redis_conn)
         .await?;
 
@@ -801,8 +801,9 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 fn test_redis_settings() -> RedisSettings {
     RedisSettings::new(
         "redis://127.0.0.1:6379",
-        "ftrelay:ready",
-        "ftrelay:ready_workers",
+        "ftrelay:sandbox:reg",
+        "ftrelay:sandbox:xfer",
+        "ftrelay:sandbox:verify",
         "ftrelay:registrations",
         "ftrelay:registration_workers",
     )

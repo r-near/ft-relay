@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use redis::aio::ConnectionManager;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,7 +127,7 @@ async fn process_registration(
     let account = &transfer.receiver_id;
 
     if rh::is_account_registered(&mut conn, account).await? {
-        info!("Account {} already registered (fast path)", account);
+        debug!("Account {} already registered (fast path)", account);
         rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
         rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
         rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;

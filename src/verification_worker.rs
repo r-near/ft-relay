@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use near_primitives::hash::CryptoHash;
 use redis::aio::ConnectionManager;
 use std::str::FromStr;
@@ -142,7 +142,7 @@ async fn verify_transaction(
     // If cached as completed/failed, the first worker already updated ALL transfers
     // So we can just ACK and skip (no need to update again)
     if let Some(cached_status) = rh::get_tx_status(&mut conn, &msg.tx_hash).await? {
-        info!(
+        debug!(
             "Tx {} status already cached: {} (transfer {} already updated by first worker)",
             msg.tx_hash, cached_status, msg.transfer_id
         );
