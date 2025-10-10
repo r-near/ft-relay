@@ -313,15 +313,16 @@ where
 
 /// Pop a batch of messages from a Redis stream using XREADGROUP with linger-based batching
 ///
-/// This helper function implements efficient batch accumulation:
-/// 1. First XREADGROUP with BLOCK=1ms (quick check for available messages)
-/// 2. If batch is not full, sleep for linger_ms to allow more messages to arrive
-/// 3. Second XREADGROUP to pick up any additional messages
-/// 4. Return the combined batch
+/// This function actively accumulates messages up to max_count over a linger_ms period:
+/// 1. Keep reading from stream with short BLOCK timeouts (10ms)
+/// 2. Accumulate messages until either:
+///    - Batch is full (max_count reached)
+///    - OR linger_ms total time has elapsed
+/// 3. Return whatever we accumulated
 ///
-/// The linger_ms parameter controls how long to wait for additional messages
-/// when the initial batch is not full, allowing workers to accumulate larger
-/// batches for better throughput.
+/// The linger_ms parameter controls the maximum time to wait for batch accumulation.
+/// With multiple workers competing, this approach ensures we actually accumulate messages
+/// instead of sleeping while other workers grab them.
 pub async fn pop_batch<C, T>(
     conn: &mut C,
     stream_key: &str,
@@ -334,49 +335,48 @@ where
     C: ConnectionLike + AsyncCommands + Send + Sync,
     T: DeserializeOwned,
 {
-    // First attempt: quick check with minimal blocking
-    let mut batch = read_stream_batch(
-        conn,
-        stream_key,
-        consumer_group,
-        consumer_name,
-        max_count,
-        1,
-    )
-    .await?;
+    let start = std::time::Instant::now();
+    let mut batch: Vec<(String, T)> = Vec::new();
 
-    // If we got some messages but batch isn't full, linger to accumulate more
-    if !batch.is_empty() && batch.len() < max_count {
-        tokio::time::sleep(tokio::time::Duration::from_millis(linger_ms)).await;
-
-        // Second attempt: pick up any messages that arrived during linger
+    // Keep accumulating until batch is full or linger time expires
+    while batch.len() < max_count && start.elapsed().as_millis() < linger_ms as u128 {
         let remaining = max_count - batch.len();
+        let time_left = linger_ms.saturating_sub(start.elapsed().as_millis() as u64);
+        
+        // Use short block timeout (10ms) to keep checking for new messages
+        let block_ms = time_left.min(10);
+        
         let mut additional = read_stream_batch(
             conn,
             stream_key,
             consumer_group,
             consumer_name,
             remaining,
-            1,
+            block_ms,
         )
         .await?;
-        batch.append(&mut additional);
-    } else if batch.is_empty() {
-        // If no messages at all, block longer to avoid busy-waiting
-        batch = read_stream_batch(
-            conn,
-            stream_key,
-            consumer_group,
-            consumer_name,
-            max_count,
-            linger_ms,
-        )
-        .await?;
-
-        // If still empty after blocking, return error to restart worker loop
-        if batch.is_empty() {
-            return Err(anyhow::anyhow!("No messages available after blocking"));
+        
+        if additional.is_empty() {
+            // No more messages available right now
+            if batch.is_empty() {
+                // If we have nothing at all, wait a bit longer
+                if time_left > 10 {
+                    continue;
+                } else {
+                    // Waited full linger time, nothing available
+                    return Err(anyhow::anyhow!("No messages available after linger"));
+                }
+            } else {
+                // We have some messages, that's good enough
+                break;
+            }
         }
+        
+        batch.append(&mut additional);
+    }
+
+    if batch.is_empty() {
+        return Err(anyhow::anyhow!("No messages available"));
     }
 
     Ok(batch)
