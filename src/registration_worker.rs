@@ -218,11 +218,12 @@ async fn process_registration(
 
     match result {
         Ok(tx_hash) => {
-            info!("Registered {} with tx {}", account, tx_hash);
+            let tx_hash_str = tx_hash.to_string();
+            info!("Registered {} with tx {}", account, tx_hash_str);
             rh::mark_account_registered(&mut conn, account).await?;
             rh::release_lock(&mut conn, &lock_key).await?;
             rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Registered).await?;
-            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED")).await?;
+            rh::log_event(&mut conn, &msg.transfer_id, Event::new("REGISTERED").with_tx_hash(tx_hash_str)).await?;
             rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &msg.transfer_id, 0).await?;
             rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_TRANSFER")).await?;
             Ok(())

@@ -15,18 +15,16 @@ use crate::types::{AccountId, ErrorResponse, Event, Status, TransferRequest, Tra
 struct AppState {
     redis_conn: redis::aio::ConnectionManager,
     env: String,
-    token: AccountId,
 }
 
 pub fn build_router(
     redis_conn: redis::aio::ConnectionManager,
     env: String,
-    token: AccountId,
+    _token: AccountId,
 ) -> Router {
     let state = AppState {
         redis_conn,
         env,
-        token,
     };
 
     Router::new()
@@ -240,8 +238,13 @@ async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> 
         Err(_) => "disconnected",
     };
 
+    let rpc_calls = crate::types::RPC_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
     Json(json!({
         "status": "healthy",
         "redis": redis_status,
+        "metrics": {
+            "rpc_calls_total": rpc_calls
+        }
     }))
 }

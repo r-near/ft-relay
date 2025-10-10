@@ -1,8 +1,12 @@
 use chrono::{DateTime, Utc};
 use near_crypto::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU64;
 
 pub type AccountId = String;
+
+// Global RPC call counter for metrics
+pub static RPC_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

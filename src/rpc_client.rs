@@ -7,17 +7,18 @@ use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::{Action, FunctionCallAction, SignedTransaction, Transaction};
 use near_primitives::types::{BlockReference, Finality};
 use near_primitives::views::{AccessKeyView, FinalExecutionOutcomeView, FinalExecutionStatus};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::config::*;
-use crate::types::AccountId;
+use crate::types::{AccountId, RPC_CALLS};
 
 #[derive(Debug, Clone)]
 pub enum TxStatus {
     Pending,
-    Success(FinalExecutionOutcomeView),
+    Success(Box<FinalExecutionOutcomeView>),
     Failed(String),
 }
 
@@ -47,6 +48,7 @@ impl NearRpcClient {
         }
 
         debug!("Fetching fresh block hash from RPC");
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::block::RpcBlockRequest {
             block_reference: BlockReference::Finality(Finality::Final),
         };
@@ -71,6 +73,7 @@ impl NearRpcClient {
         let tx_hash = signed_tx.get_hash();
         info!("Broadcasting transaction: {}", tx_hash);
 
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
             signed_transaction: signed_tx,
         };
@@ -88,6 +91,7 @@ impl NearRpcClient {
         tx_hash: &CryptoHash,
         sender: &AccountId,
     ) -> Result<TxStatus> {
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::tx::RpcTransactionStatusRequest {
             transaction_info: methods::tx::TransactionInfo::TransactionId {
                 tx_hash: *tx_hash,
@@ -103,7 +107,7 @@ impl NearRpcClient {
                 let outcome_view = outcome.into_outcome();
                 match outcome_view.status {
                     FinalExecutionStatus::SuccessValue(_) => {
-                        Ok(TxStatus::Success(outcome_view))
+                        Ok(TxStatus::Success(Box::new(outcome_view)))
                     }
                     FinalExecutionStatus::Failure(err) => Ok(TxStatus::Failed(format!("{:?}", err))),
                     FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => Ok(TxStatus::Pending),
@@ -125,6 +129,7 @@ impl NearRpcClient {
         account: &AccountId,
         public_key: &PublicKey,
     ) -> Result<AccessKeyView> {
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::query::RpcQueryRequest {
             block_reference: BlockReference::Finality(Finality::Final),
             request: near_primitives::views::QueryRequest::ViewAccessKey {
