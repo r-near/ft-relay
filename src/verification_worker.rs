@@ -45,133 +45,84 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
     loop {
         let mut conn = ctx.runtime.redis_conn.clone();
 
-        let result: Result<redis::streams::StreamReadReply, _> = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(&consumer_group)
-            .arg(&consumer_name)
-            .arg("COUNT")
-            .arg(50)
-            .arg("BLOCK")
-            .arg(ctx.linger_ms as usize)
-            .arg("STREAMS")
-            .arg(&stream_key)
-            .arg(">")
-            .query_async(&mut conn)
-            .await;
-
-        let reply = match result {
-            Ok(r) => r,
-            Err(_) => continue,
+        let batch: Vec<(String, VerificationMessage)> = match rh::pop_batch(
+            &mut conn,
+            &stream_key,
+            &consumer_group,
+            &consumer_name,
+            50,
+            ctx.linger_ms,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Error popping batch: {:?}", e);
+                continue;
+            }
         };
 
-        for stream in reply.keys {
-            for id_data in stream.ids {
-                let stream_id = id_data.id.clone();
+        for (stream_id, msg) in batch {
+            match verify_transaction(&ctx, &msg).await {
+                Ok(VerificationResult::Completed) => {
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                }
+                Ok(VerificationResult::Failed(reason)) => {
+                    warn!("Transfer {} failed: {}", msg.transfer_id, reason);
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                }
+                Ok(VerificationResult::Pending) => {
+                    let retry_count = msg.retry_count + 1;
+                    
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
-                let data = match id_data.map.get("data") {
-                    Some(redis::Value::BulkString(bytes)) => {
-                        match std::str::from_utf8(bytes) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        }
+                    if retry_count < MAX_VERIFICATION_RETRIES {
+                        let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
+                        let _ = rh::enqueue_verification(
+                            &mut conn,
+                            &ctx.runtime.env,
+                            &msg.transfer_id,
+                            &msg.tx_hash,
+                            retry_count,
+                        )
+                        .await;
+                    } else {
+                        let _ = rh::update_transfer_status(
+                            &mut conn,
+                            &msg.transfer_id,
+                            Status::Failed,
+                        )
+                        .await;
+                        let _ = rh::log_event(
+                            &mut conn,
+                            &msg.transfer_id,
+                            Event::new("FAILED")
+                                .with_reason(format!(
+                                    "Verification timeout after {} checks",
+                                    retry_count
+                                )),
+                        )
+                        .await;
                     }
-                    _ => continue,
-                };
+                }
+                Err(e) => {
+                    warn!(
+                        "Error checking tx status for {}: {:?}",
+                        msg.transfer_id, e
+                    );
+                    
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
-                let msg: VerificationMessage = match serde_json::from_str(data) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-                        continue;
-                    }
-                };
-
-                match verify_transaction(&ctx, &msg).await {
-                    Ok(VerificationResult::Completed) => {
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-                    }
-                    Ok(VerificationResult::Failed(reason)) => {
-                        warn!("Transfer {} failed: {}", msg.transfer_id, reason);
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-                    }
-                    Ok(VerificationResult::Pending) => {
-                        let retry_count = msg.retry_count + 1;
-                        
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-
-                        if retry_count < MAX_VERIFICATION_RETRIES {
-                            let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
-                            let _ = rh::enqueue_verification(
-                                &mut conn,
-                                &ctx.runtime.env,
-                                &msg.transfer_id,
-                                &msg.tx_hash,
-                                retry_count,
-                            )
-                            .await;
-                        } else {
-                            let _ = rh::update_transfer_status(
-                                &mut conn,
-                                &msg.transfer_id,
-                                Status::Failed,
-                            )
-                            .await;
-                            let _ = rh::log_event(
-                                &mut conn,
-                                &msg.transfer_id,
-                                Event::new("FAILED")
-                                    .with_reason(format!(
-                                        "Verification timeout after {} checks",
-                                        retry_count
-                                    )),
-                            )
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Error checking tx status for {}: {:?}",
-                            msg.transfer_id, e
-                        );
-                        
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-
-                        let retry_count = msg.retry_count + 1;
-                        if retry_count < MAX_VERIFICATION_RETRIES {
-                            let _ = rh::enqueue_verification(
-                                &mut conn,
-                                &ctx.runtime.env,
-                                &msg.transfer_id,
-                                &msg.tx_hash,
-                                retry_count,
-                            )
-                            .await;
-                        }
+                    let retry_count = msg.retry_count + 1;
+                    if retry_count < MAX_VERIFICATION_RETRIES {
+                        let _ = rh::enqueue_verification(
+                            &mut conn,
+                            &ctx.runtime.env,
+                            &msg.transfer_id,
+                            &msg.tx_hash,
+                            retry_count,
+                        )
+                        .await;
                     }
                 }
             }

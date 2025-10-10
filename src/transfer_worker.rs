@@ -48,71 +48,38 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
     loop {
         let mut conn = ctx.runtime.redis_conn.clone();
 
-        let result: Result<redis::streams::StreamReadReply, _> = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(&consumer_group)
-            .arg(&consumer_name)
-            .arg("COUNT")
-            .arg(MAX_BATCH_SIZE)
-            .arg("BLOCK")
-            .arg(ctx.linger_ms as usize)
-            .arg("STREAMS")
-            .arg(&stream_key)
-            .arg(">")
-            .query_async(&mut conn)
-            .await;
-
-        let reply = match result {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let mut batch = Vec::new();
-
-        for stream in reply.keys {
-            for id_data in stream.ids {
-                let stream_id = id_data.id.clone();
-
-                let data = match id_data.map.get("data") {
-                    Some(redis::Value::BulkString(bytes)) => match std::str::from_utf8(bytes) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    _ => continue,
-                };
-
-                let msg: TransferMessage = match serde_json::from_str(data) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-                        continue;
-                    }
-                };
-
-                batch.push((stream_id, msg));
+        let batch: Vec<(String, TransferMessage)> = match rh::pop_batch(
+            &mut conn,
+            &stream_key,
+            &consumer_group,
+            &consumer_name,
+            MAX_BATCH_SIZE,
+            ctx.linger_ms,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Error popping batch: {:?}", e);
+                continue;
             }
-        }
+        };
 
         if batch.is_empty() {
             continue;
         }
 
-        process_batch(&ctx, batch).await?;
+        process_batch(&ctx, &stream_key, &consumer_group, batch).await?;
     }
 }
 
 async fn process_batch(
     ctx: &TransferWorkerContext,
+    stream_key: &str,
+    consumer_group: &str,
     batch: Vec<(String, TransferMessage)>,
 ) -> Result<()> {
     let mut conn = ctx.runtime.redis_conn.clone();
-    let stream_key = format!("ftrelay:{}:xfer", ctx.runtime.env);
-    let consumer_group = format!("ftrelay:{}:xfer_workers", ctx.runtime.env);
 
     let mut transfers = Vec::new();
     for (stream_id, msg) in &batch {
@@ -120,12 +87,7 @@ async fn process_batch(
             Some(transfer) => transfers.push((stream_id.clone(), msg.clone(), transfer)),
             None => {
                 warn!("Transfer {} not found", msg.transfer_id);
-                let _: Result<(), _> = redis::cmd("XACK")
-                    .arg(&stream_key)
-                    .arg(&consumer_group)
-                    .arg(stream_id)
-                    .query_async(&mut conn)
-                    .await;
+                let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
             }
         }
     }
@@ -141,12 +103,7 @@ async fn process_batch(
         Err(e) => {
             warn!("Failed to lease access key: {:?}, will retry", e);
             for (stream_id, msg, _) in &transfers {
-                let _: Result<(), _> = redis::cmd("XACK")
-                    .arg(&stream_key)
-                    .arg(&consumer_group)
-                    .arg(stream_id)
-                    .query_async(&mut conn)
-                    .await;
+                let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
 
                 let retry_count = msg.retry_count + 1;
                 if retry_count < MAX_RETRIES {
@@ -212,12 +169,7 @@ async fn process_batch(
                 rh::log_event(&mut conn, &msg.transfer_id, Event::new("QUEUED_VERIFICATION"))
                     .await?;
 
-                let _: Result<(), _> = redis::cmd("XACK")
-                    .arg(&stream_key)
-                    .arg(&consumer_group)
-                    .arg(stream_id)
-                    .query_async(&mut conn)
-                    .await;
+                let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
             }
 
             Ok(())
@@ -226,12 +178,7 @@ async fn process_batch(
             warn!("Failed to submit batch: {:?}", e);
 
             for (stream_id, msg, _) in &transfers {
-                let _: Result<(), _> = redis::cmd("XACK")
-                    .arg(&stream_key)
-                    .arg(&consumer_group)
-                    .arg(stream_id)
-                    .query_async(&mut conn)
-                    .await;
+                let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
 
                 let retry_count = msg.retry_count + 1;
                 if retry_count < MAX_RETRIES {

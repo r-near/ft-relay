@@ -12,6 +12,8 @@ pub const STORAGE_DEPOSIT_GAS_PER_ACTION: u64 = 5_000_000_000_000;
 pub const DEFAULT_BATCH_LINGER_MS: u64 = 20;
 pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 200;
 pub const DEFAULT_MAX_TRANSFER_WORKERS: usize = 1;
+pub const DEFAULT_MAX_REGISTRATION_WORKERS: usize = 1;
+pub const DEFAULT_MAX_VERIFICATION_WORKERS: usize = 1;
 
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 pub const DEFAULT_REDIS_STREAM_KEY: &str = "ftrelay:pending";
@@ -68,6 +70,8 @@ pub struct RelayConfig {
     pub batch_submit_delay_ms: u64,
     pub max_inflight_batches: usize,
     pub max_workers: usize,
+    pub max_registration_workers: usize,
+    pub max_verification_workers: usize,
     pub bind_addr: String,
     pub redis: RedisSettings,
 }
@@ -107,6 +111,10 @@ pub struct RelayConfigBuilder {
     max_inflight_batches: Option<usize>,
     #[serde(default)]
     max_workers: Option<usize>,
+    #[serde(default)]
+    max_registration_workers: Option<usize>,
+    #[serde(default)]
+    max_verification_workers: Option<usize>,
     #[serde(default)]
     bind_addr: Option<String>,
     #[serde(default)]
@@ -163,6 +171,8 @@ impl RelayConfigBuilder {
             batch_submit_delay_ms: self.batch_submit_delay_ms.unwrap_or(0),
             max_inflight_batches: self.max_inflight_batches.unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
             max_workers: self.max_workers.unwrap_or(DEFAULT_MAX_TRANSFER_WORKERS),
+            max_registration_workers: self.max_registration_workers.unwrap_or(DEFAULT_MAX_REGISTRATION_WORKERS),
+            max_verification_workers: self.max_verification_workers.unwrap_or(DEFAULT_MAX_VERIFICATION_WORKERS),
             bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
             redis,
         })

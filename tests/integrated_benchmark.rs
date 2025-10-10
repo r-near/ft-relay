@@ -7,8 +7,13 @@
 /// 4. Runs benchmark with actual FT transfers
 /// 5. Verifies balances changed correctly (registration happens automatically)
 use ft_relay::{RedisSettings, RelayConfig};
-use near_api::{NetworkConfig, RPCEndpoint, Signer};
-use near_primitives::action::{Action, DeployContractAction, FunctionCallAction};
+use near_crypto::SecretKey;
+use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_primitives::account::AccessKeyPermission;
+use near_primitives::action::{Action, AddKeyAction, DeployContractAction, FunctionCallAction};
+use near_primitives::transaction::{SignedTransaction, Transaction, TransactionV0};
+use near_primitives::types::{BlockReference, Finality};
 use near_sandbox::{GenesisAccount, Sandbox, SandboxConfig};
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -37,13 +42,29 @@ async fn setup_ft_contract(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wasm_bytes = std::fs::read(FT_WASM_PATH)?;
 
-    let network = NetworkConfig {
-        network_name: "sandbox".to_string(),
-        rpc_endpoints: vec![RPCEndpoint::new(sandbox.rpc_addr.parse()?)],
-        ..NetworkConfig::testnet()
-    };
+    let client = JsonRpcClient::connect(&sandbox.rpc_addr);
+    let secret_key: SecretKey = owner.private_key.parse()?;
 
-    let signer = Signer::new(Signer::from_secret_key(owner.private_key.parse()?))?;
+    // Get block hash
+    let block_request = methods::block::RpcBlockRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+    };
+    let block = client.call(block_request).await?;
+    let block_hash = block.header.hash;
+
+    // Get nonce
+    let access_key_request = methods::query::RpcQueryRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+        request: near_primitives::views::QueryRequest::ViewAccessKey {
+            account_id: owner.account_id.clone(),
+            public_key: secret_key.public_key(),
+        },
+    };
+    let access_key_response = client.call(access_key_request).await?;
+    let nonce = match access_key_response.kind {
+        QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
+        _ => return Err("Unexpected response type".into()),
+    };
 
     // Deploy + initialize in one transaction
     let deploy_action = Action::DeployContract(DeployContractAction { code: wasm_bytes });
@@ -68,14 +89,29 @@ async fn setup_ft_contract(
         deposit: 0,
     }));
 
-    let tx = near_api::Transaction::construct(owner.account_id.clone(), owner.account_id.clone())
-        .add_actions(vec![deploy_action, init_action])
-        .with_signer(signer)
-        .send_to(&network)
-        .await?;
+    let transaction = Transaction::V0(TransactionV0 {
+        signer_id: owner.account_id.clone(),
+        public_key: secret_key.public_key(),
+        nonce,
+        receiver_id: owner.account_id.clone(),
+        block_hash,
+        actions: vec![deploy_action, init_action],
+    });
 
-    tx.assert_success();
-    Ok(())
+    let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+    let signed_tx = SignedTransaction::new(signature, transaction);
+
+    let broadcast_request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+        signed_transaction: signed_tx,
+    };
+    let response = client.call(broadcast_request).await?;
+
+    // Check if transaction succeeded
+    if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
+        Ok(())
+    } else {
+        Err(format!("Transaction failed: {:?}", response.status).into())
+    }
 }
 
 #[tokio::test]
@@ -129,40 +165,66 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     let mut secret_keys = vec![ft_owner.private_key.to_string()];
 
     // Add 2 more keys to the pool
-    let network = NetworkConfig {
-        network_name: "sandbox".to_string(),
-        rpc_endpoints: vec![RPCEndpoint::new(sandbox.rpc_addr.parse()?)],
-        ..NetworkConfig::testnet()
-    };
+    let client = JsonRpcClient::connect(&sandbox.rpc_addr);
+    let owner_secret_key: SecretKey = ft_owner.private_key.parse()?;
 
     for _i in 1..3 {
-        // Generate a new random keypair using near-api-rs
-        let new_secret_key = near_api::signer::generate_secret_key()?;
+        // Generate a new random keypair
+        let new_secret_key = SecretKey::from_random(near_crypto::KeyType::ED25519);
         let new_public_key = new_secret_key.public_key();
 
-        // Add the key to the account
-        let add_key_action = near_primitives::action::Action::AddKey(Box::new(
-            near_primitives::action::AddKeyAction {
-                public_key: new_public_key.clone(),
-                access_key: near_primitives::account::AccessKey {
-                    nonce: 0,
-                    permission: near_primitives::account::AccessKeyPermission::FullAccess,
-                },
+        // Get current nonce
+        let access_key_request = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: ft_owner.account_id.clone(),
+                public_key: owner_secret_key.public_key(),
             },
-        ));
+        };
+        let access_key_response = client.call(access_key_request).await?;
+        let nonce = match access_key_response.kind {
+            QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
+            _ => return Err("Unexpected response type".into()),
+        };
 
-        let owner_signer = Signer::new(Signer::from_secret_key(ft_owner.private_key.parse()?))?;
-        let tx = near_api::Transaction::construct(
-            ft_owner.account_id.clone(),
-            ft_owner.account_id.clone(),
-        )
-        .add_action(add_key_action)
-        .with_signer(owner_signer)
-        .send_to(&network)
-        .await?;
+        // Get block hash
+        let block_request = methods::block::RpcBlockRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+        };
+        let block = client.call(block_request).await?;
+        let block_hash = block.header.hash;
 
-        tx.assert_success();
-        secret_keys.push(new_secret_key.to_string());
+        // Add the key to the account
+        let add_key_action = Action::AddKey(Box::new(AddKeyAction {
+            public_key: new_public_key.clone(),
+            access_key: near_primitives::account::AccessKey {
+                nonce: 0,
+                permission: AccessKeyPermission::FullAccess,
+            },
+        }));
+
+        let transaction = Transaction::V0(TransactionV0 {
+            signer_id: ft_owner.account_id.clone(),
+            public_key: owner_secret_key.public_key(),
+            nonce,
+            receiver_id: ft_owner.account_id.clone(),
+            block_hash,
+            actions: vec![add_key_action],
+        });
+
+        let signature = owner_secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+        let signed_tx = SignedTransaction::new(signature, transaction);
+
+        let broadcast_request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+            signed_transaction: signed_tx,
+        };
+        let response = client.call(broadcast_request).await?;
+
+        if let near_primitives::views::FinalExecutionStatus::SuccessValue(_) = response.status {
+            secret_keys.push(new_secret_key.to_string());
+        } else {
+            return Err(format!("Add key transaction failed: {:?}", response.status).into());
+        }
     }
 
     println!("✅ {} access keys configured", secret_keys.len());
@@ -171,14 +233,16 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     let redis = test_redis_settings();
 
     let config = RelayConfig {
-        token: ft_owner.account_id.clone(),
-        account_id: ft_owner.account_id.clone(),
+        token: ft_owner.account_id.to_string(),
+        account_id: ft_owner.account_id.to_string(),
         secret_keys,
         rpc_url: sandbox.rpc_addr.clone(),
         batch_linger_ms: 1000,     // Fast batching
         batch_submit_delay_ms: 0,  // No throttling needed for sandbox
         max_inflight_batches: 500, // High concurrency
-        max_workers: 3,
+        max_workers: 3,            // 3 transfer workers
+        max_registration_workers: 1, // 1 registration worker
+        max_verification_workers: 1, // 1 verification worker
         bind_addr: "127.0.0.1:18082".to_string(),
         redis,
     };
@@ -414,11 +478,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
 
     println!("\n⏳ Waiting for NEAR to finalize balances...");
 
-    let network = NetworkConfig {
-        network_name: "sandbox".to_string(),
-        rpc_endpoints: vec![RPCEndpoint::new(sandbox.rpc_addr.parse()?)],
-        ..NetworkConfig::testnet()
-    };
+    let client = JsonRpcClient::connect(&sandbox.rpc_addr);
 
     let expected_total = total_requests as u128 * YOCTO_PER_TRANSFER;
     let poll_interval = Duration::from_secs(3);
@@ -436,16 +496,28 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         for receiver in &receivers {
             let balance_args = json!({
                 "account_id": receiver.account_id
-            });
+            })
+            .to_string()
+            .into_bytes();
 
-            let result = near_api::Contract(ft_owner.account_id.clone())
-                .call_function("ft_balance_of", balance_args)?
-                .read_only()
-                .fetch_from(&network)
-                .await?;
+            let call_request = methods::query::RpcQueryRequest {
+                block_reference: BlockReference::Finality(Finality::Final),
+                request: near_primitives::views::QueryRequest::CallFunction {
+                    account_id: ft_owner.account_id.clone(),
+                    method_name: "ft_balance_of".to_string(),
+                    args: near_primitives::types::FunctionArgs::from(balance_args),
+                },
+            };
 
-            let balance_str: String = result.data;
-            let balance: u128 = balance_str.parse().unwrap_or(0);
+            let response = client.call(call_request).await?;
+            let balance: u128 = match response.kind {
+                QueryResponseKind::CallResult(result) => {
+                    let balance_str: String = serde_json::from_slice(&result.result)?;
+                    balance_str.parse().unwrap_or(0)
+                }
+                _ => 0,
+            };
+
             total_balance += balance;
             balances.push(balance);
         }

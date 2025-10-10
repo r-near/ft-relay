@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
+use serde::de::DeserializeOwned;
 
 use crate::types::{Event, RegistrationMessage, Status, TransferMessage, TransferState, VerificationMessage};
 
@@ -203,4 +204,152 @@ where C: ConnectionLike + AsyncCommands + Send + Sync,
     let key = format!("tx:{}:status", tx_hash);
     let status: Option<String> = conn.get(&key).await?;
     Ok(status)
+}
+
+/// Pop a batch of messages from a Redis stream using XREADGROUP with linger-based batching
+/// 
+/// This helper function implements efficient batch accumulation:
+/// 1. First XREADGROUP with BLOCK=1ms (quick check for available messages)
+/// 2. If batch is not full, sleep for linger_ms to allow more messages to arrive
+/// 3. Second XREADGROUP to pick up any additional messages
+/// 4. Return the combined batch
+/// 
+/// The linger_ms parameter controls how long to wait for additional messages
+/// when the initial batch is not full, allowing workers to accumulate larger
+/// batches for better throughput.
+pub async fn pop_batch<C, T>(
+    conn: &mut C,
+    stream_key: &str,
+    consumer_group: &str,
+    consumer_name: &str,
+    max_count: usize,
+    linger_ms: u64,
+) -> Result<Vec<(String, T)>>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+    T: DeserializeOwned,
+{
+    // First attempt: quick check with minimal blocking
+    let mut batch = read_stream_batch(conn, stream_key, consumer_group, consumer_name, max_count, 1).await?;
+
+    // If we got some messages but batch isn't full, linger to accumulate more
+    if !batch.is_empty() && batch.len() < max_count {
+        tokio::time::sleep(tokio::time::Duration::from_millis(linger_ms)).await;
+        
+        // Second attempt: pick up any messages that arrived during linger
+        let remaining = max_count - batch.len();
+        let mut additional = read_stream_batch(conn, stream_key, consumer_group, consumer_name, remaining, 1).await?;
+        batch.append(&mut additional);
+    } else if batch.is_empty() {
+        // If no messages at all, block longer to avoid busy-waiting
+        batch = read_stream_batch(conn, stream_key, consumer_group, consumer_name, max_count, linger_ms).await?;
+    }
+
+    Ok(batch)
+}
+
+/// Internal helper to read from a stream and parse messages
+async fn read_stream_batch<C, T>(
+    conn: &mut C,
+    stream_key: &str,
+    consumer_group: &str,
+    consumer_name: &str,
+    max_count: usize,
+    block_ms: u64,
+) -> Result<Vec<(String, T)>>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+    T: DeserializeOwned,
+{
+    let result: Result<redis::streams::StreamReadReply, _> = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(consumer_group)
+        .arg(consumer_name)
+        .arg("COUNT")
+        .arg(max_count)
+        .arg("BLOCK")
+        .arg(block_ms as usize)
+        .arg("STREAMS")
+        .arg(stream_key)
+        .arg(">")
+        .query_async(conn)
+        .await;
+
+    let reply = match result {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()), // Timeout or no messages
+    };
+
+    let mut batch = Vec::new();
+
+    for stream in reply.keys {
+        for id_data in stream.ids {
+            let stream_id = id_data.id.clone();
+
+            let data = match id_data.map.get("data") {
+                Some(redis::Value::BulkString(bytes)) => match std::str::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Failed to parse stream data as UTF-8: {:?}", e);
+                        // ACK and skip malformed message
+                        let _: Result<(), _> = redis::cmd("XACK")
+                            .arg(stream_key)
+                            .arg(consumer_group)
+                            .arg(&stream_id)
+                            .query_async(conn)
+                            .await;
+                        continue;
+                    }
+                },
+                _ => {
+                    log::warn!("Stream message missing 'data' field");
+                    // ACK and skip malformed message
+                    let _: Result<(), _> = redis::cmd("XACK")
+                        .arg(stream_key)
+                        .arg(consumer_group)
+                        .arg(&stream_id)
+                        .query_async(conn)
+                        .await;
+                    continue;
+                }
+            };
+
+            let msg: T = match serde_json::from_str(data) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("Failed to deserialize message: {:?}", e);
+                    // ACK and skip malformed message
+                    let _: Result<(), _> = redis::cmd("XACK")
+                        .arg(stream_key)
+                        .arg(consumer_group)
+                        .arg(&stream_id)
+                        .query_async(conn)
+                        .await;
+                    continue;
+                }
+            };
+
+            batch.push((stream_id, msg));
+        }
+    }
+
+    Ok(batch)
+}
+
+/// Acknowledge a message in a Redis stream
+pub async fn ack_message<C>(
+    conn: &mut C,
+    stream_key: &str,
+    consumer_group: &str,
+    stream_id: &str,
+) -> Result<()>
+where C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let _: u64 = redis::cmd("XACK")
+        .arg(stream_key)
+        .arg(consumer_group)
+        .arg(stream_id)
+        .query_async(conn)
+        .await?;
+    Ok(())
 }

@@ -48,98 +48,59 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
     loop {
         let mut conn = ctx.runtime.redis_conn.clone();
 
-        let result: Result<redis::streams::StreamReadReply, _> = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(&consumer_group)
-            .arg(&consumer_name)
-            .arg("COUNT")
-            .arg(50)
-            .arg("BLOCK")
-            .arg(ctx.linger_ms as usize)
-            .arg("STREAMS")
-            .arg(&stream_key)
-            .arg(">")
-            .query_async(&mut conn)
-            .await;
-
-        let reply = match result {
-            Ok(r) => r,
-            Err(_) => continue,
+        let batch: Vec<(String, RegistrationMessage)> = match rh::pop_batch(
+            &mut conn,
+            &stream_key,
+            &consumer_group,
+            &consumer_name,
+            50,
+            ctx.linger_ms,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Error popping batch: {:?}", e);
+                continue;
+            }
         };
 
-        for stream in reply.keys {
-            for id_data in stream.ids {
-                let stream_id = id_data.id.clone();
+        for (stream_id, msg) in batch {
+            match process_registration(&ctx, &msg).await {
+                Ok(_) => {
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                }
+                Err(e) => {
+                    warn!("Error processing registration for {}: {:?}", msg.transfer_id, e);
+                    
+                    let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
-                let data = match id_data.map.get("data") {
-                    Some(redis::Value::BulkString(bytes)) => {
-                        match std::str::from_utf8(bytes) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        }
-                    }
-                    _ => continue,
-                };
-
-                let msg: RegistrationMessage = match serde_json::from_str(data) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-                        continue;
-                    }
-                };
-
-                match process_registration(&ctx, &msg).await {
-                    Ok(_) => {
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-                    }
-                    Err(e) => {
-                        warn!("Error processing registration for {}: {:?}", msg.transfer_id, e);
-                        
-                        let _: Result<(), _> = redis::cmd("XACK")
-                            .arg(&stream_key)
-                            .arg(&consumer_group)
-                            .arg(&stream_id)
-                            .query_async(&mut conn)
-                            .await;
-
-                        let retry_count = msg.retry_count + 1;
-                        if retry_count < MAX_RETRIES {
-                            let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
-                            let _ = rh::enqueue_registration(
-                                &mut conn,
-                                &ctx.runtime.env,
-                                &msg.transfer_id,
-                                retry_count,
-                            )
-                            .await;
-                        } else {
-                            let _ = rh::update_transfer_status(
-                                &mut conn,
-                                &msg.transfer_id,
-                                Status::Failed,
-                            )
-                            .await;
-                            let _ = rh::log_event(
-                                &mut conn,
-                                &msg.transfer_id,
-                                Event::new("FAILED").with_reason(format!(
-                                    "Registration failed after {} retries",
-                                    retry_count
-                                )),
-                            )
-                            .await;
-                        }
+                    let retry_count = msg.retry_count + 1;
+                    if retry_count < MAX_RETRIES {
+                        let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
+                        let _ = rh::enqueue_registration(
+                            &mut conn,
+                            &ctx.runtime.env,
+                            &msg.transfer_id,
+                            retry_count,
+                        )
+                        .await;
+                    } else {
+                        let _ = rh::update_transfer_status(
+                            &mut conn,
+                            &msg.transfer_id,
+                            Status::Failed,
+                        )
+                        .await;
+                        let _ = rh::log_event(
+                            &mut conn,
+                            &msg.transfer_id,
+                            Event::new("FAILED").with_reason(format!(
+                                "Registration failed after {} retries",
+                                retry_count
+                            )),
+                        )
+                        .await;
                     }
                 }
             }

@@ -30,6 +30,8 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         batch_submit_delay_ms: _,
         max_inflight_batches: _,
         max_workers,
+        max_registration_workers,
+        max_verification_workers,
         bind_addr,
         redis,
     } = config;
@@ -82,9 +84,8 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         axum::serve(listener, router).await.unwrap();
     });
 
-    let num_reg_workers = 5;
-    info!("Spawning {} registration worker(s)", num_reg_workers);
-    for idx in 0..num_reg_workers {
+    info!("Spawning {} registration worker(s)", max_registration_workers);
+    for idx in 0..max_registration_workers {
         let runtime = Arc::new(registration_worker::RegistrationWorkerRuntime {
             redis_conn: redis_conn.as_ref().clone(),
             rpc_client: rpc_client.clone(),
@@ -107,9 +108,8 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         });
     }
 
-    let num_transfer_workers = max_workers;
-    info!("Spawning {} transfer worker(s)", num_transfer_workers);
-    for idx in 0..num_transfer_workers {
+    info!("Spawning {} transfer worker(s)", max_workers);
+    for idx in 0..max_workers {
         let runtime = Arc::new(transfer_worker::TransferWorkerRuntime {
             redis_conn: redis_conn.as_ref().clone(),
             rpc_client: rpc_client.clone(),
@@ -132,9 +132,8 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         });
     }
 
-    let num_verify_workers = 5;
-    info!("Spawning {} verification worker(s)", num_verify_workers);
-    for idx in 0..num_verify_workers {
+    info!("Spawning {} verification worker(s)", max_verification_workers);
+    for idx in 0..max_verification_workers {
         let runtime = Arc::new(verification_worker::VerificationWorkerRuntime {
             redis_conn: redis_conn.as_ref().clone(),
             rpc_client: rpc_client.clone(),
