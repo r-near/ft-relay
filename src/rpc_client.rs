@@ -176,7 +176,7 @@ impl NearRpcClient {
             actions: vec![action],
         });
 
-        let signature = secret_key.sign(&transaction.get_hash_and_size().0.as_ref());
+        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
         
         self.broadcast_tx(signed_tx).await
@@ -218,7 +218,7 @@ impl NearRpcClient {
             actions,
         });
 
-        let signature = secret_key.sign(&transaction.get_hash_and_size().0.as_ref());
+        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
         
         self.broadcast_tx(signed_tx).await

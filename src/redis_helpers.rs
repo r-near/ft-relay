@@ -143,7 +143,7 @@ where C: ConnectionLike + AsyncCommands + Send + Sync,
     let stream_key = format!("ftrelay:{}:reg", env);
     let msg = RegistrationMessage { transfer_id: transfer_id.to_string(), retry_count };
     let serialized = serde_json::to_string(&msg)?;
-    conn.xadd(&stream_key, "*", &[("data", serialized.as_str())]).await?;
+    conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())]).await?;
     Ok(())
 }
 
@@ -153,7 +153,7 @@ where C: ConnectionLike + AsyncCommands + Send + Sync,
     let stream_key = format!("ftrelay:{}:xfer", env);
     let msg = TransferMessage { transfer_id: transfer_id.to_string(), retry_count };
     let serialized = serde_json::to_string(&msg)?;
-    conn.xadd(&stream_key, "*", &[("data", serialized.as_str())]).await?;
+    conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())]).await?;
     Ok(())
 }
 
@@ -163,6 +163,6 @@ where C: ConnectionLike + AsyncCommands + Send + Sync,
     let stream_key = format!("ftrelay:{}:verify", env);
     let msg = VerificationMessage { transfer_id: transfer_id.to_string(), tx_hash: tx_hash.to_string(), retry_count };
     let serialized = serde_json::to_string(&msg)?;
-    conn.xadd(&stream_key, "*", &[("data", serialized.as_str())]).await?;
+    conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())]).await?;
     Ok(())
 }
