@@ -45,13 +45,14 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
         let mut conn = ctx.runtime.redis_conn.clone();
 
         // Pop ONE message at a time (no batching benefit for individual RPC checks)
+        // Use a small linger to ensure we actually perform a blocking read
         let messages: Vec<(String, VerificationMessage)> = match rh::pop_batch(
             &mut conn,
             &stream_key,
             &consumer_group,
             &consumer_name,
-            1, // Just one message
-            0, // Short block timeout
+            1,   // Just one message
+            50,  // ~50ms linger to allow XREADGROUP BLOCK
         )
         .await
         {
@@ -69,13 +70,39 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
         }
 
         let (stream_id, msg) = &messages[0];
+        info!(
+            "[VERIFY] Checking tx {} for transfer {} (retry #{})",
+            msg.tx_hash, msg.transfer_id, msg.retry_count
+        );
         match verify_transaction(&ctx, msg).await {
             Ok(VerificationResult::Completed) => {
                 let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
             }
             Ok(VerificationResult::Failed(reason)) => {
-                warn!("Transfer {} failed: {}", msg.transfer_id, reason);
+                warn!(
+                    "[VERIFY] Tx {} failed: {} — re-enqueuing transfers for resubmission",
+                    msg.tx_hash, reason
+                );
+
+                // Ack this verification message
                 let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+
+                // Re-enqueue all transfers associated with this failed tx for another attempt
+                let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await.unwrap_or_default();
+                if !transfer_ids.is_empty() {
+                    info!(
+                        "[VERIFY] Re-enqueueing {} transfer(s) from failed tx {}",
+                        transfer_ids.len(), msg.tx_hash
+                    );
+                }
+
+                for tid in transfer_ids {
+                    let _ = rh::increment_retry_count(&mut conn, &tid).await;
+                    let _ = rh::update_transfer_status(&mut conn, &tid, Status::QueuedTransfer).await;
+                    let _ = rh::log_event(&mut conn, &tid, Event::new("RETRY_TRANSFER").with_reason(reason.clone())).await;
+                    let _ = rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &tid, 0).await;
+                    let _ = rh::log_event(&mut conn, &tid, Event::new("QUEUED_TRANSFER")).await;
+                }
             }
             Ok(VerificationResult::Pending) => {
                 let retry_count = msg.retry_count + 1;
@@ -154,9 +181,6 @@ async fn verify_transaction(
         }
     }
 
-    // No need to wait - transactions are submitted with wait_until: Final
-    // so they're already finalized when we get the verification message
-
     let tx_hash = CryptoHash::from_str(&msg.tx_hash)
         .map_err(|e| anyhow::anyhow!("Invalid tx hash: {:?}", e))?;
 
@@ -168,7 +192,7 @@ async fn verify_transaction(
         .await?
     {
         TxStatus::Success(_outcome) => {
-            info!("Tx {} completed successfully", msg.tx_hash);
+            info!("[VERIFY] Tx {} completed successfully", msg.tx_hash);
 
             // Cache the result so other transfers skip RPC
             rh::set_tx_status(&mut conn, &msg.tx_hash, "completed").await?;
@@ -189,7 +213,7 @@ async fn verify_transaction(
             Ok(VerificationResult::Completed)
         }
         TxStatus::Failed(reason) => {
-            warn!("Tx {} failed on-chain: {}", msg.tx_hash, reason);
+            warn!("[VERIFY] Tx {} failed on-chain: {}", msg.tx_hash, reason);
 
             // Cache the result
             rh::set_tx_status(&mut conn, &msg.tx_hash, "failed").await?;

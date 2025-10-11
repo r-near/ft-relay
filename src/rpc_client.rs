@@ -308,4 +308,63 @@ impl NearRpcClient {
 
         self.broadcast_tx(signed_tx).await
     }
+
+    /// Broadcast a batch transfer without waiting for finality; returns the tx hash immediately.
+    pub async fn submit_batch_transfer_async(
+        &self,
+        signer_account: &AccountId,
+        token: &AccountId,
+        receivers: Vec<(AccountId, String)>,
+        secret_key: &SecretKey,
+        nonce: u64,
+    ) -> Result<CryptoHash> {
+        let block_hash = self.get_block_hash().await?;
+
+        let actions: Vec<Action> = receivers
+            .into_iter()
+            .map(|(receiver_id, amount)| {
+                let args = serde_json::json!({
+                    "receiver_id": receiver_id,
+                    "amount": amount,
+                });
+
+                Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "ft_transfer".to_string(),
+                    args: args.to_string().into_bytes(),
+                    gas: FT_TRANSFER_GAS_PER_ACTION,
+                    deposit: FT_TRANSFER_DEPOSIT,
+                }))
+            })
+            .collect();
+
+        let transaction = Transaction::V0(near_primitives::transaction::TransactionV0 {
+            signer_id: signer_account
+                .parse()
+                .map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
+            public_key: secret_key.public_key(),
+            nonce,
+            receiver_id: token
+                .parse()
+                .map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
+            block_hash,
+            actions,
+        });
+
+        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+        let signed_tx = SignedTransaction::new(signature, transaction);
+
+        self.broadcast_tx_async_hash(signed_tx).await
+    }
+
+    /// Low-level: call broadcast_tx_async; returns only the tx hash without waiting
+    pub async fn broadcast_tx_async_hash(&self, signed_tx: SignedTransaction) -> Result<CryptoHash> {
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
+        let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest { signed_transaction: signed_tx };
+        let tx_hash: CryptoHash = self
+            .client
+            .call(request)
+            .await
+            .map_err(|e| anyhow!("Failed to broadcast (async) transaction: {:?}", e))?;
+        Ok(tx_hash)
+    }
 }

@@ -166,7 +166,7 @@ async fn process_batch(
     let result = ctx
         .runtime
         .rpc_client
-        .submit_batch_transfer(
+        .submit_batch_transfer_async(
             &ctx.runtime.relay_account,
             &ctx.runtime.token,
             receivers,
@@ -181,109 +181,63 @@ async fn process_batch(
     drop(leased_key);
 
     match result {
-        Ok((tx_hash, outcome)) => {
+        Ok(tx_hash) => {
             let tx_hash_str = tx_hash.to_string();
-            
-            // Check if transaction succeeded (already Final, no need to verify)
-            let is_success = matches!(
-                outcome.status,
-                near_primitives::views::FinalExecutionStatus::SuccessValue(_)
+            info!(
+                "Batch of {} transfers submitted, tx: {} (verification async)",
+                transfers.len(),
+                tx_hash_str
             );
 
-            if is_success {
-                info!(
-                    "Batch of {} transfers succeeded, tx: {}",
-                    transfers.len(),
-                    tx_hash_str
-                );
-            } else {
-                warn!(
-                    "Batch of {} transfers uncertain, tx: {} - will verify",
-                    transfers.len(),
-                    tx_hash_str
-                );
+            // Pipeline all Redis updates: mark submitted, set tx_hash, map tx->transfers,
+            // enqueue verification, and ack messages.
+            let verify_stream = format!("ftrelay:{}:verify", ctx.runtime.env);
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            let now = chrono::Utc::now().to_rfc3339();
+
+            for (stream_id, msg, _) in &transfers {
+                let transfer_key = format!("transfer:{}", msg.transfer_id);
+                let event_key = format!("transfer:{}:ev", msg.transfer_id);
+                let tx_transfers_key = format!("tx:{}:transfers", tx_hash_str);
+
+                // Update transfer status + timestamps
+                pipe.hset(&transfer_key, "status", Status::Submitted.as_str());
+                pipe.hset(&transfer_key, "updated_at", &now);
+                // Update tx_hash
+                pipe.hset(&transfer_key, "tx_hash", &tx_hash_str);
+
+                // Map transfer to tx
+                pipe.sadd(&tx_transfers_key, &msg.transfer_id);
+                pipe.expire(&tx_transfers_key, 86400);
+
+                // Events: SUBMITTED + EXPIRE
+                let ev_submitted = serde_json::to_string(&Event::new("SUBMITTED").with_tx_hash(tx_hash_str.clone()))?;
+                pipe.lpush(&event_key, ev_submitted);
+                pipe.expire(&event_key, 86400);
+
+                // Enqueue verification
+                let verify_msg = crate::types::VerificationMessage { transfer_id: msg.transfer_id.clone(), tx_hash: tx_hash_str.clone(), retry_count: 0 };
+                let verify_json = serde_json::to_string(&verify_msg)?;
+                pipe.cmd("XADD")
+                    .arg(&verify_stream)
+                    .arg("*")
+                    .arg("data")
+                    .arg(&verify_json);
+
+                // Event: QUEUED_VERIFICATION
+                let ev_qv = serde_json::to_string(&Event::new("QUEUED_VERIFICATION"))?;
+                pipe.lpush(&event_key, ev_qv);
+                pipe.expire(&event_key, 86400);
+
+                // Ack
+                pipe.cmd("XACK")
+                    .arg(stream_key)
+                    .arg(consumer_group)
+                    .arg(stream_id);
             }
 
-            if is_success {
-                // Transaction succeeded - mark as completed (skip verification)
-                let redis_update_start = std::time::Instant::now();
-                
-                // Pipeline ALL Redis updates for the batch (one round-trip instead of 900!)
-                let mut pipe = redis::pipe();
-                pipe.atomic(); // Execute all commands together
-                
-                let now = chrono::Utc::now().to_rfc3339();
-                for (stream_id, msg, _) in &transfers {
-                    let transfer_key = format!("transfer:{}", msg.transfer_id);
-                    let event_key = format!("transfer:{}:ev", msg.transfer_id);
-                    let tx_transfers_key = format!("tx:{}:transfers", tx_hash_str);
-                    
-                    // Update transfer status (2 HSETs)
-                    pipe.hset(&transfer_key, "status", "Completed");
-                    pipe.hset(&transfer_key, "updated_at", &now);
-                    pipe.hset(&transfer_key, "completed_at", &now);
-                    
-                    // Update tx_hash (1 HSET)
-                    pipe.hset(&transfer_key, "tx_hash", &tx_hash_str);
-                    
-                    // Add transfer to tx mapping (1 SADD + 1 EXPIRE)
-                    pipe.sadd(&tx_transfers_key, &msg.transfer_id);
-                    pipe.expire(&tx_transfers_key, 86400);
-                    
-                    // Log event (1 LPUSH + 1 EXPIRE)
-                    let event = Event::new("COMPLETED").with_tx_hash(tx_hash_str.clone());
-                    let serialized = serde_json::to_string(&event)?;
-                    pipe.lpush(&event_key, serialized);
-                    pipe.expire(&event_key, 86400);
-                    
-                    // ACK message (1 XACK)
-                    pipe.cmd("XACK")
-                        .arg(stream_key)
-                        .arg(consumer_group)
-                        .arg(stream_id);
-                }
-                
-                // Execute entire pipeline in ONE network round-trip!
-                pipe.query_async::<()>(&mut conn).await?;
-                
-                let redis_update_duration = redis_update_start.elapsed();
-                debug!("[METRIC] op=redis_updates duration_ms={} count={}", redis_update_duration.as_millis(), transfers.len());
-                debug!("[TIMING] Pipelined Redis updates for {} transfers took {}ms ({:.1}ms per transfer)", 
-                    transfers.len(), 
-                    redis_update_duration.as_millis(),
-                    redis_update_duration.as_millis() as f64 / transfers.len() as f64
-                );
-            } else {
-                // Transaction failed or uncertain - send to verification
-                for (stream_id, msg, _) in &transfers {
-                    rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Submitted)
-                        .await?;
-                    rh::update_tx_hash(&mut conn, &msg.transfer_id, &tx_hash_str).await?;
-                    rh::add_transfer_to_tx(&mut conn, &tx_hash_str, &msg.transfer_id).await?;
-                    rh::log_event(
-                        &mut conn,
-                        &msg.transfer_id,
-                        Event::new("SUBMITTED").with_tx_hash(tx_hash_str.clone()),
-                    )
-                    .await?;
-                    rh::enqueue_verification(
-                        &mut conn,
-                        &ctx.runtime.env,
-                        &msg.transfer_id,
-                        &tx_hash_str,
-                        0,
-                    )
-                    .await?;
-                    rh::log_event(
-                        &mut conn,
-                        &msg.transfer_id,
-                        Event::new("QUEUED_VERIFICATION"),
-                    )
-                    .await?;
-                    let _ = rh::ack_message(&mut conn, stream_key, consumer_group, stream_id).await;
-                }
-            }
-
+            pipe.query_async::<()>(&mut conn).await?;
             Ok(())
         }
         Err(e) => {
