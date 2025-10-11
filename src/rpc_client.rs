@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use log::{debug, info};
+use redis::aio::ConnectionManager;
 use near_crypto::{PublicKey, SecretKey};
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
@@ -28,15 +29,30 @@ pub enum TxStatus {
 pub struct NearRpcClient {
     client: JsonRpcClient,
     block_hash_cache: Arc<RwLock<Option<(CryptoHash, Instant)>>>,
+    redis_conn: ConnectionManager,
+    env: String,
 }
 
 impl NearRpcClient {
-    pub fn new(rpc_url: &str) -> Self {
+    pub fn new(rpc_url: &str, redis_conn: ConnectionManager, env: String) -> Self {
         let client = JsonRpcClient::connect(rpc_url);
         Self {
             client,
             block_hash_cache: Arc::new(RwLock::new(None)),
+            redis_conn,
+            env,
         }
+    }
+
+    async fn incr_stat(&self, field: &str) {
+        let key = format!("ftrelay:{}:rpc_stats", self.env);
+        let mut conn = self.redis_conn.clone();
+        let _ = redis::cmd("HINCRBY")
+            .arg(key)
+            .arg(field)
+            .arg(1)
+            .query_async::<()>(&mut conn)
+            .await;
     }
 
     pub async fn get_block_hash(&self) -> Result<CryptoHash> {
@@ -53,6 +69,7 @@ impl NearRpcClient {
         }
 
         debug!("Fetching fresh block hash from RPC");
+        self.incr_stat("get_block_hash").await;
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::block::RpcBlockRequest {
             block_reference: BlockReference::Finality(Finality::Final),
@@ -80,6 +97,7 @@ impl NearRpcClient {
     ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let tx_hash = signed_tx.get_hash();
         debug!("Broadcasting transaction: {}", tx_hash);
+        self.incr_stat("broadcast_tx").await;
 
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = RpcSendTransactionRequest {
@@ -106,6 +124,7 @@ impl NearRpcClient {
         tx_hash: &CryptoHash,
         sender: &AccountId,
     ) -> Result<TxStatus> {
+        self.incr_stat("check_tx_status").await;
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::tx::RpcTransactionStatusRequest {
             transaction_info: methods::tx::TransactionInfo::TransactionId {
@@ -151,6 +170,7 @@ impl NearRpcClient {
         account: &AccountId,
         public_key: &PublicKey,
     ) -> Result<AccessKeyView> {
+        self.incr_stat("get_access_key").await;
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::query::RpcQueryRequest {
             block_reference: BlockReference::Finality(Finality::Final),
@@ -358,6 +378,7 @@ impl NearRpcClient {
 
     /// Low-level: call broadcast_tx_async; returns only the tx hash without waiting
     pub async fn broadcast_tx_async_hash(&self, signed_tx: SignedTransaction) -> Result<CryptoHash> {
+        self.incr_stat("broadcast_tx_async_hash").await;
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
         let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest { signed_transaction: signed_tx };
         let tx_hash: CryptoHash = self

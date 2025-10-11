@@ -52,7 +52,19 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     let http_redis_client = redis::Client::open(redis.url.as_str())?;
     let redis_conn = redis::aio::ConnectionManager::new(http_redis_client).await?;
 
-    let rpc_client = Arc::new(NearRpcClient::new(&rpc_url));
+    let env = if token.contains(".testnet") {
+        "testnet"
+    } else if token.contains(".near") {
+        "mainnet"
+    } else {
+        "sandbox"
+    };
+
+    // Dedicated Redis connection for RPC stats
+    let rpc_redis_client = redis::Client::open(redis.url.as_str())?;
+    let rpc_redis_conn = redis::aio::ConnectionManager::new(rpc_redis_client).await?;
+
+    let rpc_client = Arc::new(NearRpcClient::new(&rpc_url, rpc_redis_conn, env.to_string()));
     let access_key_pool = Arc::new(AccessKeyPool::new(access_keys.clone(), redis_conn.clone()));
 
     let mut nonce_manager = NonceManager::new(redis_conn.clone());
@@ -73,13 +85,7 @@ pub async fn run(config: RelayConfig) -> Result<()> {
         }
     }
 
-    let env = if token.contains(".testnet") {
-        "testnet"
-    } else if token.contains(".near") {
-        "mainnet"
-    } else {
-        "sandbox"
-    };
+    let env = env; // reuse computed env
 
     let router = http::build_router(redis_conn.clone(), env.to_string(), token.clone());
     tokio::spawn(async move {

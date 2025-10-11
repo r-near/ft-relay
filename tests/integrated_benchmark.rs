@@ -273,7 +273,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         max_inflight_batches: 500, // High concurrency
         max_workers: 1,       // 1 transfer worker
         max_registration_workers: 1, // 1 registration worker (serial registration)
-        max_verification_workers: 5, // 1 verification worker (no sleep needed, txs already Final)
+        max_verification_workers: 10, // 10 verification workers
         bind_addr: "127.0.0.1:18082".to_string(),
         redis,
     };
@@ -549,6 +549,70 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         println!("  Status:                 ✅ VERIFIED");
     }
 
+    // Wait for verification worker to drain its queue before on-chain polling
+    println!("\n⏳ Waiting for verification worker to finish...");
+    let verify_stream = "ftrelay:sandbox:verify";
+    let verify_group = "ftrelay:sandbox:verify_workers";
+    let pending_set_key = "ftrelay:sandbox:pending_verification_txs";
+
+    for _ in 0..240 {
+        // up to ~120s at 500ms interval
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // pending set cardinality
+        let pending_set: u64 = redis::cmd("SCARD")
+            .arg(pending_set_key)
+            .query_async(&mut redis_conn)
+            .await
+            .unwrap_or(0);
+
+        // group pending
+        let mut group_pending: u64 = 0;
+        if let Ok(groups) = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(verify_stream)
+            .query_async::<redis::Value>(&mut redis_conn)
+            .await
+        {
+            if let redis::Value::Array(items) = groups {
+                for grp in items {
+                    if let redis::Value::Array(kv) = grp {
+                        let mut name: Option<String> = None;
+                        let mut pending: Option<u64> = None;
+                        let mut i = 0;
+                        while i + 1 < kv.len() {
+                            let key = &kv[i];
+                            let val = &kv[i + 1];
+                            if let redis::Value::BulkString(k) = key {
+                                if k == b"name" {
+                                    if let redis::Value::BulkString(v) = val {
+                                        name = std::str::from_utf8(v).ok().map(|s| s.to_string());
+                                    }
+                                } else if k == b"pending" {
+                                    if let redis::Value::Int(v) = val {
+                                        pending = Some(*v as u64);
+                                    }
+                                }
+                            }
+                            i += 2;
+                        }
+                        if let (Some(n), Some(p)) = (name, pending) {
+                            if n == verify_group {
+                                group_pending = p;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if pending_set == 0 && group_pending == 0 {
+            println!("  ✅ Verification queue drained");
+            break;
+        }
+    }
+
     println!("\n⏳ Waiting for NEAR to finalize balances...");
 
     let client = JsonRpcClient::connect(&sandbox.rpc_addr);
@@ -765,6 +829,24 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     println!("onchain_success_rate: {:.2}", final_success_rate);
     println!("status: PASSED");
     println!("--- END BENCHMARK RESULTS ---");
+
+    // Print RPC stats collected in Redis
+    println!("\n╔════════════════════════════════════════════════════════════╗");
+    println!("║  RPC STATS                                                 ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    let stats_key = "ftrelay:sandbox:rpc_stats";
+    let stats: Vec<(String, i64)> = redis::cmd("HGETALL")
+        .arg(stats_key)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
+    if stats.is_empty() {
+        println!("  (no RPC stats recorded)");
+    } else {
+        for (method, count) in stats {
+            println!("  {:<28} {}", method, count);
+        }
+    }
 
     Ok(())
 }
