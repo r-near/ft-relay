@@ -1,6 +1,6 @@
+use ::redis::aio::ConnectionManager;
 use anyhow::{anyhow, Result};
 use log::debug;
-use redis::aio::ConnectionManager;
 use near_crypto::{PublicKey, SecretKey};
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
@@ -45,9 +45,9 @@ impl NearRpcClient {
     }
 
     async fn incr_stat(&self, field: &str) {
-        let key = format!("ftrelay:{}:rpc_stats", self.env);
+        let key = crate::redis::keys::rpc_stats_hash(&self.env);
         let mut conn = self.redis_conn.clone();
-        let _ = redis::cmd("HINCRBY")
+        let _ = ::redis::cmd("HINCRBY")
             .arg(key)
             .arg(field)
             .arg(1)
@@ -59,8 +59,6 @@ impl NearRpcClient {
         {
             let cache = self.block_hash_cache.read().await;
             if let Some((hash, cached_at)) = *cache {
-                // Reduced from 3600s to 1s to prevent expiration during high load
-                // Sandbox creates new block per tx, so stale hash = expired tx after ~100 blocks
                 if cached_at.elapsed() < Duration::from_millis(500) {
                     debug!("Using cached block hash");
                     return Ok(hash);
@@ -157,15 +155,12 @@ impl NearRpcClient {
             Err(e) => {
                 let err_str = format!("{:?}", e);
                 if err_str.contains("UNKNOWN_TRANSACTION") || err_str.contains("does not exist") {
-                    // Transaction not found yet - still pending
                     Ok(TxStatus::Pending)
                 } else if err_str.contains("TimeoutError") || err_str.contains("TIMEOUT_ERROR") {
-                    // RPC timeout while waiting for finality - transaction state unknown
-                    // Per NEAR docs: transaction was routed but not recorded on chain in 10 seconds
-                    // Solution: resubmit the transaction (NEAR's idempotency will handle duplicates)
-                    // We treat this as Failed so the verification worker will re-enqueue transfers
                     debug!("RPC timeout checking tx status - will resubmit transaction");
-                    Ok(TxStatus::Failed("RPC timeout - resubmitting transaction".to_string()))
+                    Ok(TxStatus::Failed(
+                        "RPC timeout - resubmitting transaction".to_string(),
+                    ))
                 } else {
                     Err(anyhow!("Failed to check transaction status: {:?}", e))
                 }
@@ -190,11 +185,14 @@ impl NearRpcClient {
             },
         };
 
-        let response = self
-            .client
-            .call(request)
-            .await
-            .map_err(|e| anyhow!("Failed to fetch access key for {} / {}: {:?}", account, public_key, e))?;
+        let response = self.client.call(request).await.map_err(|e| {
+            anyhow!(
+                "Failed to fetch access key for {} / {}: {:?}",
+                account,
+                public_key,
+                e
+            )
+        })?;
 
         match response.kind {
             QueryResponseKind::AccessKey(access_key) => Ok(access_key),
@@ -202,7 +200,6 @@ impl NearRpcClient {
         }
     }
 
-    /// Fetch all access keys for an account at once (much faster than individual queries)
     pub async fn get_access_key_list(
         &self,
         account: &AccountId,
@@ -271,7 +268,6 @@ impl NearRpcClient {
         self.broadcast_tx(signed_tx).await
     }
 
-    /// Register multiple accounts in a single transaction (batch storage_deposit)
     pub async fn register_accounts_batch(
         &self,
         signer_account: &AccountId,
@@ -282,23 +278,22 @@ impl NearRpcClient {
     ) -> Result<(CryptoHash, FinalExecutionOutcomeView)> {
         let block_hash = self.get_block_hash().await?;
 
-        // Create one storage_deposit action per account
-        let mut actions = Vec::new();
-        for account in accounts_to_register {
-            let args = serde_json::json!({
-                "account_id": account,
-                "registration_only": true,
-            });
+        let actions = accounts_to_register
+            .into_iter()
+            .map(|account| {
+                let args = serde_json::json!({
+                    "account_id": account,
+                    "registration_only": true,
+                });
 
-            let action = Action::FunctionCall(Box::new(FunctionCallAction {
-                method_name: "storage_deposit".to_string(),
-                args: args.to_string().into_bytes(),
-                gas: STORAGE_DEPOSIT_GAS_PER_ACTION,
-                deposit: STORAGE_DEPOSIT_AMOUNT,
-            }));
-
-            actions.push(action);
-        }
+                Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "storage_deposit".to_string(),
+                    args: args.to_string().into_bytes(),
+                    gas: STORAGE_DEPOSIT_GAS_PER_ACTION,
+                    deposit: STORAGE_DEPOSIT_AMOUNT,
+                }))
+            })
+            .collect();
 
         let transaction = Transaction::V0(near_primitives::transaction::TransactionV0 {
             signer_id: signer_account
@@ -365,9 +360,6 @@ impl NearRpcClient {
         self.broadcast_tx(signed_tx).await
     }
 
-    /// Submit batch transfer and return tx_hash even on broadcast errors
-    /// Returns: (tx_hash, Result<outcome>)
-    /// The tx_hash is always available, even if broadcast times out
     pub async fn submit_batch_transfer_with_hash(
         &self,
         signer_account: &AccountId,
@@ -375,7 +367,10 @@ impl NearRpcClient {
         receivers: Vec<(AccountId, String)>,
         secret_key: &SecretKey,
         nonce: u64,
-    ) -> Result<(CryptoHash, std::result::Result<FinalExecutionOutcomeView, String>)> {
+    ) -> Result<(
+        CryptoHash,
+        std::result::Result<FinalExecutionOutcomeView, String>,
+    )> {
         let block_hash = self.get_block_hash().await?;
 
         let actions: Vec<Action> = receivers
@@ -410,17 +405,15 @@ impl NearRpcClient {
 
         let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
         let signed_tx = SignedTransaction::new(signature, transaction);
-        
+
         let tx_hash = signed_tx.get_hash();
 
-        // Broadcast and capture result separately
         match self.broadcast_tx(signed_tx).await {
             Ok((_hash, outcome)) => Ok((tx_hash, Ok(outcome))),
             Err(e) => Ok((tx_hash, Err(format!("{:?}", e)))),
         }
     }
 
-    /// Broadcast a batch transfer without waiting for finality; returns the tx hash immediately.
     pub async fn submit_batch_transfer_async(
         &self,
         signer_account: &AccountId,
@@ -467,11 +460,15 @@ impl NearRpcClient {
         self.broadcast_tx_async_hash(signed_tx).await
     }
 
-    /// Low-level: call broadcast_tx_async; returns only the tx hash without waiting
-    pub async fn broadcast_tx_async_hash(&self, signed_tx: SignedTransaction) -> Result<CryptoHash> {
+    pub async fn broadcast_tx_async_hash(
+        &self,
+        signed_tx: SignedTransaction,
+    ) -> Result<CryptoHash> {
         self.incr_stat("broadcast_tx_async_hash").await;
         RPC_CALLS.fetch_add(1, Ordering::Relaxed);
-        let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest { signed_transaction: signed_tx };
+        let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+            signed_transaction: signed_tx,
+        };
         let tx_hash: CryptoHash = self
             .client
             .call(request)

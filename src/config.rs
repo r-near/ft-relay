@@ -10,53 +10,26 @@ pub const STORAGE_DEPOSIT_AMOUNT: u128 = 1_250_000_000_000_000_000_000;
 pub const FT_TRANSFER_GAS_PER_ACTION: u64 = 3_000_000_000_000;
 pub const STORAGE_DEPOSIT_GAS_PER_ACTION: u64 = 5_000_000_000_000;
 pub const DEFAULT_BATCH_LINGER_MS: u64 = 20;
-pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 200;
-pub const DEFAULT_MAX_TRANSFER_WORKERS: usize = 1;
-pub const DEFAULT_MAX_REGISTRATION_WORKERS: usize = 1;
-pub const DEFAULT_MAX_VERIFICATION_WORKERS: usize = 1;
+pub const DEFAULT_TRANSFER_WORKERS: usize = 1;
+pub const DEFAULT_REGISTRATION_WORKERS: usize = 1;
+pub const DEFAULT_VERIFICATION_WORKERS: usize = 1;
 
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
-pub const DEFAULT_REDIS_STREAM_KEY: &str = "ftrelay:pending";
-pub const DEFAULT_REDIS_CONSUMER_GROUP: &str = "ftrelay:batcher";
-pub const DEFAULT_REDIS_REGISTRATION_STREAM_KEY: &str = "ftrelay:registrations";
-pub const DEFAULT_REDIS_REGISTRATION_CONSUMER_GROUP: &str = "ftrelay:registration_worker";
 
 #[derive(Debug, Clone)]
 pub struct RedisSettings {
     pub url: String,
-    pub stream_key: String,
-    pub consumer_group: String,
-    pub registration_stream_key: String,
-    pub registration_consumer_group: String,
 }
 
 impl RedisSettings {
-    pub fn new(
-        url: impl Into<String>,
-        stream_key: impl Into<String>,
-        consumer_group: impl Into<String>,
-        registration_stream_key: impl Into<String>,
-        registration_consumer_group: impl Into<String>,
-    ) -> Self {
-        Self {
-            url: url.into(),
-            stream_key: stream_key.into(),
-            consumer_group: consumer_group.into(),
-            registration_stream_key: registration_stream_key.into(),
-            registration_consumer_group: registration_consumer_group.into(),
-        }
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
     }
 }
 
 impl Default for RedisSettings {
     fn default() -> Self {
-        Self {
-            url: DEFAULT_REDIS_URL.to_string(),
-            stream_key: DEFAULT_REDIS_STREAM_KEY.to_string(),
-            consumer_group: DEFAULT_REDIS_CONSUMER_GROUP.to_string(),
-            registration_stream_key: DEFAULT_REDIS_REGISTRATION_STREAM_KEY.to_string(),
-            registration_consumer_group: DEFAULT_REDIS_REGISTRATION_CONSUMER_GROUP.to_string(),
-        }
+        Self::new(DEFAULT_REDIS_URL)
     }
 }
 
@@ -67,11 +40,9 @@ pub struct RelayConfig {
     pub secret_keys: Vec<String>,
     pub rpc_url: String,
     pub batch_linger_ms: u64,
-    pub batch_submit_delay_ms: u64,
-    pub max_inflight_batches: usize,
-    pub max_workers: usize,
-    pub max_registration_workers: usize,
-    pub max_verification_workers: usize,
+    pub transfer_workers: usize,
+    pub registration_workers: usize,
+    pub verification_workers: usize,
     pub bind_addr: String,
     pub redis: RedisSettings,
 }
@@ -106,27 +77,15 @@ pub struct RelayConfigBuilder {
     #[serde(default)]
     batch_linger_ms: Option<u64>,
     #[serde(default)]
-    batch_submit_delay_ms: Option<u64>,
+    transfer_workers: Option<usize>,
     #[serde(default)]
-    max_inflight_batches: Option<usize>,
+    registration_workers: Option<usize>,
     #[serde(default)]
-    max_workers: Option<usize>,
-    #[serde(default)]
-    max_registration_workers: Option<usize>,
-    #[serde(default)]
-    max_verification_workers: Option<usize>,
+    verification_workers: Option<usize>,
     #[serde(default)]
     bind_addr: Option<String>,
     #[serde(default)]
     redis_url: Option<String>,
-    #[serde(default)]
-    redis_stream_key: Option<String>,
-    #[serde(default)]
-    redis_consumer_group: Option<String>,
-    #[serde(default)]
-    redis_registration_stream_key: Option<String>,
-    #[serde(default)]
-    redis_registration_consumer_group: Option<String>,
 }
 
 impl RelayConfigBuilder {
@@ -155,14 +114,6 @@ impl RelayConfigBuilder {
         let redis = RedisSettings::new(
             self.redis_url
                 .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
-            self.redis_stream_key
-                .unwrap_or_else(|| DEFAULT_REDIS_STREAM_KEY.to_string()),
-            self.redis_consumer_group
-                .unwrap_or_else(|| DEFAULT_REDIS_CONSUMER_GROUP.to_string()),
-            self.redis_registration_stream_key
-                .unwrap_or_else(|| DEFAULT_REDIS_REGISTRATION_STREAM_KEY.to_string()),
-            self.redis_registration_consumer_group
-                .unwrap_or_else(|| DEFAULT_REDIS_REGISTRATION_CONSUMER_GROUP.to_string()),
         );
 
         Ok(RelayConfig {
@@ -171,17 +122,13 @@ impl RelayConfigBuilder {
             secret_keys,
             rpc_url: self.rpc_url,
             batch_linger_ms: self.batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
-            batch_submit_delay_ms: self.batch_submit_delay_ms.unwrap_or(0),
-            max_inflight_batches: self
-                .max_inflight_batches
-                .unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
-            max_workers: self.max_workers.unwrap_or(DEFAULT_MAX_TRANSFER_WORKERS),
-            max_registration_workers: self
-                .max_registration_workers
-                .unwrap_or(DEFAULT_MAX_REGISTRATION_WORKERS),
-            max_verification_workers: self
-                .max_verification_workers
-                .unwrap_or(DEFAULT_MAX_VERIFICATION_WORKERS),
+            transfer_workers: self.transfer_workers.unwrap_or(DEFAULT_TRANSFER_WORKERS),
+            registration_workers: self
+                .registration_workers
+                .unwrap_or(DEFAULT_REGISTRATION_WORKERS),
+            verification_workers: self
+                .verification_workers
+                .unwrap_or(DEFAULT_VERIFICATION_WORKERS),
             bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
             redis,
         })

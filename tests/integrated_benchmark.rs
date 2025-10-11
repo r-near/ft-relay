@@ -6,7 +6,7 @@
 /// 3. Starts the relay API server (with registration workers)
 /// 4. Runs benchmark with actual FT transfers
 /// 5. Verifies balances changed correctly (registration happens automatically)
-use ft_relay::{RedisSettings, RelayConfig};
+use ft_relay::RelayConfig;
 use near_crypto::SecretKey;
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::{
@@ -15,29 +15,19 @@ use near_jsonrpc_primitives::types::{
 use near_primitives::account::AccessKeyPermission;
 use near_primitives::action::{Action, AddKeyAction, DeployContractAction, FunctionCallAction};
 use near_primitives::transaction::{SignedTransaction, Transaction, TransactionV0};
-use near_primitives::types::{BlockReference, Finality};
+use near_primitives::types::{AccountId, BlockReference, Finality};
 use near_primitives::views::TxExecutionStatus;
 use near_sandbox::{GenesisAccount, Sandbox, SandboxConfig};
 use serde_json::json;
-use std::error::Error;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod common;
+use common::{
+    flush_redis, print_benchmark_summary, redis_settings_from_env, run_benchmark, BenchmarkPlan,
+};
 
 const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
 const YOCTO_PER_TRANSFER: u128 = 1_000_000_000_000_000_000;
-
-/// Flush Redis before test
-async fn flush_redis() -> Result<(), Box<dyn std::error::Error>> {
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    println!("Flushing Redis at {}...", redis_url);
-    let redis_client = redis::Client::open(redis_url)?;
-    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
-    redis::cmd("FLUSHALL")
-        .query_async::<()>(&mut redis_conn)
-        .await?;
-    println!("✅ Redis flushed");
-    Ok(())
-}
 
 /// Deploy and initialize the FT contract
 async fn setup_ft_contract(
@@ -136,12 +126,13 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     .is_test(true)
     .try_init()
     .ok();
-    flush_redis().await?;
-
-    println!("\n╔════════════════════════════════════════════════════════════╗");
-    println!("║  BOUNTY REQUIREMENT TEST: 60,000 Transfers in 10 Minutes  ║");
-    println!("║  Target: ≥100 transfers/second sustained for 10 minutes   ║");
-    println!("╚════════════════════════════════════════════════════════════╝\n");
+    let redis_settings = redis_settings_from_env();
+    let redis_url = redis_settings.url.clone();
+    flush_redis(&redis_url).await?;
+    println!(
+        "Starting sandbox benchmark: {} transfers (concurrency {})",
+        60_000, 100
+    );
 
     // Start sandbox with multiple receivers
     let ft_owner = GenesisAccount::generate_with_name("ft.sandbox".parse()?);
@@ -166,11 +157,11 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     })
     .await?;
 
-    println!("✅ Sandbox started at {}", sandbox.rpc_addr);
+    println!("Sandbox started at {}", sandbox.rpc_addr);
 
     // Deploy and setup
     setup_ft_contract(&sandbox, &ft_owner).await?;
-    println!("✅ FT contract deployed and initialized");
+    println!("FT contract deployed and initialized");
 
     // Generate multiple access keys for better throughput (real-world usage pattern)
     println!("\nGenerating 75 access keys for key pooling...");
@@ -241,7 +232,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     if let Some(outcome) = response.final_execution_outcome {
         match outcome.into_outcome().status {
             near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
-                println!("  ✅ All keys added successfully in batch");
+                println!("  All keys added successfully in batch");
                 // Add all new keys to the pool
                 for key in new_keys {
                     secret_keys.push(key.to_string());
@@ -256,597 +247,59 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
     }
 
     println!(
-        "✅ All {} access keys configured and verified",
+        "All {} access keys configured and verified",
         secret_keys.len()
     );
 
-    // Start relay server with optimized config for high throughput
-    let redis = test_redis_settings();
+    let receiver_ids: Vec<AccountId> = receivers
+        .iter()
+        .map(|receiver| receiver.account_id.clone())
+        .collect();
 
-    let config = RelayConfig {
+    let relay_config = RelayConfig {
         token: ft_owner.account_id.to_string(),
         account_id: ft_owner.account_id.to_string(),
         secret_keys,
         rpc_url: sandbox.rpc_addr.clone(),
-        batch_linger_ms: 100, // Fast batching (100ms is enough with high load)
-        batch_submit_delay_ms: 0, // No throttling needed for sandbox
-        max_inflight_batches: 1000, // High concurrency
-        max_workers: 30,      // 30 transfer workers
-        max_registration_workers: 1, // 1 registration worker (serial registration)
-        max_verification_workers: 10, // 10 verification workers
+        batch_linger_ms: 100,
+        transfer_workers: 30,
+        registration_workers: 1,
+        verification_workers: 10,
         bind_addr: "127.0.0.1:18082".to_string(),
-        redis,
+        redis: redis_settings.clone(),
     };
 
-    println!("\nServer Configuration:");
-    println!("  Batch linger: {}ms", config.batch_linger_ms);
-    println!("  Max inflight batches: {}", config.max_inflight_batches);
-    println!("  Access keys: {}", config.secret_keys.len());
-    println!(
-        "  Registration workers: {}",
-        config.max_registration_workers
-    );
-    println!("  Transfer workers: {}", config.max_workers);
-    println!(
-        "  Verification workers: {}",
-        config.max_verification_workers
-    );
+    let plan = BenchmarkPlan::new(
+        "sandbox_60k",
+        relay_config,
+        redis_url.clone(),
+        "ftrelay:sandbox",
+        60_000,
+        receiver_ids.clone(),
+        ft_owner.account_id.clone(),
+        sandbox.rpc_addr.clone(),
+        "1000000000000000000",
+        YOCTO_PER_TRANSFER,
+    )
+    .with_concurrency(100)
+    .with_min_throughput(100.0)
+    .with_max_duration(Duration::from_secs(600))
+    .with_polling(Duration::from_secs(3), 60);
 
-    let server_handle = tokio::spawn(async move {
-        match ft_relay::run(config).await {
-            Ok(_) => println!("Server exited normally"),
-            Err(e) => {
-                eprintln!("\n❌ Relay server error: {:?}", e);
-                panic!("Server failed: {:?}", e);
-            }
-        }
-    });
+    let outcome = run_benchmark(plan).await?;
 
-    // Wait for server to be ready with health check
-    let client = reqwest::Client::new();
-    println!("Waiting for server to be ready...");
-    for attempt in 1..=10 {
-        match client.get("http://127.0.0.1:18082/health").send().await {
-            Ok(r) if r.status().is_success() => {
-                println!("✅ Server is ready (attempt {})\n", attempt);
-                break;
-            }
-            _ if attempt < 10 => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            _ => {
-                panic!("Server health check failed after 10 attempts");
-            }
-        }
-    }
-
-    // Send 60,000 transfer requests
-    let total_requests = 60_000;
-    let concurrent_workers = 100; // Number of parallel HTTP workers (reduced to avoid overwhelming server)
-
-    println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║  Starting benchmark: {} transfers", total_requests);
-    println!("║  Concurrent HTTP workers: {}", concurrent_workers);
-    println!("╚════════════════════════════════════════════════════════════╝\n");
-
-    println!("[PHASE_MARKER] phase=http_load_start");
-
-    let api_start = Instant::now();
-    let mut tasks = Vec::new();
-    let batch_size = total_requests / concurrent_workers;
-
-    for worker_id in 0..concurrent_workers {
-        let client = client.clone();
-        let receivers = receivers.clone();
-        let start_idx = worker_id * batch_size;
-        let end_idx = if worker_id == concurrent_workers - 1 {
-            total_requests
-        } else {
-            start_idx + batch_size
-        };
-
-        let api_started_at = api_start;
-        let task = tokio::spawn(async move {
-            let mut worker_success = 0;
-            let mut worker_errors = 0;
-            for i in start_idx..end_idx {
-                if worker_id == 0 && i % 1000 == 0 {
-                    println!(
-                        "Worker {} at request {}/{}",
-                        worker_id,
-                        i - start_idx,
-                        end_idx - start_idx
-                    );
-                }
-                let receiver_id = receivers[i % receiver_count].account_id.clone();
-
-                // Generate unique idempotency key for this request
-                let idempotency_key = uuid::Uuid::new_v4().to_string();
-
-                match client
-                    .post("http://127.0.0.1:18082/v1/transfer")
-                    .header("X-Idempotency-Key", &idempotency_key)
-                    .json(&json!({
-                        "receiver_id": receiver_id,
-                        "amount": "1000000000000000000" // 1 token each
-                    }))
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => worker_success += 1,
-                    Ok(r) => {
-                        if worker_id == 0 && worker_success == 0 {
-                            eprintln!(
-                                "❌ Worker {} request failed with status {}: {:?}",
-                                worker_id,
-                                r.status(),
-                                r.text().await
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        worker_errors += 1;
-                        if worker_id == 0 && worker_errors < 5 {
-                            eprintln!("❌ Worker {} request error: {:?}", worker_id, e);
-                            if let Some(source) = e.source() {
-                                eprintln!("   Caused by: {:?}", source);
-                            }
-                        }
-                    }
-                }
-
-                // Print progress every 10k requests
-                if i > 0 && i % 10_000 == 0 && worker_id == 0 {
-                    let elapsed = api_started_at.elapsed();
-                    let current_rate = i as f64 / elapsed.as_secs_f64();
-                    println!(
-                        "  Progress: {} requests in {:?} ({:.1} req/sec)",
-                        i, elapsed, current_rate
-                    );
-                }
-            }
-            (worker_success, worker_errors)
-        });
-        tasks.push(task);
-    }
-
-    let mut total_success = 0;
-    let mut total_errors = 0;
-    for task in tasks {
-        let (success, errors) = task.await.unwrap_or((0, 0));
-        total_success += success;
-        total_errors += errors;
-    }
-
-    let api_end = Instant::now();
-    println!("[PHASE_MARKER] phase=http_load_end");
-
-    let api_elapsed = api_end
-        .checked_duration_since(api_start)
-        .unwrap_or_else(|| Duration::from_secs(0));
-    let api_duration_secs = api_elapsed.as_secs_f64();
-    let api_throughput = if api_duration_secs > 0.0 {
-        total_success as f64 / api_duration_secs
+    let expected_per_receiver = if receiver_ids.is_empty() {
+        0
     } else {
-        0.0
+        (outcome.http.accepted / receiver_ids.len()) as u128 * YOCTO_PER_TRANSFER
     };
 
-    println!("\n╔════════════════════════════════════════════════════════════╗");
-    println!("║  HTTP REQUEST RESULTS                                      ║");
-    println!("╚════════════════════════════════════════════════════════════╝");
-    println!("  Total requests:  {}", total_requests);
-    println!("  Accepted:        {}", total_success);
-    println!("  Errors:          {}", total_errors);
-    println!(
-        "  Other:           {}",
-        total_requests - total_success - total_errors
+    print_benchmark_summary(
+        "sandbox_60k",
+        &outcome,
+        Some(expected_per_receiver),
+        YOCTO_PER_TRANSFER,
     );
-    println!("  API duration:    {:.2}s", api_duration_secs);
-    println!("  API throughput:  {:.2} req/sec", api_throughput);
-    println!("  Target:          ≥100 req/sec");
-
-    if api_throughput >= 100.0 {
-        println!("  Status:          ✅ PASSED");
-    } else {
-        println!("  Status:          ❌ FAILED");
-    }
-
-    // Check if server is still running
-    if server_handle.is_finished() {
-        panic!("❌ Server task died during benchmark!");
-    }
-
-    // Verify Redis recorded a TransferState for every accepted HTTP request
-    println!("\n╔════════════════════════════════════════════════════════════╗");
-    println!("║  REDIS QUEUE VERIFICATION                                  ║");
-    println!("╚════════════════════════════════════════════════════════════╝");
-    println!("  Verifying transfer state keys match HTTP 200 responses...");
-
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let redis_client = redis::Client::open(redis_url)?;
-    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
-
-    // Poll using SCAN to count `transfer:*` state keys (exclude `:ev` event lists)
-    let mut prev_count = 0u64;
-    let mut stable_count = 0;
-    let expected = total_success as u64;
-
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let mut cursor: u64 = 0;
-        let mut state_count: u64 = 0;
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg("transfer:*")
-                .arg("COUNT")
-                .arg(2000)
-                .query_async(&mut redis_conn)
-                .await?;
-
-            state_count += keys.iter().filter(|k| !k.ends_with(":ev")).count() as u64;
-
-            cursor = next_cursor;
-            if cursor == 0 {
-                break;
-            }
-        }
-
-        if state_count == prev_count {
-            stable_count += 1;
-            if stable_count >= 3 {
-                println!("  Count stabilized at {} keys", state_count);
-                break;
-            }
-        } else {
-            stable_count = 0;
-        }
-        prev_count = state_count;
-
-        if state_count >= expected {
-            println!("  All {} transfer states observed!", expected);
-            break;
-        }
-    }
-
-    // Final count
-    let mut cursor: u64 = 0;
-    let mut final_count: u64 = 0;
-    loop {
-        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg("transfer:*")
-            .arg("COUNT")
-            .arg(2000)
-            .query_async(&mut redis_conn)
-            .await?;
-
-        final_count += keys.iter().filter(|k| !k.ends_with(":ev")).count() as u64;
-
-        cursor = next_cursor;
-        if cursor == 0 {
-            break;
-        }
-    }
-
-    println!("  HTTP 200 responses:     {}", total_success);
-    println!("  Transfer state keys:    {}", final_count);
-
-    if final_count != expected {
-        println!("  Status:                 ❌ MISMATCH");
-        panic!(
-            "❌ Redis verification failed: {} HTTP requests accepted but only {} transfer states stored (lost {})",
-            total_success,
-            final_count,
-            expected.saturating_sub(final_count)
-        );
-    } else {
-        println!("  Status:                 ✅ VERIFIED");
-    }
-
-    // Wait for transfer worker to finish processing
-    println!("\n⏳ Waiting for transfer worker to finish...");
-    let xfer_stream = "ftrelay:sandbox:xfer";
-    let xfer_group = "ftrelay:sandbox:xfer_workers";
-
-    for _ in 0..240 {
-        // up to ~120s at 500ms interval
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Check consumer group pending count (this is what actually matters)
-        // Note: XLEN returns total stream size (including processed messages), not pending count
-        let mut group_pending: u64 = 0;
-        if let Ok(redis::Value::Array(items)) = redis::cmd("XINFO")
-            .arg("GROUPS")
-            .arg(xfer_stream)
-            .query_async::<redis::Value>(&mut redis_conn)
-            .await
-        {
-            for grp in items {
-                if let redis::Value::Array(kv) = grp {
-                        let mut name: Option<String> = None;
-                        let mut pending: Option<u64> = None;
-                        let mut i = 0;
-                        while i + 1 < kv.len() {
-                            let key = &kv[i];
-                            let val = &kv[i + 1];
-                            if let redis::Value::BulkString(k) = key {
-                                if k == b"name" {
-                                    if let redis::Value::BulkString(v) = val {
-                                        name = std::str::from_utf8(v).ok().map(|s| s.to_string());
-                                    }
-                                } else if k == b"pending" {
-                                    if let redis::Value::Int(v) = val {
-                                        pending = Some(*v as u64);
-                                    }
-                                }
-                            }
-                            i += 2;
-                        }
-                    if let (Some(n), Some(p)) = (name, pending) {
-                        if n == xfer_group {
-                            group_pending = p;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if group_pending == 0 {
-            println!("  ✅ Transfer queue drained");
-            break;
-        }
-    }
-
-    println!("\n⏳ Waiting for NEAR to finalize balances...");
-
-    let client = JsonRpcClient::connect(&sandbox.rpc_addr);
-
-    let expected_total = total_requests as u128 * YOCTO_PER_TRANSFER;
-    let poll_interval = Duration::from_secs(3);
-    let max_polls = 60; // ~3 minutes max wait
-
-    let mut final_balances = Vec::new();
-    let mut final_total: u128 = 0;
-    let mut final_success_rate = 0.0;
-    let mut completion_instant: Option<Instant> = None;
-
-    for poll in 1..=max_polls {
-        let mut balances = Vec::with_capacity(receiver_count);
-        let mut total_balance: u128 = 0;
-
-        for receiver in &receivers {
-            let balance_args = json!({
-                "account_id": receiver.account_id
-            })
-            .to_string()
-            .into_bytes();
-
-            let call_request = methods::query::RpcQueryRequest {
-                block_reference: BlockReference::Finality(Finality::Final),
-                request: near_primitives::views::QueryRequest::CallFunction {
-                    account_id: ft_owner.account_id.clone(),
-                    method_name: "ft_balance_of".to_string(),
-                    args: near_primitives::types::FunctionArgs::from(balance_args),
-                },
-            };
-
-            let response = client.call(call_request).await?;
-            let balance: u128 = match response.kind {
-                QueryResponseKind::CallResult(result) => {
-                    let balance_str: String = serde_json::from_slice(&result.result)?;
-                    balance_str.parse().unwrap_or(0)
-                }
-                _ => 0,
-            };
-
-            total_balance += balance;
-            balances.push(balance);
-        }
-
-        final_success_rate = (total_balance as f64 / expected_total as f64) * 100.0;
-
-        println!(
-            "  Poll {}: {} tokens ({:.2}% complete)",
-            poll,
-            total_balance / YOCTO_PER_TRANSFER,
-            final_success_rate
-        );
-
-        if total_balance >= expected_total {
-            println!(
-                "  ✅ Target reached after {} polls (~{}s)",
-                poll,
-                poll * poll_interval.as_secs()
-            );
-            final_balances = balances;
-            final_total = total_balance;
-            completion_instant = Some(Instant::now());
-            break;
-        }
-
-        if poll == max_polls {
-            println!(
-                "  ⚠️  Reached polling cap (~{}s); proceeding with current totals",
-                poll * poll_interval.as_secs()
-            );
-            final_balances = balances;
-            final_total = total_balance;
-            completion_instant = Some(Instant::now());
-            break;
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    let expected_per_receiver = (total_requests / receiver_count) as u128 * YOCTO_PER_TRANSFER;
-
-    let completion_instant = completion_instant.unwrap_or_else(Instant::now);
-    let onchain_elapsed = completion_instant
-        .checked_duration_since(api_start)
-        .unwrap_or_else(|| Duration::from_secs(0));
-    let onchain_duration_secs = onchain_elapsed.as_secs_f64();
-    let post_api_elapsed = completion_instant
-        .checked_duration_since(api_end)
-        .unwrap_or_else(|| Duration::from_secs(0));
-    let post_api_duration_secs = post_api_elapsed.as_secs_f64();
-    let completed_transfers = (final_total / YOCTO_PER_TRANSFER) as usize;
-    let blockchain_throughput = if onchain_duration_secs > 0.0 {
-        completed_transfers as f64 / onchain_duration_secs
-    } else {
-        0.0
-    };
-    let settlement_throughput = if post_api_duration_secs > 0.0 {
-        completed_transfers as f64 / post_api_duration_secs
-    } else {
-        0.0
-    };
-
-    println!("\n╔════════════════════════════════════════════════════════════╗");
-    println!(
-        "║  ON-CHAIN VERIFICATION (all {} receivers)               ║",
-        receiver_count
-    );
-    println!("╚════════════════════════════════════════════════════════════╝");
-    println!(
-        "  Expected total:     {} tokens",
-        expected_total / YOCTO_PER_TRANSFER
-    );
-    println!(
-        "  Actual total:       {} tokens",
-        final_total / YOCTO_PER_TRANSFER
-    );
-    println!("  Success rate:       {:.2}%", final_success_rate);
-    println!(
-        "  Blockchain time:    {:.2}s (from first request)",
-        onchain_duration_secs
-    );
-    println!(
-        "  Settlement lag:     {:.2}s after API completion",
-        post_api_duration_secs
-    );
-    println!(
-        "  Blockchain throughput {:.2} tx/sec (completed)",
-        blockchain_throughput
-    );
-    if post_api_duration_secs > 0.0 {
-        println!("  Post-API throughput {:.2} tx/sec", settlement_throughput);
-    }
-
-    println!("\n  Receiver breakdown:");
-    for (idx, (receiver, balance)) in receivers.iter().zip(final_balances.iter()).enumerate() {
-        println!(
-            "    {:>2}: {:<20} {} tokens (expected: {})",
-            idx,
-            receiver.account_id,
-            balance / YOCTO_PER_TRANSFER,
-            expected_per_receiver / YOCTO_PER_TRANSFER
-        );
-    }
-
-    println!("\n╔════════════════════════════════════════════════════════════╗");
-    println!("║  FINAL BOUNTY REQUIREMENT CHECK                            ║");
-    println!("╚════════════════════════════════════════════════════════════╝");
-    println!("  ✓ Total transfers:   {} / 60,000", total_success);
-    println!(
-        "  ✓ API throughput:    {:.2} / ≥100 req/sec",
-        api_throughput
-    );
-    println!(
-        "  ✓ API duration:      {:.2}s / ≤600s (10 min)",
-        api_duration_secs
-    );
-    println!(
-        "  - On-chain throughput {:.2} tx/sec",
-        blockchain_throughput
-    );
-    let http_success_rate = (total_success as f64 / total_requests as f64) * 100.0;
-    println!("  ✓ HTTP success:      {:.2}%", http_success_rate);
-    println!("  ✓ On-chain success:  {:.2}%", final_success_rate);
-
-    // Assert bounty requirements
-    assert!(
-        total_success >= 60_000,
-        "❌ Failed: Only {} of 60,000 requests accepted",
-        total_success
-    );
-
-    assert!(
-        api_throughput >= 100.0,
-        "❌ Failed: Throughput {:.2} req/sec is below 100 req/sec requirement",
-        api_throughput
-    );
-
-    assert!(
-        api_elapsed.as_secs() <= 600,
-        "❌ Failed: Took {:.2}s, should complete within 600s (10 minutes)",
-        api_duration_secs
-    );
-
-    assert!(
-        final_success_rate >= 100.0,
-        "❌ Failed: Only {:.2}% of transactions confirmed on-chain (expected 100%)",
-        final_success_rate
-    );
-
-    println!("\n🎉 ╔════════════════════════════════════════════════════════════╗");
-    println!("   ║  BOUNTY REQUIREMENTS: ✅ PASSED                            ║");
-    println!(
-        "   ║  Successfully handled 60,000 transfers at {:.0}+ req/sec     ║",
-        api_throughput
-    );
-    println!("   ║  All requirements satisfied!                               ║");
-    println!("   ╚════════════════════════════════════════════════════════════╝");
-
-    // Emit benchmark results in parseable format for CI
-    println!("\n--- BENCHMARK RESULTS (SANDBOX) ---");
-    println!("test_name: test_bounty_requirement_60k");
-    println!("transfers: {}", total_requests);
-    println!("api_duration_secs: {:.2}", api_duration_secs);
-    println!("duration_secs: {:.2}", api_duration_secs);
-    println!("throughput_req_per_sec: {:.2}", api_throughput);
-    println!("blockchain_completion_secs: {:.2}", onchain_duration_secs);
-    println!(
-        "blockchain_throughput_req_per_sec: {:.2}",
-        blockchain_throughput
-    );
-    println!("http_success_rate: {:.2}", http_success_rate);
-    println!("onchain_success_rate: {:.2}", final_success_rate);
-    println!("status: PASSED");
-    println!("--- END BENCHMARK RESULTS ---");
-
-    // Print RPC stats collected in Redis
-    println!("\n╔════════════════════════════════════════════════════════════╗");
-    println!("║  RPC STATS                                                 ║");
-    println!("╚════════════════════════════════════════════════════════════╝");
-    let stats_key = "ftrelay:sandbox:rpc_stats";
-    let stats: Vec<(String, i64)> = redis::cmd("HGETALL")
-        .arg(stats_key)
-        .query_async(&mut redis_conn)
-        .await
-        .unwrap_or_default();
-    if stats.is_empty() {
-        println!("  (no RPC stats recorded)");
-    } else {
-        for (method, count) in stats {
-            println!("  {:<28} {}", method, count);
-        }
-    }
 
     Ok(())
-}
-fn test_redis_settings() -> RedisSettings {
-    RedisSettings::new(
-        "redis://127.0.0.1:6379",
-        "unused", // Old stream names not used anymore
-        "unused",
-        "unused",
-        "unused",
-    )
 }

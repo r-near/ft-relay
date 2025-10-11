@@ -1,7 +1,7 @@
+use ::redis::aio::ConnectionManager;
+use ::redis::AsyncCommands;
 use anyhow::Result;
 use log::debug;
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
 
 #[derive(Clone)]
 pub struct NonceManager {
@@ -22,7 +22,7 @@ impl NonceManager {
     pub async fn initialize_nonce(&mut self, key_id: &str, initial_nonce: u64) -> Result<()> {
         let nonce_key = format!("nonce:{}", key_id);
 
-        let set: bool = redis::cmd("SET")
+        let set: bool = ::redis::cmd("SET")
             .arg(&nonce_key)
             .arg(initial_nonce)
             .arg("NX")

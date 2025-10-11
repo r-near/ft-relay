@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ft_relay::redis::streams;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +64,7 @@ async fn test_pop_batch_full_batch_immediate() -> Result<()> {
     create_consumer_group(&mut conn, stream_key, group).await?;
 
     // Pop batch with max=100, should get all immediately
-    let batch: Vec<(String, TestMessage)> = ft_relay::redis_helpers::pop_batch(
+    let batch: Vec<(String, TestMessage)> = streams::pop_batch(
         &mut conn, stream_key, group, consumer, 100, 1000, // 1 second linger
     )
     .await?;
@@ -97,7 +98,7 @@ async fn test_pop_batch_partial_with_linger() -> Result<()> {
     let start = std::time::Instant::now();
 
     // Pop batch with max=100, should get 10 after lingering
-    let batch: Vec<(String, TestMessage)> = ft_relay::redis_helpers::pop_batch(
+    let batch: Vec<(String, TestMessage)> = streams::pop_batch(
         &mut conn, stream_key, group, consumer, 100, 500, // 500ms linger
     )
     .await?;
@@ -152,8 +153,7 @@ async fn test_pop_batch_accumulates_during_linger() -> Result<()> {
     // Pop batch with max=100, linger=500ms
     // Should get 10 initially, then accumulate the 20 that arrive during linger
     let batch: Vec<(String, TestMessage)> =
-        ft_relay::redis_helpers::pop_batch(&mut conn, stream_key, group, consumer, 100, 500)
-            .await?;
+        streams::pop_batch(&mut conn, stream_key, group, consumer, 100, 500).await?;
 
     let elapsed = start.elapsed();
 

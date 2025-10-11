@@ -1,6 +1,6 @@
+use ::redis::aio::ConnectionManager;
 use anyhow::Result;
 use log::{debug, warn};
-use redis::aio::ConnectionManager;
 use uuid::Uuid;
 
 use crate::types::AccessKey;
@@ -26,7 +26,7 @@ impl AccessKeyPool {
             let token = Uuid::new_v4().to_string();
 
             let mut conn = self.redis.clone();
-            let acquired: bool = redis::cmd("SET")
+            let acquired: bool = ::redis::cmd("SET")
                 .arg(&lease_key)
                 .arg(&token)
                 .arg("NX")
@@ -74,7 +74,7 @@ impl Drop for LeasedKey {
                 end
             "#;
 
-            let result: Result<i32, _> = redis::Script::new(script)
+            let result: Result<i32, _> = ::redis::Script::new(script)
                 .key(&lease_key)
                 .arg(&token)
                 .invoke_async(&mut redis)

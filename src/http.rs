@@ -1,3 +1,5 @@
+use ::redis::aio::ConnectionManager as RedisConnectionManager;
+use ::redis::AsyncCommands;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -5,10 +7,9 @@ use axum::{
     Json, Router,
 };
 use log::warn;
-use redis::AsyncCommands;
 use serde_json::json;
 
-use crate::redis_helpers as rh;
+use crate::redis::{accounts, events, keys, state, transfers};
 use crate::types::{
     AccountId, ErrorResponse, Event, RegistrationMessage, Status, TransferRequest,
     TransferResponse, TransferState,
@@ -16,15 +17,11 @@ use crate::types::{
 
 #[derive(Clone)]
 struct AppState {
-    redis_conn: redis::aio::ConnectionManager,
+    redis_conn: RedisConnectionManager,
     env: String,
 }
 
-pub fn build_router(
-    redis_conn: redis::aio::ConnectionManager,
-    env: String,
-    _token: AccountId,
-) -> Router {
+pub fn build_router(redis_conn: RedisConnectionManager, env: String, _token: AccountId) -> Router {
     let state = AppState { redis_conn, env };
 
     Router::new()
@@ -39,7 +36,6 @@ async fn create_transfer(
     headers: HeaderMap,
     Json(body): Json<TransferRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
-
     // Extract idempotency key
     let idempotency_key = headers
         .get("X-Idempotency-Key")
@@ -87,7 +83,7 @@ async fn create_transfer(
     );
 
     // Store transfer state (needed by workers)
-    rh::store_transfer_state(&mut conn, &transfer)
+    state::store_transfer_state(&mut conn, &transfer)
         .await
         .map_err(|e| {
             warn!("Failed to store transfer state: {:?}", e);
@@ -100,7 +96,7 @@ async fn create_transfer(
         })?;
 
     // Log RECEIVED event
-    rh::log_event(&mut conn, &transfer_id, Event::new("RECEIVED"))
+    events::log_event(&mut conn, &transfer_id, Event::new("RECEIVED"))
         .await
         .map_err(|e| {
             warn!("Failed to log event: {:?}", e);
@@ -113,7 +109,7 @@ async fn create_transfer(
         })?;
 
     // Check if receiver is already registered (fast path)
-    let is_registered = rh::is_account_registered(&mut conn, &body.receiver_id)
+    let is_registered = accounts::is_account_registered(&mut conn, &body.receiver_id)
         .await
         .map_err(|e| {
             warn!("Failed to check registration: {:?}", e);
@@ -127,7 +123,7 @@ async fn create_transfer(
 
     let status = if is_registered {
         // Already registered - skip registration queue, go directly to transfer
-        rh::enqueue_transfer(&mut conn, &state.env, &transfer_id, 0)
+        transfers::enqueue_transfer(&mut conn, &state.env, &transfer_id, 0)
             .await
             .map_err(|e| {
                 warn!("Failed to enqueue transfer: {:?}", e);
@@ -138,7 +134,7 @@ async fn create_transfer(
                     }),
                 )
             })?;
-        rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_TRANSFER"))
+        events::log_event(&mut conn, &transfer_id, Event::new("QUEUED_TRANSFER"))
             .await
             .map_err(|e| {
                 warn!("Failed to log event: {:?}", e);
@@ -153,7 +149,7 @@ async fn create_transfer(
     } else {
         // Not registered - atomically add transfer to waiting list and check if first
         // Lua script ensures no race conditions!
-        let is_first_request = rh::add_transfer_waiting_for_registration(
+        let is_first_request = accounts::add_transfer_waiting_for_registration(
             &mut conn,
             &body.receiver_id,
             &transfer_id,
@@ -185,9 +181,9 @@ async fn create_transfer(
                 )
             })?;
 
-            let stream_key = format!("ftrelay:{}:reg", state.env);
+            let stream_key = keys::registration_stream(&state.env);
             let _: String = conn
-                .xadd(&stream_key, "*", &[("data", serialized)])
+                .xadd(&stream_key, "*", &[("data", serialized.as_str())])
                 .await
                 .map_err(|e| {
                     warn!("Failed to enqueue registration: {:?}", e);
@@ -199,7 +195,7 @@ async fn create_transfer(
                     )
                 })?;
 
-            rh::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
+            events::log_event(&mut conn, &transfer_id, Event::new("QUEUED_REGISTRATION"))
                 .await
                 .map_err(|e| {
                     warn!("Failed to log event: {:?}", e);
@@ -212,7 +208,7 @@ async fn create_transfer(
                 })?;
         } else {
             // Already pending - transfer added to waiting list, will be processed when registration completes
-            rh::log_event(&mut conn, &transfer_id, Event::new("WAITING_REGISTRATION"))
+            events::log_event(&mut conn, &transfer_id, Event::new("WAITING_REGISTRATION"))
                 .await
                 .map_err(|e| {
                     warn!("Failed to log event: {:?}", e);
@@ -251,7 +247,7 @@ async fn get_transfer_status(
 ) -> Result<Json<TransferResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut conn = state.redis_conn.clone();
 
-    let transfer = match rh::get_transfer_state(&mut conn, &id).await {
+    let transfer = match state::get_transfer_state(&mut conn, &id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err((
@@ -272,7 +268,7 @@ async fn get_transfer_status(
         }
     };
 
-    let events = rh::get_events(&mut conn, &id).await.ok();
+    let events = events::get_events(&mut conn, &id).await.ok();
 
     let mut response: TransferResponse = transfer.into();
     response.events = events;
