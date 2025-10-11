@@ -64,37 +64,22 @@ jobs:
       - name: Cargo test (ignored integration and testnet suites)
         env:
           REDIS_URL: redis://localhost:6379
-          TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
+          # Testnet configuration (maps from GitHub secrets)
+          ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+          TOKEN: ${{ secrets.TOKEN }}
+          PRIVATE_KEYS: ${{ secrets.PRIVATE_KEYS }}
+          RPC_URL: ${{ secrets.RPC_URL }}
           RUST_LOG: info,ft_relay=info,near_api=warn,tracing::span=warn
           RUST_BACKTRACE: 1
         run: |
+          set -o pipefail
           cargo test --all --locked -- --ignored --nocapture --test-threads=1 2>&1 | tee benchmark_output.txt
 
       - name: Extract and display benchmark results
         if: always()
         run: |
-          echo "## 📊 Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Extract sandbox benchmark results
-          if grep -q "BENCHMARK RESULTS (SANDBOX)" benchmark_output.txt; then
-            echo "### 🔬 Sandbox (60k transfers)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            sed -n '/--- BENCHMARK RESULTS (SANDBOX) ---/,/--- END BENCHMARK RESULTS ---/p' benchmark_output.txt | grep -v "^---" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Extract testnet benchmark results
-          if grep -q "BENCHMARK RESULTS (TESTNET)" benchmark_output.txt; then
-            echo "### 🌐 Testnet (60k transfers)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            sed -n '/--- BENCHMARK RESULTS (TESTNET) ---/,/--- END BENCHMARK RESULTS ---/p' benchmark_output.txt | grep -v "^---" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # If no benchmarks found, indicate that
-          if ! grep -q "BENCHMARK RESULTS" benchmark_output.txt; then
-            echo "_No benchmark results found (tests may have been skipped or failed)_" >> $GITHUB_STEP_SUMMARY
-          fi
+          python scripts/benchmark_matrix.py benchmark_output.txt || {
+            echo "## Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "No benchmark metrics were captured." >> "$GITHUB_STEP_SUMMARY"
+          }

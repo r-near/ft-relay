@@ -76,19 +76,19 @@ All configuration except the FT contract ID comes from environment variables. Th
 
 | Variable               | Required | Description                                                                                           |
 | ---------------------- | -------- | ----------------------------------------------------------------------------------------------------- |
-| `ACCOUNT_ID`           | ✅       | NEAR account that owns the function-call access keys.                                                 |
-| `PRIVATE_KEYS`         | ✅       | Comma-separated list of ed25519 secret keys (`ed25519:...`). Use multiple keys for higher throughput. |
-| `RPC_URL`              | ✅       | NEAR RPC endpoint (sandbox/testnet/mainnet).                                                          |
-| `BIND_ADDR`            | ❌       | HTTP bind address (`0.0.0.0:8080` by default).                                                        |
-| `BATCH_SIZE`           | ❌       | Max logical transfers per batch (default `90`).                                                       |
-| `BATCH_LINGER_MS`      | ❌       | Max time to wait for a batch to fill (default `20ms`).                                                |
-| `MAX_INFLIGHT_BATCHES` | ❌       | Inflight batch semaphore (default `200`).                                                             |
-| `RUST_LOG`             | ❌       | Standard Rust logging spec (`info,ft_relay=info`).                                                    |
-| `REDIS_URL`            | ❌       | Connection string for Redis (default `redis://127.0.0.1:6379`).                                       |
-| `REDIS_STREAM_KEY`     | ❌       | Stream key for pending transfers (default `ftrelay:pending`).                                        |
-| `REDIS_CONSUMER_GROUP` | ❌       | Consumer group name used by the batch worker (default `ftrelay:batcher`).                             |
+| `ACCOUNT_ID`           | Required | NEAR account that owns the function-call access keys.                                                 |
+| `PRIVATE_KEYS`         | Required | Comma-separated list of ed25519 secret keys (`ed25519:...`). Use multiple keys for higher throughput. |
+| `RPC_URL`              | Required | NEAR RPC endpoint (sandbox/testnet/mainnet).                                                          |
+| `BIND_ADDR`            | Optional | HTTP bind address (`0.0.0.0:8080` by default).                                                        |
+| `BATCH_SIZE`           | Optional | Max logical transfers per batch (default `90`).                                                       |
+| `BATCH_LINGER_MS`      | Optional | Max time to wait for a batch to fill (default `20ms`).                                                |
+| `MAX_INFLIGHT_BATCHES` | Optional | Inflight batch semaphore (default `200`).                                                             |
+| `RUST_LOG`             | Optional | Standard Rust logging spec (`info,ft_relay=info`).                                                    |
+| `REDIS_URL`            | Optional | Connection string for Redis (default `redis://127.0.0.1:6379`).                                       |
+| `REDIS_STREAM_KEY`     | Optional | Stream key for pending transfers (default `ftrelay:pending`).                                        |
+| `REDIS_CONSUMER_GROUP` | Optional | Consumer group name used by the batch worker (default `ftrelay:batcher`).                             |
 
-> ⚠️ Use function-call restricted keys that can only call your FT contract. Never ship full-access secrets in production.
+> Warning: Use function-call restricted keys that can only call your FT contract. Never ship full-access secrets in production.
 
 ---
 
@@ -182,7 +182,7 @@ cargo test --all --locked -- --ignored --nocapture --test-threads=1
 - **Integration tests** – Sandbox-based with real NEAR nodes
 - **Testnet tests** – Live testnet benchmarks (require `TESTNET_RPC_URL` in `.env`)
 
-> ⚠️ Always use `--test-threads=1` to run tests serially and avoid Redis/sandbox conflicts.
+> Warning: Always use `--test-threads=1` to run tests serially and avoid Redis/sandbox conflicts.
 
 ---
 

@@ -1,536 +1,746 @@
-use std::{
-    net::TcpListener,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, ensure, Context, Result};
-use near_api::{Contract, NetworkConfig, RPCEndpoint, Signer, Transaction};
-use near_api_types::{AccountId, NearToken};
-use near_crypto::SecretKey;
-use near_primitives::account::{AccessKey, AccessKeyPermission};
-use near_primitives::action::{
-    Action, AddKeyAction, CreateAccountAction, DeleteAccountAction, DeployContractAction,
-    FunctionCallAction, TransferAction,
-};
-use reqwest::StatusCode;
+use anyhow::{anyhow, ensure, Result};
+use ft_relay::{RedisSettings, RelayConfig};
+use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_primitives::types::{AccountId, BlockReference, Finality};
+use near_primitives::views::QueryRequest;
+use redis::aio::ConnectionManager;
+use redis::Client;
+use reqwest::Client as HttpClient;
 use serde_json::json;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
 
-const FAUCET_URL: &str = "https://helper.nearprotocol.com/account";
-const FT_WASM_PATH: &str = "resources/fungible_token.wasm";
-const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(125);
-const DEFAULT_FAUCET_WAIT: Duration = Duration::from_secs(2);
-const DEFAULT_RECEIVER_DEPOSIT: NearToken = NearToken::from_millinear(500);
-const DEFAULT_BENEFICIARY: &str = "testnet";
-
-static ACCOUNT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone)]
-pub struct OwnerCtx {
-    pub account_id: AccountId,
-    primary_secret: SecretKey,
-    signer_keys: Vec<SecretKey>,
+pub async fn flush_redis(url: &str) -> Result<()> {
+    let client = Client::open(url)?;
+    let mut conn = ConnectionManager::new(client).await?;
+    redis::cmd("FLUSHALL").query_async::<()>(&mut conn).await?;
+    println!("Redis flushed at {}", url);
+    Ok(())
 }
 
-#[derive(Clone)]
-pub struct ReceiverCtx {
-    pub account_id: AccountId,
-    pub secret_key: SecretKey,
+pub fn redis_settings(url: impl Into<String>) -> RedisSettings {
+    RedisSettings::new(url)
 }
 
-pub struct HarnessConfig<'a> {
-    pub label: &'a str,
-    pub receiver_count: usize,
-    pub receiver_deposit: NearToken,
-    pub signer_pool_size: usize,
-    pub faucet_wait: Duration,
+pub fn redis_settings_from_env() -> RedisSettings {
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    redis_settings(url)
 }
 
-impl Default for HarnessConfig<'_> {
-    fn default() -> Self {
-        Self {
-            label: "harness",
-            receiver_count: 1,
-            receiver_deposit: DEFAULT_RECEIVER_DEPOSIT,
-            signer_pool_size: 1,
-            faucet_wait: DEFAULT_FAUCET_WAIT,
+pub struct RelayHandle {
+    join: JoinHandle<()>,
+}
+
+pub async fn spawn_relay(config: RelayConfig) -> RelayHandle {
+    let join = tokio::spawn(async move {
+        if let Err(err) = ft_relay::run(config).await {
+            eprintln!("Relay server error: {err:?}");
+            panic!("Relay server terminated: {:?}", err);
         }
+    });
+    RelayHandle { join }
+}
+
+impl RelayHandle {
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+
+    pub async fn shutdown(self) {
+        self.join.abort();
+        let _ = self.join.await;
     }
 }
 
-pub struct TestnetHarness {
-    pub network: NetworkConfig,
-    pub owner: OwnerCtx,
-    pub receivers: Vec<ReceiverCtx>,
-    pub beneficiary: AccountId,
+pub async fn wait_for_health(base_url: &str, attempts: usize, delay: Duration) -> Result<()> {
+    let client = HttpClient::new();
+    let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+    for attempt in 1..=attempts {
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                println!("Server is ready (attempt {})", attempt);
+                return Ok(());
+            }
+            _ if attempt < attempts => tokio::time::sleep(delay).await,
+            _ => {
+                return Err(anyhow!(
+                    "Server health check failed after {} attempts",
+                    attempts
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct BenchmarkPlan {
+    pub name: &'static str,
+    pub relay_config: RelayConfig,
+    pub redis_url: String,
+    pub redis_namespace: String,
+    pub total_requests: usize,
+    pub concurrency: usize,
+    pub transfer_amount: String,
+    pub receivers: Vec<AccountId>,
+    pub token_account: AccountId,
     pub rpc_url: String,
+    pub yocto_per_transfer: u128,
+    pub min_throughput: f64,
+    pub max_duration: Duration,
+    pub poll_interval: Duration,
+    pub max_polls: usize,
+    pub queue_drain_interval: Duration,
+    pub max_queue_checks: usize,
 }
 
-impl TestnetHarness {
-    pub async fn new(config: HarnessConfig<'_>) -> Result<Self> {
-        ensure!(
-            config.receiver_count > 0,
-            "receiver_count must be greater than zero"
-        );
-        ensure!(
-            config.signer_pool_size >= 1,
-            "signer_pool_size must be at least 1"
-        );
-
-        // Flush Redis before each test
-        if let Ok(redis_url) = std::env::var("REDIS_URL") {
-            println!("Flushing Redis at {}...", redis_url);
-            let client = redis::Client::open(redis_url)?;
-            let mut conn = client.get_multiplexed_async_connection().await?;
-            redis::cmd("FLUSHALL").query_async::<()>(&mut conn).await?;
-            println!("✅ Redis flushed");
-        }
-
-        // Load .env file if present (for local development)
-        // This is OK to fail in CI where env vars are set directly
-        let _ = dotenv::dotenv();
-
-        let rpc_url = std::env::var("TESTNET_RPC_URL")
-            .or_else(|_| std::env::var("RPC_URL"))
-            .context(
-                "Set TESTNET_RPC_URL or RPC_URL in the environment (e.g. via .env) with the authenticated testnet RPC endpoint",
-            )?;
-
-        let beneficiary: AccountId = DEFAULT_BENEFICIARY
-            .parse()
-            .context("default beneficiary account id should be valid")?;
-
-        let seq = ACCOUNT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time available")
-            .as_millis();
-        let pid = std::process::id();
-        let owner_id_str = format!("dev-{now_ms}-{pid}-{}-{}.testnet", config.label, seq);
-        let owner_id: AccountId = owner_id_str
-            .parse()
-            .context("generated account ID should be valid")?;
-
-        let owner_secret_key = near_api::signer::generate_secret_key()?;
-        let owner_public_key = owner_secret_key.public_key();
-
-        request_faucet_account(&owner_id_str, &owner_public_key.to_string()).await?;
-        tokio::time::sleep(config.faucet_wait).await;
-
-        let network = NetworkConfig {
-            network_name: "testnet".to_string(),
-            rpc_endpoints: vec![RPCEndpoint::new(rpc_url.parse()?)],
-            ..NetworkConfig::testnet()
-        };
-
-        // For high-volume tests, request additional faucet accounts and transfer their balance
-        // to the owner to increase available funds (faucet limit is 5 accounts, ~10N each)
-        let donor_count = if config.receiver_count >= 5 { 2 } else { 0 };
-
-        if donor_count > 0 {
-            println!(
-                "Requesting {} additional faucet account(s) for extra funds...",
-                donor_count
-            );
-
-            for donor_idx in 0..donor_count {
-                let donor_id_str = format!("dev-{now_ms}-{pid}-donor{}-{}.testnet", donor_idx, seq);
-                let donor_id: AccountId = donor_id_str.parse()?;
-                let donor_secret_key = near_api::signer::generate_secret_key()?;
-                let donor_public_key = donor_secret_key.public_key();
-
-                request_faucet_account(&donor_id_str, &donor_public_key.to_string()).await?;
-                tokio::time::sleep(config.faucet_wait).await;
-
-                // Transfer all funds from donor to owner, then delete donor
-                let donor_signer = Signer::new(Signer::from_secret_key(donor_secret_key.clone()))?;
-
-                // Get donor balance to determine transfer amount
-                let donor_state = near_api::Account(donor_id.clone())
-                    .view()
-                    .fetch_from(&network)
-                    .await?;
-
-                // Transfer almost all balance (leave 0.1N for transaction fees)
-                let donor_balance_yocto = donor_state.data.amount;
-                let reserve_yocto = NearToken::from_millinear(100).as_yoctonear();
-                let transfer_amount_yocto = donor_balance_yocto.saturating_sub(reserve_yocto);
-
-                if transfer_amount_yocto > 0 {
-                    let transfer_action = Action::Transfer(TransferAction {
-                        deposit: transfer_amount_yocto,
-                    });
-
-                    Transaction::construct(donor_id.clone(), owner_id.clone())
-                        .add_action(transfer_action)
-                        .with_signer(donor_signer.clone())
-                        .send_to(&network)
-                        .await?;
-
-                    let transfer_near = NearToken::from_yoctonear(transfer_amount_yocto);
-                    println!(
-                        "✅ Transferred {} NEAR from donor{} to owner",
-                        transfer_near.as_near(),
-                        donor_idx
-                    );
-
-                    // Delete donor account (send remaining funds to owner)
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let _ =
-                        delete_account(&network, &donor_id, &donor_secret_key, owner_id.clone())
-                            .await;
-                }
-            }
-        }
-
-        let owner_signer = Signer::new(Signer::from_secret_key(owner_secret_key.clone()))?;
-        deploy_ft_contract(&network, &owner_signer, &owner_id).await?;
-
-        // Create receiver accounts and register storage
-        // Note: Done serially to avoid nonce conflicts with testnet RPC
-        println!("Creating {} receiver account(s)...", config.receiver_count);
-        let mut receivers = Vec::with_capacity(config.receiver_count);
-        for idx in 0..config.receiver_count {
-            let receiver = create_receiver_account(
-                &network,
-                &owner_signer,
-                &owner_id,
-                idx,
-                config.receiver_deposit,
-            )
-            .await?;
-            register_storage(&network, &owner_signer, &owner_id, &receiver.account_id).await?;
-            receivers.push(receiver);
-        }
-
-        // Prepare signer pool (primary key + optional extra keys)
-        let mut signer_keys = vec![owner_secret_key.clone()];
-        if config.signer_pool_size > 1 {
-            let mut extra_keys = Vec::with_capacity(config.signer_pool_size - 1);
-            for _ in 0..(config.signer_pool_size - 1) {
-                extra_keys.push(near_api::signer::generate_secret_key()?);
-            }
-            add_function_access_keys(&network, &owner_signer, &owner_id, &extra_keys).await?;
-            for key in &extra_keys {
-                owner_signer
-                    .add_signer_to_pool(Signer::from_secret_key(key.clone()))
-                    .await?;
-            }
-            signer_keys.extend(extra_keys);
-        }
-
-        Ok(Self {
-            network,
-            owner: OwnerCtx {
-                account_id: owner_id,
-                primary_secret: owner_secret_key,
-                signer_keys,
-            },
+impl BenchmarkPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: &'static str,
+        relay_config: RelayConfig,
+        redis_url: impl Into<String>,
+        redis_namespace: impl Into<String>,
+        total_requests: usize,
+        receivers: Vec<AccountId>,
+        token_account: AccountId,
+        rpc_url: impl Into<String>,
+        transfer_amount: impl Into<String>,
+        yocto_per_transfer: u128,
+    ) -> Self {
+        Self {
+            name,
+            relay_config,
+            redis_url: redis_url.into(),
+            redis_namespace: redis_namespace.into(),
+            total_requests,
+            concurrency: receivers.len().max(1),
+            transfer_amount: transfer_amount.into(),
             receivers,
-            beneficiary,
-            rpc_url,
-        })
-    }
-
-    pub fn relay_secret_keys(&self) -> Vec<String> {
-        self.owner
-            .signer_keys
-            .iter()
-            .map(|k| k.to_string())
-            .collect()
-    }
-
-    pub async fn fetch_balance(&self, receiver_id: &AccountId) -> Result<String> {
-        let args = json!({ "account_id": receiver_id });
-
-        let result = Contract(self.owner.account_id.clone())
-            .call_function("ft_balance_of", args)?
-            .read_only()
-            .fetch_from(&self.network)
-            .await?;
-
-        Ok(result.data)
-    }
-
-    pub async fn collect_balances(&self) -> Result<BalanceSummary> {
-        let mut per_receiver = Vec::with_capacity(self.receivers.len());
-        let mut total: u128 = 0;
-
-        for receiver in &self.receivers {
-            let balance_str = self.fetch_balance(&receiver.account_id).await?;
-            let balance: u128 = balance_str
-                .parse()
-                .context("failed to parse balance into u128")?;
-            total += balance;
-            per_receiver.push((receiver.account_id.clone(), balance));
-        }
-
-        Ok(BalanceSummary {
-            per_receiver,
-            total_tokens: total,
-        })
-    }
-
-    pub async fn teardown(self) -> Result<()> {
-        let mut first_error: Option<anyhow::Error> = None;
-
-        for receiver in &self.receivers {
-            if let Err(err) = delete_account(
-                &self.network,
-                &receiver.account_id,
-                &receiver.secret_key,
-                self.owner.account_id.clone(),
-            )
-            .await
-            {
-                eprintln!(
-                    "Failed to delete receiver account {}: {err:?}",
-                    receiver.account_id
-                );
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        if let Err(err) = delete_account(
-            &self.network,
-            &self.owner.account_id,
-            &self.owner.primary_secret,
-            self.beneficiary.clone(),
-        )
-        .await
-        {
-            eprintln!(
-                "Failed to delete faucet account {}: {err:?}",
-                self.owner.account_id
-            );
-            if first_error.is_none() {
-                first_error = Some(err);
-            }
-        }
-
-        if let Some(err) = first_error {
-            Err(err)
-        } else {
-            Ok(())
+            token_account,
+            rpc_url: rpc_url.into(),
+            yocto_per_transfer,
+            min_throughput: 0.0,
+            max_duration: Duration::from_secs(600),
+            poll_interval: Duration::from_secs(5),
+            max_polls: 300,
+            queue_drain_interval: Duration::from_millis(500),
+            max_queue_checks: 240,
         }
     }
 
-    pub fn receiver_ids(&self) -> Vec<AccountId> {
-        self.receivers
-            .iter()
-            .map(|r| r.account_id.clone())
-            .collect()
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
+        self
+    }
+
+    pub fn with_min_throughput(mut self, value: f64) -> Self {
+        self.min_throughput = value;
+        self
+    }
+
+    pub fn with_max_duration(mut self, duration: Duration) -> Self {
+        self.max_duration = duration;
+        self
+    }
+
+    pub fn with_polling(mut self, interval: Duration, max_polls: usize) -> Self {
+        self.poll_interval = interval;
+        self.max_polls = max_polls;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_queue_drain(mut self, interval: Duration, max_checks: usize) -> Self {
+        self.queue_drain_interval = interval;
+        self.max_queue_checks = max_checks;
+        self
     }
 }
 
-#[derive(Debug)]
-pub struct BalanceSummary {
-    pub per_receiver: Vec<(AccountId, u128)>,
-    pub total_tokens: u128,
+pub struct HttpMetrics {
+    pub accepted: usize,
+    pub failed: usize,
+    pub duration: Duration,
+    pub throughput: f64,
+    pub success_rate: f64,
+    pub start: Instant,
+    pub end: Instant,
 }
 
-pub fn allocate_bind_addr() -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-    Ok(format!("127.0.0.1:{}", addr.port()))
+pub struct OnchainMetrics {
+    pub final_total: u128,
+    pub success_rate: f64,
+    pub onchain_duration: Duration,
+    pub settlement_duration: Duration,
+    pub post_api_duration: Duration,
+    pub blockchain_throughput: f64,
+    pub post_api_throughput: f64,
+    pub receiver_balances: Vec<(AccountId, u128)>,
 }
 
-async fn request_faucet_account(account_id: &str, public_key: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post(FAUCET_URL)
-        .json(&json!({
-            "newAccountId": account_id,
-            "newAccountPublicKey": public_key,
-        }))
-        .send()
-        .await
-        .context("failed to reach faucet helper")?;
-
-    if response.status() != StatusCode::OK {
-        return Err(anyhow!(
-            "faucet returned {}: {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        ));
-    }
-    Ok(())
+pub struct BenchmarkOutcome {
+    pub http: HttpMetrics,
+    pub onchain: OnchainMetrics,
 }
 
-async fn deploy_ft_contract(
-    network: &NetworkConfig,
-    signer: &Arc<Signer>,
-    account_id: &AccountId,
-) -> Result<()> {
-    let wasm = tokio::fs::read(FT_WASM_PATH)
-        .await
-        .with_context(|| format!("failed to read {}", FT_WASM_PATH))?;
-
-    let init_args = json!({
-        "owner_id": account_id,
-        "total_supply": "1000000000000000000000000000",
-        "metadata": {
-            "spec": "ft-1.0.0",
-            "name": "Benchmark Token",
-            "symbol": "BENCH",
-            "decimals": 18
+pub fn print_benchmark_summary(
+    name: &str,
+    outcome: &BenchmarkOutcome,
+    expected_per_receiver: Option<u128>,
+    yocto_per_transfer: u128,
+) {
+    println!();
+    println!("Benchmark: {}", name);
+    println!(
+        "  HTTP phase   : {:.2}s, throughput {:.1} req/s, success {:.2}%",
+        outcome.http.duration.as_secs_f64(),
+        outcome.http.throughput,
+        outcome.http.success_rate
+    );
+    println!(
+        "  Settlement   : loop {:.2}s, total {:.2}s (lag {:.2}s), throughput {:.1} tx/s overall / {:.1} tx/s post-HTTP, success {:.2}%",
+        outcome.onchain.settlement_duration.as_secs_f64(),
+        outcome.onchain.onchain_duration.as_secs_f64(),
+        outcome.onchain.post_api_duration.as_secs_f64(),
+        outcome.onchain.blockchain_throughput,
+        outcome.onchain.post_api_throughput,
+        outcome.onchain.success_rate
+    );
+    let env_base = name
+        .split_once('_')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(name);
+    let env_key = env_base.to_ascii_lowercase();
+    let env_title = {
+        let mut chars = env_base.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
         }
-    })
-    .to_string()
-    .into_bytes();
+    };
 
-    let deploy_action = Action::DeployContract(DeployContractAction { code: wasm });
-    let init_action = Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "new".to_string(),
-        args: init_args,
-        gas: 50_000_000_000_000,
-        deposit: 0,
-    }));
-
-    let tx = Transaction::construct(account_id.clone(), account_id.clone())
-        .add_actions(vec![deploy_action, init_action])
-        .with_signer(signer.clone())
-        .send_to(network)
-        .await
-        .context("failed to deploy FT contract")?;
-
-    tx.assert_success();
-    println!("FT contract deployed to {}", account_id);
-    Ok(())
-}
-
-async fn create_receiver_account(
-    network: &NetworkConfig,
-    signer: &Arc<Signer>,
-    owner_id: &AccountId,
-    index: usize,
-    deposit: NearToken,
-) -> Result<ReceiverCtx> {
-    let receiver_id_str = format!("recv{:02}.{}", index, owner_id.as_str());
-    let receiver_id: AccountId = receiver_id_str.parse()?;
-    let receiver_secret = near_api::signer::generate_secret_key()?;
-    let receiver_public = receiver_secret.public_key();
-
-    let actions = vec![
-        Action::CreateAccount(CreateAccountAction {}),
-        Action::Transfer(TransferAction {
-            deposit: deposit.as_yoctonear(),
-        }),
-        Action::AddKey(Box::new(AddKeyAction {
-            public_key: receiver_public,
-            access_key: AccessKey {
-                nonce: 0,
-                permission: AccessKeyPermission::FullAccess,
-            },
-        })),
+    let metrics: Vec<(&str, String)> = vec![
+        ("Benchmark", name.to_string()),
+        (
+            "HTTP duration (s)",
+            format!("{:.2}", outcome.http.duration.as_secs_f64()),
+        ),
+        (
+            "HTTP throughput (req/s)",
+            format!("{:.1}", outcome.http.throughput),
+        ),
+        (
+            "HTTP success (%)",
+            format!("{:.2}", outcome.http.success_rate),
+        ),
+        (
+            "Settlement loop (s)",
+            format!("{:.2}", outcome.onchain.settlement_duration.as_secs_f64()),
+        ),
+        (
+            "Settlement total (s)",
+            format!("{:.2}", outcome.onchain.onchain_duration.as_secs_f64()),
+        ),
+        (
+            "Settlement lag (s)",
+            format!("{:.2}", outcome.onchain.post_api_duration.as_secs_f64()),
+        ),
+        (
+            "Chain throughput (tx/s)",
+            format!("{:.1}", outcome.onchain.blockchain_throughput),
+        ),
+        (
+            "Post-HTTP throughput (tx/s)",
+            format!("{:.1}", outcome.onchain.post_api_throughput),
+        ),
+        (
+            "On-chain success (%)",
+            format!("{:.2}", outcome.onchain.success_rate),
+        ),
     ];
 
-    let tx = Transaction::construct(owner_id.clone(), receiver_id.clone())
-        .add_actions(actions)
-        .with_signer(signer.clone())
-        .send_to(network)
-        .await
-        .context("failed to create receiver subaccount")?;
+    println!("| Metric | {} |", env_title);
+    println!("| --- | --- |");
+    for (metric, value) in &metrics {
+        let display_value = if *metric == "Chain throughput (tx/s)" {
+            format!("**{}**", value)
+        } else {
+            value.clone()
+        };
+        println!("| {} | {} |", metric, display_value);
+    }
 
-    tx.assert_success();
-    println!("Receiver account {} created", receiver_id);
+    for (metric, value) in &metrics {
+        println!("BENCHMARK_METRIC|{}|{}|{}", env_key, metric, value);
+    }
 
-    Ok(ReceiverCtx {
-        account_id: receiver_id,
-        secret_key: receiver_secret,
+    if let Some(expected) = expected_per_receiver {
+        println!("Receiver balances:");
+        for (account, balance) in &outcome.onchain.receiver_balances {
+            println!(
+                "  {} => {} (expected: {})",
+                account,
+                balance / yocto_per_transfer,
+                expected / yocto_per_transfer
+            );
+        }
+    }
+}
+
+pub async fn run_benchmark(plan: BenchmarkPlan) -> Result<BenchmarkOutcome> {
+    let bind_addr = plan.relay_config.bind_addr.clone();
+    let base_url = format!("http://{}", bind_addr);
+
+    let relay_handle = spawn_relay(plan.relay_config.clone()).await;
+    let outcome = run_benchmark_inner(&plan, &base_url, &relay_handle).await;
+    relay_handle.shutdown().await;
+    outcome
+}
+
+async fn run_benchmark_inner(
+    plan: &BenchmarkPlan,
+    base_url: &str,
+    relay_handle: &RelayHandle,
+) -> Result<BenchmarkOutcome> {
+    println!("Waiting for relay health check at {}...", base_url);
+    wait_for_health(base_url, 20, Duration::from_millis(500)).await?;
+    println!(
+        "Starting benchmark '{}' with {} requests (concurrency {}).",
+        plan.name, plan.total_requests, plan.concurrency
+    );
+
+    let http_metrics = execute_http_phase(plan).await?;
+
+    ensure!(
+        http_metrics.accepted == plan.total_requests,
+        "Accepted {} of {} HTTP requests",
+        http_metrics.accepted,
+        plan.total_requests
+    );
+    ensure!(
+        http_metrics.throughput >= plan.min_throughput,
+        "HTTP throughput {:.2} req/sec below target {:.2}",
+        http_metrics.throughput,
+        plan.min_throughput
+    );
+    ensure!(
+        http_metrics.duration <= plan.max_duration,
+        "HTTP phase took {:.2?}, exceeds {:?}",
+        http_metrics.duration,
+        plan.max_duration
+    );
+    ensure!(
+        !relay_handle.is_finished(),
+        "Relay server task ended during HTTP load"
+    );
+
+    println!(
+        "HTTP phase complete: accepted {} / failed {} / throughput {:.1} req/s",
+        http_metrics.accepted, http_metrics.failed, http_metrics.throughput
+    );
+
+    let mut redis_conn = ConnectionManager::new(Client::open(plan.redis_url.as_str())?).await?;
+    let final_count = verify_transfer_state(&mut redis_conn, http_metrics.accepted as u64).await?;
+    ensure!(
+        final_count == http_metrics.accepted as u64,
+        "Redis recorded {} transfer states but expected {}",
+        final_count,
+        http_metrics.accepted
+    );
+
+    wait_for_transfer_queue(plan, &mut redis_conn).await?;
+
+    let expected_total = (http_metrics.accepted as u128) * plan.yocto_per_transfer;
+    let onchain_metrics = verify_onchain(plan, &http_metrics, expected_total).await?;
+
+    ensure!(
+        onchain_metrics.final_total == expected_total,
+        "On-chain total {} mismatches expected {}",
+        onchain_metrics.final_total,
+        expected_total
+    );
+    ensure!(
+        onchain_metrics.success_rate >= 100.0,
+        "On-chain success {:.2}% below 100%",
+        onchain_metrics.success_rate
+    );
+    println!(
+        "Benchmark '{}' succeeded: on-chain success {:.2}% in {:.1}s",
+        plan.name,
+        onchain_metrics.success_rate,
+        onchain_metrics.onchain_duration.as_secs_f64()
+    );
+
+    Ok(BenchmarkOutcome {
+        http: http_metrics,
+        onchain: onchain_metrics,
     })
 }
 
-async fn register_storage(
-    network: &NetworkConfig,
-    signer: &Arc<Signer>,
-    owner_id: &AccountId,
-    receiver_id: &AccountId,
-) -> Result<()> {
-    let args = json!({ "account_id": receiver_id })
-        .to_string()
-        .into_bytes();
+async fn execute_http_phase(plan: &BenchmarkPlan) -> Result<HttpMetrics> {
+    let endpoint = format!("http://{}/v1/transfer", plan.relay_config.bind_addr);
+    let client = HttpClient::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
-    let action = Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "storage_deposit".to_string(),
-        args,
-        gas: 10_000_000_000_000,
-        deposit: STORAGE_DEPOSIT.as_yoctonear(),
-    }));
+    let start = Instant::now();
+    let phase = PhaseTimer::with_start("HTTP load", start);
+    let receiver_count = plan.receivers.len();
+    let requests_per_worker = plan.total_requests / plan.concurrency;
 
-    let tx = Transaction::construct(owner_id.clone(), owner_id.clone())
-        .add_action(action)
-        .with_signer(signer.clone())
-        .send_to(network)
-        .await
-        .context("failed to register receiver for storage")?;
+    let mut tasks = Vec::with_capacity(plan.concurrency);
+    for worker_id in 0..plan.concurrency {
+        let client = client.clone();
+        let endpoint = endpoint.clone();
+        let receivers = plan.receivers.clone();
+        let amount = plan.transfer_amount.clone();
+        let worker_start = start;
+        let start_idx = worker_id * requests_per_worker;
+        let end_idx = if worker_id == plan.concurrency - 1 {
+            plan.total_requests
+        } else {
+            start_idx + requests_per_worker
+        };
 
-    tx.assert_success();
-    println!("Receiver {} registered for storage", receiver_id);
-    Ok(())
-}
+        let task = tokio::spawn(async move {
+            let mut success = 0usize;
+            let mut errors = 0usize;
+            for i in start_idx..end_idx {
+                let receiver = &receivers[i % receiver_count];
+                let payload = json!({
+                    "receiver_id": receiver,
+                    "amount": amount,
+                });
+                let idempotency_key = Uuid::new_v4().to_string();
 
-async fn add_function_access_keys(
-    network: &NetworkConfig,
-    signer: &Arc<Signer>,
-    owner_id: &AccountId,
-    keys: &[SecretKey],
-) -> Result<()> {
-    if keys.is_empty() {
-        return Ok(());
+                match client
+                    .post(&endpoint)
+                    .header("X-Idempotency-Key", &idempotency_key)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => success += 1,
+                    Ok(resp) => {
+                        if worker_id == 0 && success == 0 && errors == 0 {
+                            eprintln!(
+                                "Worker {} first failure: status {}",
+                                worker_id,
+                                resp.status()
+                            );
+                        }
+                        errors += 1;
+                    }
+                    Err(err) => {
+                        if worker_id == 0 && success == 0 && errors == 0 {
+                            eprintln!("Worker {} request error: {:?}", worker_id, err);
+                        }
+                        errors += 1;
+                    }
+                }
+
+                if worker_id == 0 && (i - start_idx + 1) % 10_000 == 0 {
+                    let elapsed = worker_start.elapsed();
+                    let rate = (i - start_idx + 1) as f64 / elapsed.as_secs_f64().max(1e-6);
+                    println!(
+                        "  Progress: {} requests handled ({:.1} req/sec)",
+                        i - start_idx + 1,
+                        rate
+                    );
+                }
+            }
+
+            (success, errors)
+        });
+        tasks.push(task);
     }
 
-    let mut actions = Vec::with_capacity(keys.len());
-    for key in keys {
-        actions.push(Action::AddKey(Box::new(AddKeyAction {
-            public_key: key.public_key(),
-            access_key: AccessKey {
-                nonce: 0,
-                permission: AccessKeyPermission::FullAccess,
-            },
-        })));
+    let mut accepted = 0usize;
+    let mut failed = 0usize;
+    for task in tasks {
+        let (success, errors) = task.await.unwrap_or((0, 0));
+        accepted += success;
+        failed += errors;
     }
 
-    let tx = Transaction::construct(owner_id.clone(), owner_id.clone())
-        .add_actions(actions)
-        .with_signer(signer.clone())
-        .send_to(network)
-        .await
-        .context("failed to add signer keys to owner")?;
+    let duration = phase.finish();
+    let success_rate = (accepted as f64 / plan.total_requests as f64) * 100.0;
+    let throughput = if duration.as_secs_f64() > 0.0 {
+        accepted as f64 / duration.as_secs_f64()
+    } else {
+        0.0
+    };
 
-    tx.assert_success();
-    println!("Added {} additional signer keys", keys.len());
-    Ok(())
+    Ok(HttpMetrics {
+        accepted,
+        failed,
+        duration,
+        throughput,
+        success_rate,
+        start,
+        end: start + duration,
+    })
 }
 
-async fn delete_account(
-    network: &NetworkConfig,
-    account_id: &AccountId,
-    secret_key: &SecretKey,
-    beneficiary_id: AccountId,
+async fn count_transfer_states(redis_conn: &mut ConnectionManager) -> Result<u64> {
+    let mut cursor: u64 = 0;
+    let mut count: u64 = 0;
+
+    loop {
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("transfer:*")
+            .arg("COUNT")
+            .arg(2000)
+            .query_async(redis_conn)
+            .await?;
+
+        count += keys.iter().filter(|k| !k.ends_with(":ev")).count() as u64;
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    Ok(count)
+}
+
+async fn verify_transfer_state(redis_conn: &mut ConnectionManager, expected: u64) -> Result<u64> {
+    let mut last_count = 0u64;
+    for attempt in 1..=60 {
+        let count = count_transfer_states(redis_conn).await?;
+        if count != last_count {
+            println!(
+                "Redis transfer states attempt {}: {} (expected {})",
+                attempt, count, expected
+            );
+        }
+        if count >= expected {
+            return Ok(count);
+        }
+        last_count = count;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    Err(anyhow!(
+        "Timed out waiting for {} transfer state entries in Redis",
+        expected
+    ))
+}
+
+async fn pending_in_group(
+    redis_conn: &mut ConnectionManager,
+    stream_key: &str,
+    group_name: &str,
+) -> Result<u64> {
+    if let redis::Value::Array(items) = redis::cmd("XINFO")
+        .arg("GROUPS")
+        .arg(stream_key)
+        .query_async::<redis::Value>(redis_conn)
+        .await?
+    {
+        for group in items {
+            if let redis::Value::Array(kv) = group {
+                let mut name: Option<String> = None;
+                let mut pending: Option<u64> = None;
+                let mut i = 0;
+                while i + 1 < kv.len() {
+                    if let redis::Value::BulkString(key) = &kv[i] {
+                        if key == b"name" {
+                            if let redis::Value::BulkString(value) = &kv[i + 1] {
+                                name = std::str::from_utf8(value).ok().map(|s| s.to_string());
+                            }
+                        } else if key == b"pending" {
+                            if let redis::Value::Int(value) = &kv[i + 1] {
+                                pending = Some(*value as u64);
+                            }
+                        }
+                    }
+                    i += 2;
+                }
+
+                if let (Some(n), Some(p)) = (name, pending) {
+                    if n == group_name {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(0)
+}
+
+async fn wait_for_transfer_queue(
+    plan: &BenchmarkPlan,
+    redis_conn: &mut ConnectionManager,
 ) -> Result<()> {
-    let signer = Signer::new(Signer::from_secret_key(secret_key.clone()))?;
-    let delete_action = Action::DeleteAccount(DeleteAccountAction { beneficiary_id });
+    let stream_key = format!("{}:xfer", plan.redis_namespace);
+    let group_name = format!("{}:xfer_workers", plan.redis_namespace);
 
-    let tx = Transaction::construct(account_id.clone(), account_id.clone())
-        .add_action(delete_action)
-        .with_signer(signer)
-        .send_to(network)
-        .await
-        .context("failed to delete account")?;
+    for attempt in 1..=plan.max_queue_checks {
+        let pending = pending_in_group(redis_conn, &stream_key, &group_name).await?;
+        if pending == 0 {
+            println!("Transfer worker queue drained after {} checks", attempt);
+            return Ok(());
+        }
+        tokio::time::sleep(plan.queue_drain_interval).await;
+    }
 
-    tx.assert_success();
-    println!("Account {} deleted", account_id);
-    Ok(())
+    Err(anyhow!("Transfer queue did not drain within timeout"))
 }
 
-pub fn default_faucet_wait() -> Duration {
-    DEFAULT_FAUCET_WAIT
+async fn verify_onchain(
+    plan: &BenchmarkPlan,
+    http: &HttpMetrics,
+    expected_total: u128,
+) -> Result<OnchainMetrics> {
+    let settlement_phase = PhaseTimer::start("On-chain settlement wait");
+
+    let client = JsonRpcClient::connect(&plan.rpc_url);
+    let mut final_balances = Vec::new();
+    let mut final_total: u128 = 0;
+    let mut final_success_rate = 0.0;
+    let mut completion_instant: Option<Instant> = None;
+
+    for poll in 1..=plan.max_polls {
+        let mut balances = Vec::with_capacity(plan.receivers.len());
+        let mut total_balance: u128 = 0;
+
+        for receiver in &plan.receivers {
+            let balance_args = json!({
+                "account_id": receiver,
+            })
+            .to_string()
+            .into_bytes();
+
+            let request = methods::query::RpcQueryRequest {
+                block_reference: BlockReference::Finality(Finality::Final),
+                request: QueryRequest::CallFunction {
+                    account_id: plan.token_account.clone(),
+                    method_name: "ft_balance_of".to_string(),
+                    args: near_primitives::types::FunctionArgs::from(balance_args),
+                },
+            };
+
+            let response = client.call(request).await?;
+            let balance: u128 = match response.kind {
+                QueryResponseKind::CallResult(result) => {
+                    let balance_str: String = serde_json::from_slice(&result.result)?;
+                    balance_str.parse().unwrap_or(0)
+                }
+                _ => 0,
+            };
+
+            total_balance += balance;
+            balances.push(balance);
+        }
+
+        final_success_rate = (total_balance as f64 / expected_total as f64) * 100.0;
+        println!(
+            "On-chain poll {}: {} tokens ({:.2}% complete)",
+            poll,
+            total_balance / plan.yocto_per_transfer,
+            final_success_rate
+        );
+
+        if total_balance >= expected_total {
+            let elapsed_secs = (poll as u64) * plan.poll_interval.as_secs();
+            println!(
+                "Reached expected total after {} polls (~{}s)",
+                poll, elapsed_secs
+            );
+            final_balances = balances;
+            final_total = total_balance;
+            completion_instant = Some(Instant::now());
+            break;
+        }
+
+        if poll == plan.max_polls {
+            let elapsed_secs = (poll as u64) * plan.poll_interval.as_secs();
+            println!("Polling cap reached (~{}s); proceeding", elapsed_secs);
+            final_balances = balances;
+            final_total = total_balance;
+            completion_instant = Some(Instant::now());
+            break;
+        }
+
+        tokio::time::sleep(plan.poll_interval).await;
+    }
+
+    let settlement_duration = settlement_phase.finish();
+    let completion_instant = completion_instant.unwrap_or_else(Instant::now);
+    let onchain_elapsed = completion_instant
+        .checked_duration_since(http.start)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let post_api_elapsed = completion_instant
+        .checked_duration_since(http.end)
+        .unwrap_or_else(|| Duration::from_secs(0));
+    let completed_transfers = (final_total / plan.yocto_per_transfer) as usize;
+    let blockchain_throughput = if onchain_elapsed.as_secs_f64() > 0.0 {
+        completed_transfers as f64 / onchain_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    let post_api_throughput = if post_api_elapsed.as_secs_f64() > 0.0 {
+        completed_transfers as f64 / post_api_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    println!(
+        "On-chain totals: expected {} / actual {} (success {:.2}% in {:.1}s)",
+        expected_total / plan.yocto_per_transfer,
+        final_total / plan.yocto_per_transfer,
+        final_success_rate,
+        onchain_elapsed.as_secs_f64()
+    );
+
+    Ok(OnchainMetrics {
+        final_total,
+        success_rate: final_success_rate,
+        onchain_duration: onchain_elapsed,
+        settlement_duration,
+        post_api_duration: post_api_elapsed,
+        blockchain_throughput,
+        post_api_throughput,
+        receiver_balances: plan
+            .receivers
+            .iter()
+            .cloned()
+            .zip(final_balances.into_iter())
+            .collect(),
+    })
+}
+
+pub struct PhaseTimer {
+    label: String,
+    start: Instant,
+}
+
+impl PhaseTimer {
+    pub fn start(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            start: Instant::now(),
+        }
+    }
+
+    pub fn with_start(label: impl Into<String>, start: Instant) -> Self {
+        Self {
+            label: label.into(),
+            start,
+        }
+    }
+
+    pub fn finish(self) -> Duration {
+        let elapsed = self.start.elapsed();
+        println!("{} completed in {:.2?}", self.label, elapsed);
+        elapsed
+    }
 }
