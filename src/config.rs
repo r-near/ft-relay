@@ -1,48 +1,35 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use config::{Config, Environment};
-use near_api_types::AccountId;
 use serde::Deserialize;
 
-pub const FT_TRANSFER_DEPOSIT: u128 = 1; // yoctoNEAR
-pub const FT_TRANSFER_GAS_PER_ACTION: u64 = 3_000_000_000_000; // 3 Tgas (~0.22Tgas actual, 10x safety)
-pub const DEFAULT_BATCH_SIZE: usize = 90; // Fits safely under 300 TGas
+use crate::types::AccountId;
+
+pub const FT_TRANSFER_DEPOSIT: u128 = 1;
+pub const STORAGE_DEPOSIT_AMOUNT: u128 = 1_250_000_000_000_000_000_000;
+pub const FT_TRANSFER_GAS_PER_ACTION: u64 = 3_000_000_000_000;
+pub const STORAGE_DEPOSIT_GAS_PER_ACTION: u64 = 5_000_000_000_000;
 pub const DEFAULT_BATCH_LINGER_MS: u64 = 20;
-pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 200;
-pub const DEFAULT_MAX_WORKERS: usize = 3;
+pub const DEFAULT_TRANSFER_WORKERS: usize = 1;
+pub const DEFAULT_REGISTRATION_WORKERS: usize = 1;
+pub const DEFAULT_VERIFICATION_WORKERS: usize = 1;
 
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
-pub const DEFAULT_REDIS_STREAM_KEY: &str = "ftrelay:pending";
-pub const DEFAULT_REDIS_CONSUMER_GROUP: &str = "ftrelay:batcher";
 
 #[derive(Debug, Clone)]
 pub struct RedisSettings {
     pub url: String,
-    pub stream_key: String,
-    pub consumer_group: String,
 }
 
 impl RedisSettings {
-    pub fn new(
-        url: impl Into<String>,
-        stream_key: impl Into<String>,
-        consumer_group: impl Into<String>,
-    ) -> Self {
-        Self {
-            url: url.into(),
-            stream_key: stream_key.into(),
-            consumer_group: consumer_group.into(),
-        }
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
     }
 }
 
 impl Default for RedisSettings {
     fn default() -> Self {
-        Self {
-            url: DEFAULT_REDIS_URL.to_string(),
-            stream_key: DEFAULT_REDIS_STREAM_KEY.to_string(),
-            consumer_group: DEFAULT_REDIS_CONSUMER_GROUP.to_string(),
-        }
+        Self::new(DEFAULT_REDIS_URL)
     }
 }
 
@@ -52,10 +39,10 @@ pub struct RelayConfig {
     pub account_id: AccountId,
     pub secret_keys: Vec<String>,
     pub rpc_url: String,
-    pub batch_size: usize,
     pub batch_linger_ms: u64,
-    pub max_inflight_batches: usize,
-    pub max_workers: usize,
+    pub transfer_workers: usize,
+    pub registration_workers: usize,
+    pub verification_workers: usize,
     pub bind_addr: String,
     pub redis: RedisSettings,
 }
@@ -73,11 +60,9 @@ impl RelayConfig {
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Fungible Token Relay", long_about = None)]
 pub struct CliArgs {
-    /// Token (FT contract) account ID
     #[arg(long)]
-    pub token: AccountId,
+    pub token: String,
 
-    /// RPC URL override (optional; defaults to environment)
     #[arg(long)]
     pub rpc_url: Option<String>,
 }
@@ -85,26 +70,22 @@ pub struct CliArgs {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RelayConfigBuilder {
     #[serde(default)]
-    token: Option<AccountId>,
-    account_id: AccountId,
+    token: Option<String>,
+    account_id: String,
     private_keys: String,
     rpc_url: String,
     #[serde(default)]
-    batch_size: Option<usize>,
-    #[serde(default)]
     batch_linger_ms: Option<u64>,
     #[serde(default)]
-    max_inflight_batches: Option<usize>,
+    transfer_workers: Option<usize>,
     #[serde(default)]
-    max_workers: Option<usize>,
+    registration_workers: Option<usize>,
+    #[serde(default)]
+    verification_workers: Option<usize>,
     #[serde(default)]
     bind_addr: Option<String>,
     #[serde(default)]
     redis_url: Option<String>,
-    #[serde(default)]
-    redis_stream_key: Option<String>,
-    #[serde(default)]
-    redis_consumer_group: Option<String>,
 }
 
 impl RelayConfigBuilder {
@@ -125,41 +106,30 @@ impl RelayConfigBuilder {
     }
 
     pub fn build(self) -> Result<RelayConfig> {
-        let RelayConfigBuilder {
-            token,
-            account_id,
-            private_keys,
-            rpc_url,
-            batch_size,
-            batch_linger_ms,
-            max_inflight_batches,
-            max_workers,
-            bind_addr,
-            redis_url,
-            redis_stream_key,
-            redis_consumer_group,
-        } = self;
-
-        let token = token
+        let token = self
+            .token
             .ok_or_else(|| anyhow!("FT token must be provided via --token or TOKEN env var"))?;
-        let secret_keys = parse_secret_keys(&private_keys)?;
+        let secret_keys = parse_secret_keys(&self.private_keys)?;
 
         let redis = RedisSettings::new(
-            redis_url.unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
-            redis_stream_key.unwrap_or_else(|| DEFAULT_REDIS_STREAM_KEY.to_string()),
-            redis_consumer_group.unwrap_or_else(|| DEFAULT_REDIS_CONSUMER_GROUP.to_string()),
+            self.redis_url
+                .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string()),
         );
 
         Ok(RelayConfig {
             token,
-            account_id,
+            account_id: self.account_id,
             secret_keys,
-            rpc_url,
-            batch_size: batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
-            batch_linger_ms: batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
-            max_inflight_batches: max_inflight_batches.unwrap_or(DEFAULT_MAX_INFLIGHT_BATCHES),
-            max_workers: max_workers.unwrap_or(DEFAULT_MAX_WORKERS),
-            bind_addr: bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
+            rpc_url: self.rpc_url,
+            batch_linger_ms: self.batch_linger_ms.unwrap_or(DEFAULT_BATCH_LINGER_MS),
+            transfer_workers: self.transfer_workers.unwrap_or(DEFAULT_TRANSFER_WORKERS),
+            registration_workers: self
+                .registration_workers
+                .unwrap_or(DEFAULT_REGISTRATION_WORKERS),
+            verification_workers: self
+                .verification_workers
+                .unwrap_or(DEFAULT_VERIFICATION_WORKERS),
+            bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string()),
             redis,
         })
     }
