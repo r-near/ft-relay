@@ -64,7 +64,11 @@ jobs:
       - name: Cargo test (ignored integration and testnet suites)
         env:
           REDIS_URL: redis://localhost:6379
-          TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
+          # Testnet configuration (maps from GitHub secrets)
+          ACCOUNT_ID: ${{ secrets.TESTNET_ACCOUNT_ID }}
+          TOKEN: ${{ secrets.TESTNET_TOKEN }}
+          PRIVATE_KEYS: ${{ secrets.TESTNET_PRIVATE_KEYS }}
+          RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
           RUST_LOG: info,ft_relay=info,near_api=warn,tracing::span=warn
           RUST_BACKTRACE: 1
         run: |
