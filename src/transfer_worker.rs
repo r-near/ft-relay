@@ -189,9 +189,7 @@ async fn process_batch(
                 tx_hash_str
             );
 
-            // Pipeline all Redis updates: mark submitted, set tx_hash, map tx->transfers,
-            // enqueue verification, and ack messages.
-            let verify_stream = format!("ftrelay:{}:verify", ctx.runtime.env);
+            // Pipeline all Redis updates: mark submitted, set tx_hash, map tx->transfers, and ack messages.
             let mut pipe = redis::pipe();
             pipe.atomic();
             let now = chrono::Utc::now().to_rfc3339();
@@ -216,15 +214,6 @@ async fn process_batch(
                 pipe.lpush(&event_key, ev_submitted);
                 pipe.expire(&event_key, 86400);
 
-                // Enqueue verification
-                let verify_msg = crate::types::VerificationMessage { transfer_id: msg.transfer_id.clone(), tx_hash: tx_hash_str.clone(), retry_count: 0 };
-                let verify_json = serde_json::to_string(&verify_msg)?;
-                pipe.cmd("XADD")
-                    .arg(&verify_stream)
-                    .arg("*")
-                    .arg("data")
-                    .arg(&verify_json);
-
                 // Event: QUEUED_VERIFICATION
                 let ev_qv = serde_json::to_string(&Event::new("QUEUED_VERIFICATION"))?;
                 pipe.lpush(&event_key, ev_qv);
@@ -238,6 +227,9 @@ async fn process_batch(
             }
 
             pipe.query_async::<()>(&mut conn).await?;
+
+            // Enqueue ONE verification message for this tx (deduped)
+            let _ = rh::enqueue_tx_verification_once(&mut conn, &ctx.runtime.env, &tx_hash_str, 0).await?;
             Ok(())
         }
         Err(e) => {

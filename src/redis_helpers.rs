@@ -4,7 +4,7 @@ use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 
-use crate::types::{Event, Status, TransferMessage, TransferState, VerificationMessage};
+use crate::types::{Event, Status, TransferMessage, TransferState, VerificationMessage, VerificationTxMessage};
 
 pub async fn store_transfer_state<C>(conn: &mut C, state: &TransferState) -> Result<()>
 where
@@ -485,6 +485,75 @@ where
     let serialized = serde_json::to_string(&msg)?;
     conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())])
         .await?;
+    Ok(())
+}
+
+/// Enqueue a verification job for a tx hash ONCE (deduped via a pending set). Returns true if enqueued.
+pub async fn enqueue_tx_verification_once<C>(
+    conn: &mut C,
+    env: &str,
+    tx_hash: &str,
+    retry_count: u32,
+) -> Result<bool>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let set_key = format!("ftrelay:{}:pending_verification_txs", env);
+    let stream_key = format!("ftrelay:{}:verify", env);
+    let msg = VerificationTxMessage { tx_hash: tx_hash.to_string(), retry_count };
+    let serialized = serde_json::to_string(&msg)?;
+
+    let script = redis::Script::new(
+        r#"
+        local set_key = KEYS[1]
+        local stream_key = KEYS[2]
+        local tx_hash = ARGV[1]
+        local payload = ARGV[2]
+        local added = redis.call('SADD', set_key, tx_hash)
+        if added == 1 then
+            redis.call('XADD', stream_key, '*', 'data', payload)
+            return 1
+        else
+            return 0
+        end
+        "#,
+    );
+
+    let enqueued: i32 = script
+        .key(&set_key)
+        .key(&stream_key)
+        .arg(tx_hash)
+        .arg(&serialized)
+        .invoke_async(conn)
+        .await?;
+    Ok(enqueued == 1)
+}
+
+/// Enqueue a retry verification job for a tx hash (does not dedupe message creation).
+pub async fn enqueue_tx_verification_retry<C>(
+    conn: &mut C,
+    env: &str,
+    tx_hash: &str,
+    retry_count: u32,
+) -> Result<()>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let stream_key = format!("ftrelay:{}:verify", env);
+    let msg = VerificationTxMessage { tx_hash: tx_hash.to_string(), retry_count };
+    let serialized = serde_json::to_string(&msg)?;
+    conn.xadd::<_, _, _, _, ()>(&stream_key, "*", &[("data", serialized.as_str())])
+        .await?;
+    Ok(())
+}
+
+/// Clear a tx from the pending verification set (call on terminal states)
+pub async fn clear_tx_pending_verification<C>(conn: &mut C, env: &str, tx_hash: &str) -> Result<()>
+where
+    C: ConnectionLike + AsyncCommands + Send + Sync,
+{
+    let set_key = format!("ftrelay:{}:pending_verification_txs", env);
+    conn.srem::<_, _, ()>(&set_key, tx_hash).await?;
     Ok(())
 }
 

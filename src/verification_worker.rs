@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::redis_helpers as rh;
 use crate::rpc_client::{NearRpcClient, TxStatus};
-use crate::types::{AccountId, Event, Status, VerificationMessage};
+use crate::types::{AccountId, Event, Status, VerificationTxMessage};
 
 const MAX_VERIFICATION_RETRIES: u32 = 20;
 
@@ -46,7 +46,7 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
 
         // Pop ONE message at a time (no batching benefit for individual RPC checks)
         // Use a small linger to ensure we actually perform a blocking read
-        let messages: Vec<(String, VerificationMessage)> = match rh::pop_batch(
+        let messages: Vec<(String, VerificationTxMessage)> = match rh::pop_batch(
             &mut conn,
             &stream_key,
             &consumer_group,
@@ -71,8 +71,8 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
 
         let (stream_id, msg) = &messages[0];
         info!(
-            "[VERIFY] Checking tx {} for transfer {} (retry #{})",
-            msg.tx_hash, msg.transfer_id, msg.retry_count
+            "[VERIFY] Checking tx {} (retry #{})",
+            msg.tx_hash, msg.retry_count
         );
         match verify_transaction(&ctx, msg).await {
             Ok(VerificationResult::Completed) => {
@@ -103,6 +103,8 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
                     let _ = rh::enqueue_transfer(&mut conn, &ctx.runtime.env, &tid, 0).await;
                     let _ = rh::log_event(&mut conn, &tid, Event::new("QUEUED_TRANSFER")).await;
                 }
+                // Clear pending set for this tx since it's terminal
+                let _ = rh::clear_tx_pending_verification(&mut conn, &ctx.runtime.env, &msg.tx_hash).await;
             }
             Ok(VerificationResult::Pending) => {
                 let retry_count = msg.retry_count + 1;
@@ -110,44 +112,33 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
                 let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
                 if retry_count < MAX_VERIFICATION_RETRIES {
-                    let _ = rh::increment_retry_count(&mut conn, &msg.transfer_id).await;
-                    let _ = rh::enqueue_verification(
-                        &mut conn,
-                        &ctx.runtime.env,
-                        &msg.transfer_id,
-                        &msg.tx_hash,
-                        retry_count,
-                    )
-                    .await;
+                    let _ = rh::enqueue_tx_verification_retry(&mut conn, &ctx.runtime.env, &msg.tx_hash, retry_count).await;
                 } else {
-                    let _ = rh::update_transfer_status(&mut conn, &msg.transfer_id, Status::Failed)
+                    // Give up verifying; mark all associated transfers failed
+                    let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await.unwrap_or_default();
+                    for tid in transfer_ids {
+                        let _ = rh::update_transfer_status(&mut conn, &tid, Status::Failed).await;
+                        let _ = rh::log_event(
+                            &mut conn,
+                            &tid,
+                            Event::new("FAILED").with_reason(format!(
+                                "Verification timeout after {} checks",
+                                retry_count
+                            )),
+                        )
                         .await;
-                    let _ = rh::log_event(
-                        &mut conn,
-                        &msg.transfer_id,
-                        Event::new("FAILED").with_reason(format!(
-                            "Verification timeout after {} checks",
-                            retry_count
-                        )),
-                    )
-                    .await;
+                    }
+                    let _ = rh::clear_tx_pending_verification(&mut conn, &ctx.runtime.env, &msg.tx_hash).await;
                 }
             }
             Err(e) => {
-                warn!("Error checking tx status for {}: {:?}", msg.transfer_id, e);
+                warn!("Error checking tx status for {}: {:?}", msg.tx_hash, e);
 
                 let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
 
                 let retry_count = msg.retry_count + 1;
                 if retry_count < MAX_VERIFICATION_RETRIES {
-                    let _ = rh::enqueue_verification(
-                        &mut conn,
-                        &ctx.runtime.env,
-                        &msg.transfer_id,
-                        &msg.tx_hash,
-                        retry_count,
-                    )
-                    .await;
+                    let _ = rh::enqueue_tx_verification_retry(&mut conn, &ctx.runtime.env, &msg.tx_hash, retry_count).await;
                 }
             }
         }
@@ -161,7 +152,7 @@ enum VerificationResult {
 }
 async fn verify_transaction(
     ctx: &VerificationWorkerContext,
-    msg: &VerificationMessage,
+    msg: &VerificationTxMessage,
 ) -> Result<VerificationResult> {
     let mut conn = ctx.runtime.redis_conn.clone();
 
@@ -170,8 +161,8 @@ async fn verify_transaction(
     // So we can just ACK and skip (no need to update again)
     if let Some(cached_status) = rh::get_tx_status(&mut conn, &msg.tx_hash).await? {
         debug!(
-            "Tx {} status already cached: {} (transfer {} already updated by first worker)",
-            msg.tx_hash, cached_status, msg.transfer_id
+            "Tx {} status already cached: {} (already handled)",
+            msg.tx_hash, cached_status
         );
 
         match cached_status.as_str() {
@@ -210,6 +201,9 @@ async fn verify_transaction(
                 rh::log_event(&mut conn, &transfer_id, Event::new("COMPLETED")).await?;
             }
 
+            // Clear pending set
+            rh::clear_tx_pending_verification(&mut conn, &ctx.runtime.env, &msg.tx_hash).await?;
+
             Ok(VerificationResult::Completed)
         }
         TxStatus::Failed(reason) => {
@@ -230,6 +224,9 @@ async fn verify_transaction(
                 )
                 .await?;
             }
+
+            // Clear pending set
+            rh::clear_tx_pending_verification(&mut conn, &ctx.runtime.env, &msg.tx_hash).await?;
 
             Ok(VerificationResult::Failed(reason))
         }

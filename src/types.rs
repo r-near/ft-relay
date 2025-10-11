@@ -141,6 +141,12 @@ pub struct VerificationMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationTxMessage {
+    pub tx_hash: String,
+    pub retry_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferRequest {
     pub receiver_id: AccountId,
     pub amount: String,
