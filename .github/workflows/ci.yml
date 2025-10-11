@@ -65,10 +65,10 @@ jobs:
         env:
           REDIS_URL: redis://localhost:6379
           # Testnet configuration (maps from GitHub secrets)
-          ACCOUNT_ID: ${{ secrets.TESTNET_ACCOUNT_ID }}
-          TOKEN: ${{ secrets.TESTNET_TOKEN }}
-          PRIVATE_KEYS: ${{ secrets.TESTNET_PRIVATE_KEYS }}
-          RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
+          ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+          TOKEN: ${{ secrets.TOKEN }}
+          PRIVATE_KEYS: ${{ secrets.PRIVATE_KEYS }}
+          RPC_URL: ${{ secrets.RPC_URL }}
           RUST_LOG: info,ft_relay=info,near_api=warn,tracing::span=warn
           RUST_BACKTRACE: 1
         run: |
