@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/r-near/ft-relay/compare/v0.3.0...v0.4.0) (2025-10-11)
+
+
+### Features
+
+* modular worker architecture with access key pooling and Redis streams ([#11](https://github.com/r-near/ft-relay/issues/11)) ([9e190ac](https://github.com/r-near/ft-relay/commit/9e190ac79ccac8004d031b38fcb3289ad2780157))
+
 ## [0.3.0](https://github.com/r-near/ft-relay/compare/v0.2.0...v0.3.0) (2025-10-05)
 
 
