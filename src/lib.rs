@@ -114,8 +114,6 @@ pub async fn run(config: RelayConfig) -> Result<()> {
     
     info!("✅ Nonce initialization complete: {} keys initialized, {} already cached", initialized_count, already_cached);
 
-    let env = env; // reuse computed env
-
     let router = http::build_router(redis_conn.clone(), env.to_string(), token.clone());
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use log::{debug, info};
+use log::debug;
 use redis::aio::ConnectionManager;
 use near_crypto::{PublicKey, SecretKey};
 use near_jsonrpc_client::{methods, JsonRpcClient};

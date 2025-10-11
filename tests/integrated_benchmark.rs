@@ -270,8 +270,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         rpc_url: sandbox.rpc_addr.clone(),
         batch_linger_ms: 100, // Fast batching (100ms is enough with high load)
         batch_submit_delay_ms: 0, // No throttling needed for sandbox
-        max_inflight_batches: 500, // High concurrency
-        max_workers: 10,      // 10 transfer workers
+        max_inflight_batches: 1000, // High concurrency
+        max_workers: 30,      // 30 transfer workers
         max_registration_workers: 1, // 1 registration worker (serial registration)
         max_verification_workers: 10, // 10 verification workers
         bind_addr: "127.0.0.1:18082".to_string(),
@@ -558,24 +558,17 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         // up to ~120s at 500ms interval
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Check stream length (pending messages in stream)
-        let stream_len: u64 = redis::cmd("XLEN")
-            .arg(xfer_stream)
-            .query_async(&mut redis_conn)
-            .await
-            .unwrap_or(0);
-
-        // Check consumer group pending count
+        // Check consumer group pending count (this is what actually matters)
+        // Note: XLEN returns total stream size (including processed messages), not pending count
         let mut group_pending: u64 = 0;
-        if let Ok(groups) = redis::cmd("XINFO")
+        if let Ok(redis::Value::Array(items)) = redis::cmd("XINFO")
             .arg("GROUPS")
             .arg(xfer_stream)
             .query_async::<redis::Value>(&mut redis_conn)
             .await
         {
-            if let redis::Value::Array(items) = groups {
-                for grp in items {
-                    if let redis::Value::Array(kv) = grp {
+            for grp in items {
+                if let redis::Value::Array(kv) = grp {
                         let mut name: Option<String> = None;
                         let mut pending: Option<u64> = None;
                         let mut i = 0;
@@ -595,18 +588,17 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                             }
                             i += 2;
                         }
-                        if let (Some(n), Some(p)) = (name, pending) {
-                            if n == xfer_group {
-                                group_pending = p;
-                                break;
-                            }
+                    if let (Some(n), Some(p)) = (name, pending) {
+                        if n == xfer_group {
+                            group_pending = p;
+                            break;
                         }
                     }
                 }
             }
         }
 
-        if stream_len == 0 && group_pending == 0 {
+        if group_pending == 0 {
             println!("  ✅ Transfer queue drained");
             break;
         }

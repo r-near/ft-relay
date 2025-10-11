@@ -137,7 +137,7 @@ async fn process_registration_batch(
     for (stream_id, msg) in batch {
         account_to_jobs
             .entry(msg.account.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(stream_id.clone());
     }
 
@@ -243,7 +243,8 @@ async fn process_registration_batch(
     Ok(())
 }
 
-/// Helper: Forward a transfer to the ready-for-transfer stream
+// Unused helper function - kept for potential future use
+#[allow(dead_code)]
 async fn forward_transfer_to_ready_stream(
     ctx: &RegistrationWorkerContext,
     conn: &mut redis::aio::ConnectionManager,

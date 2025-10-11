@@ -4,7 +4,6 @@ use near_primitives::hash::CryptoHash;
 use redis::aio::ConnectionManager;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::redis_helpers as rh;
@@ -75,7 +74,7 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
         );
         match verify_transaction(&ctx, msg).await {
             Ok(VerificationResult::Completed) => {
-                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
             }
             Ok(VerificationResult::Failed(reason)) => {
                 warn!(
@@ -84,7 +83,7 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
                 );
 
                 // Ack this verification message
-                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
 
                 // Re-enqueue all transfers associated with this failed tx for another attempt
                 let transfer_ids = rh::get_tx_transfers(&mut conn, &msg.tx_hash).await.unwrap_or_default();
@@ -108,7 +107,7 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
             Ok(VerificationResult::Pending) => {
                 let retry_count = msg.retry_count + 1;
 
-                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
 
                 if retry_count < MAX_VERIFICATION_RETRIES {
                     let _ = rh::enqueue_tx_verification_retry(&mut conn, &ctx.runtime.env, &msg.tx_hash, retry_count).await;
@@ -133,7 +132,7 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
             Err(e) => {
                 warn!("Error checking tx status for {}: {:?}", msg.tx_hash, e);
 
-                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, &stream_id).await;
+                let _ = rh::ack_message(&mut conn, &stream_key, &consumer_group, stream_id).await;
 
                 let retry_count = msg.retry_count + 1;
                 if retry_count < MAX_VERIFICATION_RETRIES {

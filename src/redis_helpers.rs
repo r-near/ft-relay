@@ -110,7 +110,7 @@ where
         let updated_at = data
             .get("updated_at")
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| Utc::now());
+            .unwrap_or_else(Utc::now);
         let retry_count = data
             .get("retry_count")
             .and_then(|s| s.parse().ok())

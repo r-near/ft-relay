@@ -543,24 +543,17 @@ async fn run_60k_benchmark(
     for _ in 0..240 {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Check stream length (pending messages in stream)
-        let stream_len: u64 = redis::cmd("XLEN")
-            .arg(xfer_stream)
-            .query_async(redis_conn)
-            .await
-            .unwrap_or(0);
-
-        // Check consumer group pending count
+        // Check consumer group pending count (this is what actually matters)
+        // Note: XLEN returns total stream size (including processed messages), not pending count
         let mut group_pending: u64 = 0;
-        if let Ok(groups) = redis::cmd("XINFO")
+        if let Ok(redis::Value::Array(items)) = redis::cmd("XINFO")
             .arg("GROUPS")
             .arg(xfer_stream)
             .query_async::<redis::Value>(redis_conn)
             .await
         {
-            if let redis::Value::Array(items) = groups {
-                for grp in items {
-                    if let redis::Value::Array(kv) = grp {
+            for grp in items {
+                if let redis::Value::Array(kv) = grp {
                         let mut name: Option<String> = None;
                         let mut pending: Option<u64> = None;
                         let mut i = 0;
@@ -579,20 +572,21 @@ async fn run_60k_benchmark(
                             }
                             i += 2;
                         }
-                        if let (Some(n), Some(p)) = (name, pending) {
-                            if n == xfer_group {
-                                group_pending = p;
-                                break;
-                            }
+                    if let (Some(n), Some(p)) = (name, pending) {
+                        if n == xfer_group {
+                            group_pending = p;
+                            break;
                         }
                     }
                 }
             }
         }
 
-        if stream_len == 0 && group_pending == 0 {
-            println!("  ✅ Transfer queue drained");
+        if group_pending == 0 {
+            println!("  ✅ Transfer queue drained (all messages processed)");
             break;
+        } else {
+            println!("  ⏳ Waiting for transfer worker (pending={})", group_pending);
         }
     }
 
@@ -734,6 +728,24 @@ async fn run_60k_benchmark(
     println!("onchain_success_rate: {:.2}", on_chain_success_pct);
     println!("status: PASSED");
     println!("--- END BENCHMARK RESULTS ---");
+
+    // Print RPC stats collected in Redis
+    println!("\n╔════════════════════════════════════════════════════════════╗");
+    println!("║  RPC STATS                                                 ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    let stats_key = "ftrelay:testnet:rpc_stats";
+    let stats: Vec<(String, i64)> = redis::cmd("HGETALL")
+        .arg(stats_key)
+        .query_async(redis_conn)
+        .await
+        .unwrap_or_default();
+    if stats.is_empty() {
+        println!("  (no RPC stats recorded)");
+    } else {
+        for (method, count) in stats {
+            println!("  {:<28} {}", method, count);
+        }
+    }
 
     relay_handle.abort();
     let _ = relay_handle.await;
