@@ -271,7 +271,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         batch_linger_ms: 100, // Fast batching (100ms is enough with high load)
         batch_submit_delay_ms: 0, // No throttling needed for sandbox
         max_inflight_batches: 500, // High concurrency
-        max_workers: 1,       // 1 transfer worker
+        max_workers: 10,      // 10 transfer workers
         max_registration_workers: 1, // 1 registration worker (serial registration)
         max_verification_workers: 10, // 10 verification workers
         bind_addr: "127.0.0.1:18082".to_string(),

@@ -9,7 +9,7 @@ use near_jsonrpc_primitives::types::{
     query::QueryResponseKind, transactions::RpcSendTransactionRequest,
 };
 use near_primitives::account::AccessKeyPermission;
-use near_primitives::action::{Action, AddKeyAction, CreateAccountAction, TransferAction};
+use near_primitives::action::{Action, AddKeyAction, CreateAccountAction, DeleteAccountAction, TransferAction};
 use near_primitives::transaction::{SignedTransaction, Transaction, TransactionV0};
 use near_primitives::types::{AccountId, BlockReference, Finality};
 use near_primitives::views::TxExecutionStatus;
@@ -200,7 +200,117 @@ async fn sixty_k_benchmark_test() -> Result<()> {
     )
     .await;
 
+    // Clean up receiver accounts (always runs, even if test failed)
+    println!("\n🧹 Cleaning up receiver accounts...");
+    let cleanup_result = cleanup_receiver_accounts(
+        &client,
+        &owner_account_id,
+        &owner_secret,
+        &owner_public,
+        &receivers,
+    )
+    .await;
+    
+    match cleanup_result {
+        Ok(count) => println!("✅ Deleted {} receiver accounts", count),
+        Err(e) => println!("⚠️  Cleanup warning: {:?}", e),
+    }
+
     result
+}
+
+async fn cleanup_receiver_accounts(
+    client: &JsonRpcClient,
+    owner_account_id: &AccountId,
+    owner_secret: &SecretKey,
+    owner_public: &near_crypto::PublicKey,
+    receivers: &[AccountId],
+) -> Result<usize> {
+    if receivers.is_empty() {
+        return Ok(0);
+    }
+
+    // Get current nonce
+    let access_key_request = methods::query::RpcQueryRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+        request: near_primitives::views::QueryRequest::ViewAccessKey {
+            account_id: owner_account_id.clone(),
+            public_key: owner_public.clone(),
+        },
+    };
+    let access_key_response = client.call(access_key_request).await?;
+    let _nonce = match access_key_response.kind {
+        QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
+        _ => return Err(anyhow::anyhow!("Unexpected response type")),
+    };
+
+    // Get block hash
+    let block_request = methods::block::RpcBlockRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+    };
+    let block = client.call(block_request).await?;
+    let mut block_hash = block.header.hash;
+
+    let mut deleted = 0;
+    
+    // Delete accounts one by one
+    for (idx, receiver_id) in receivers.iter().enumerate() {
+        // DeleteAccount action transfers remaining balance to beneficiary
+        let delete_action = Action::DeleteAccount(DeleteAccountAction {
+            beneficiary_id: owner_account_id.clone(),
+        });
+
+        let transaction = Transaction::V0(TransactionV0 {
+            signer_id: receiver_id.clone(),
+            public_key: owner_public.clone(),
+            nonce: 1, // These are new accounts, so nonce starts at 1
+            receiver_id: receiver_id.clone(),
+            block_hash,
+            actions: vec![delete_action],
+        });
+
+        let signature = owner_secret.sign(transaction.get_hash_and_size().0.as_ref());
+        let signed_tx = SignedTransaction::new(signature, transaction);
+
+        let broadcast_request = RpcSendTransactionRequest {
+            signed_transaction: signed_tx,
+            wait_until: TxExecutionStatus::Final,
+        };
+
+        match client.call(broadcast_request).await {
+            Ok(response) => {
+                if let Some(outcome) = response.final_execution_outcome {
+                    match outcome.into_outcome().status {
+                        near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
+                            deleted += 1;
+                            println!("  🗑️  Deleted: {}", receiver_id);
+                        }
+                        status => {
+                            println!("  ⚠️  Failed to delete {}: {:?}", receiver_id, status);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  ⚠️  Failed to delete {}: {:?}", receiver_id, e);
+            }
+        }
+
+        // Refresh block hash every few deletions
+        if idx % 3 == 2 && idx + 1 < receivers.len() {
+            let block_request = methods::block::RpcBlockRequest {
+                block_reference: BlockReference::Finality(Finality::Final),
+            };
+            if let Ok(block) = client.call(block_request).await {
+                block_hash = block.header.hash;
+            }
+        }
+
+        // Small delay between deletions
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Ok(deleted)
 }
 
 async fn run_60k_benchmark(
