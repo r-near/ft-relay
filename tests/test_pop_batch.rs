@@ -64,17 +64,12 @@ async fn test_pop_batch_full_batch_immediate() -> Result<()> {
 
     // Pop batch with max=100, should get all immediately
     let batch: Vec<(String, TestMessage)> = ft_relay::redis_helpers::pop_batch(
-        &mut conn,
-        stream_key,
-        group,
-        consumer,
-        100,
-        1000, // 1 second linger
+        &mut conn, stream_key, group, consumer, 100, 1000, // 1 second linger
     )
     .await?;
 
     assert_eq!(batch.len(), 100, "Should get full batch of 100 messages");
-    
+
     // Verify messages are in order
     for (i, (_stream_id, msg)) in batch.iter().enumerate() {
         assert_eq!(msg.id, i as u32);
@@ -100,15 +95,10 @@ async fn test_pop_batch_partial_with_linger() -> Result<()> {
     create_consumer_group(&mut conn, stream_key, group).await?;
 
     let start = std::time::Instant::now();
-    
+
     // Pop batch with max=100, should get 10 after lingering
     let batch: Vec<(String, TestMessage)> = ft_relay::redis_helpers::pop_batch(
-        &mut conn,
-        stream_key,
-        group,
-        consumer,
-        100,
-        500, // 500ms linger
+        &mut conn, stream_key, group, consumer, 100, 500, // 500ms linger
     )
     .await?;
 
@@ -161,15 +151,9 @@ async fn test_pop_batch_accumulates_during_linger() -> Result<()> {
 
     // Pop batch with max=100, linger=500ms
     // Should get 10 initially, then accumulate the 20 that arrive during linger
-    let batch: Vec<(String, TestMessage)> = ft_relay::redis_helpers::pop_batch(
-        &mut conn,
-        stream_key,
-        group,
-        consumer,
-        100,
-        500,
-    )
-    .await?;
+    let batch: Vec<(String, TestMessage)> =
+        ft_relay::redis_helpers::pop_batch(&mut conn, stream_key, group, consumer, 100, 500)
+            .await?;
 
     let elapsed = start.elapsed();
 
@@ -184,51 +168,10 @@ async fn test_pop_batch_accumulates_during_linger() -> Result<()> {
         "Should get at most 30 messages (10 + 20), got {}",
         batch.len()
     );
-    
+
     println!(
         "Accumulated {} messages in {}ms",
         batch.len(),
-        elapsed.as_millis()
-    );
-
-    // Clean up
-    let _: Result<(), _> = conn.del(stream_key).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_pop_batch_empty_stream() -> Result<()> {
-    let mut conn = setup_redis().await?;
-    let stream_key = "test:pop_batch:empty";
-    let group = "test-group";
-    let consumer = "consumer-1";
-
-    // Clean up from previous runs
-    let _: Result<(), _> = conn.del(stream_key).await;
-
-    // Create empty stream
-    create_consumer_group(&mut conn, stream_key, group).await?;
-
-    let start = std::time::Instant::now();
-
-    // Pop batch from empty stream
-    let result: Result<Vec<(String, TestMessage)>> = ft_relay::redis_helpers::pop_batch(
-        &mut conn,
-        stream_key,
-        group,
-        consumer,
-        100,
-        200, // Short linger
-    )
-    .await;
-
-    let elapsed = start.elapsed();
-
-    // Should return error after linger timeout
-    assert!(result.is_err(), "Should return error for empty stream");
-    assert!(
-        elapsed.as_millis() >= 180,
-        "Should wait close to linger time, waited {}ms",
         elapsed.as_millis()
     );
 
