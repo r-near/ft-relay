@@ -157,7 +157,15 @@ impl NearRpcClient {
             Err(e) => {
                 let err_str = format!("{:?}", e);
                 if err_str.contains("UNKNOWN_TRANSACTION") || err_str.contains("does not exist") {
+                    // Transaction not found yet - still pending
                     Ok(TxStatus::Pending)
+                } else if err_str.contains("TimeoutError") || err_str.contains("TIMEOUT_ERROR") {
+                    // RPC timeout while waiting for finality - transaction state unknown
+                    // Per NEAR docs: transaction was routed but not recorded on chain in 10 seconds
+                    // Solution: resubmit the transaction (NEAR's idempotency will handle duplicates)
+                    // We treat this as Failed so the verification worker will re-enqueue transfers
+                    debug!("RPC timeout checking tx status - will resubmit transaction");
+                    Ok(TxStatus::Failed("RPC timeout - resubmitting transaction".to_string()))
                 } else {
                     Err(anyhow!("Failed to check transaction status: {:?}", e))
                 }
@@ -186,10 +194,38 @@ impl NearRpcClient {
             .client
             .call(request)
             .await
-            .map_err(|e| anyhow!("Failed to fetch access key: {:?}", e))?;
+            .map_err(|e| anyhow!("Failed to fetch access key for {} / {}: {:?}", account, public_key, e))?;
 
         match response.kind {
             QueryResponseKind::AccessKey(access_key) => Ok(access_key),
+            _ => Err(anyhow!("Unexpected response type")),
+        }
+    }
+
+    /// Fetch all access keys for an account at once (much faster than individual queries)
+    pub async fn get_access_key_list(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<near_primitives::views::AccessKeyInfoView>> {
+        self.incr_stat("get_access_key_list").await;
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
+        let request = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+            request: near_primitives::views::QueryRequest::ViewAccessKeyList {
+                account_id: account
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid account ID: {:?}", e))?,
+            },
+        };
+
+        let response = self
+            .client
+            .call(request)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch access key list for {}: {:?}", account, e))?;
+
+        match response.kind {
+            QueryResponseKind::AccessKeyList(access_keys) => Ok(access_keys.keys),
             _ => Err(anyhow!("Unexpected response type")),
         }
     }
@@ -327,6 +363,61 @@ impl NearRpcClient {
         let signed_tx = SignedTransaction::new(signature, transaction);
 
         self.broadcast_tx(signed_tx).await
+    }
+
+    /// Submit batch transfer and return tx_hash even on broadcast errors
+    /// Returns: (tx_hash, Result<outcome>)
+    /// The tx_hash is always available, even if broadcast times out
+    pub async fn submit_batch_transfer_with_hash(
+        &self,
+        signer_account: &AccountId,
+        token: &AccountId,
+        receivers: Vec<(AccountId, String)>,
+        secret_key: &SecretKey,
+        nonce: u64,
+    ) -> Result<(CryptoHash, std::result::Result<FinalExecutionOutcomeView, String>)> {
+        let block_hash = self.get_block_hash().await?;
+
+        let actions: Vec<Action> = receivers
+            .into_iter()
+            .map(|(receiver_id, amount)| {
+                let args = serde_json::json!({
+                    "receiver_id": receiver_id,
+                    "amount": amount,
+                });
+
+                Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "ft_transfer".to_string(),
+                    args: args.to_string().into_bytes(),
+                    gas: FT_TRANSFER_GAS_PER_ACTION,
+                    deposit: FT_TRANSFER_DEPOSIT,
+                }))
+            })
+            .collect();
+
+        let transaction = Transaction::V0(near_primitives::transaction::TransactionV0 {
+            signer_id: signer_account
+                .parse()
+                .map_err(|e| anyhow!("Invalid signer: {:?}", e))?,
+            public_key: secret_key.public_key(),
+            nonce,
+            receiver_id: token
+                .parse()
+                .map_err(|e| anyhow!("Invalid receiver: {:?}", e))?,
+            block_hash,
+            actions,
+        });
+
+        let signature = secret_key.sign(transaction.get_hash_and_size().0.as_ref());
+        let signed_tx = SignedTransaction::new(signature, transaction);
+        
+        let tx_hash = signed_tx.get_hash();
+
+        // Broadcast and capture result separately
+        match self.broadcast_tx(signed_tx).await {
+            Ok((_hash, outcome)) => Ok((tx_hash, Ok(outcome))),
+            Err(e) => Ok((tx_hash, Err(format!("{:?}", e)))),
+        }
     }
 
     /// Broadcast a batch transfer without waiting for finality; returns the tx hash immediately.

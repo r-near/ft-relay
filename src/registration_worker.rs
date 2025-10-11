@@ -66,18 +66,17 @@ pub async fn registration_worker_loop(ctx: RegistrationWorkerContext) -> Result<
         .await
         {
             Ok(b) => {
-                debug!(
-                    "[REG_WORKER] {} got batch of {} registration job(s)",
-                    consumer_name,
-                    b.len()
-                );
+                if !b.is_empty() {
+                    debug!(
+                        "[REG_WORKER] {} got batch of {} registration job(s)",
+                        consumer_name,
+                        b.len()
+                    );
+                }
                 b
             }
             Err(e) => {
-                debug!(
-                    "[REG_WORKER] {} found no messages after {}ms wait",
-                    consumer_name, ctx.linger_ms
-                );
+                warn!("[REG_WORKER] {} error popping batch: {:?}", consumer_name, e);
                 continue;
             }
         };

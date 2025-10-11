@@ -69,21 +69,50 @@ pub async fn run(config: RelayConfig) -> Result<()> {
 
     let mut nonce_manager = NonceManager::new(redis_conn.clone());
 
-    info!("Initializing nonces from RPC...");
+    info!("Initializing nonces from RPC for {} access keys...", access_keys.len());
+    
+    // Fetch all access keys at once (much faster than one-by-one)
+    let access_key_list = rpc_client
+        .get_access_key_list(&account_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch access key list during initialization: {}", e))?;
+    
+    info!("Fetched {} access keys from RPC, matching against our {} keys...", access_key_list.len(), access_keys.len());
+    
+    // Build a map of public_key -> nonce for quick lookup
+    let mut nonce_map = std::collections::HashMap::new();
+    for key_info in &access_key_list {
+        nonce_map.insert(key_info.public_key.to_string(), key_info.access_key.nonce);
+    }
+    
+    let mut initialized_count = 0;
+    let mut already_cached = 0;
+    
     for key in &access_keys {
         if !nonce_manager.is_initialized(&key.key_id).await? {
-            let access_key_view = rpc_client
-                .get_access_key(&account_id, &key.public_key)
-                .await?;
-            nonce_manager
-                .initialize_nonce(&key.key_id, access_key_view.nonce)
-                .await?;
-            debug!(
-                "Initialized nonce for key {} to {}",
-                key.key_id, access_key_view.nonce
-            );
+            let public_key_str = key.public_key.to_string();
+            match nonce_map.get(&public_key_str) {
+                Some(&nonce) => {
+                    nonce_manager
+                        .initialize_nonce(&key.key_id, nonce)
+                        .await?;
+                    debug!("Initialized nonce for key {} to {}", key.key_id, nonce);
+                    initialized_count += 1;
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Access key {} not found in account {}. This key may not exist on-chain.",
+                        public_key_str, account_id
+                    ));
+                }
+            }
+        } else {
+            debug!("Key {} already initialized, skipping", key.key_id);
+            already_cached += 1;
         }
     }
+    
+    info!("✅ Nonce initialization complete: {} keys initialized, {} already cached", initialized_count, already_cached);
 
     let env = env; // reuse computed env
 

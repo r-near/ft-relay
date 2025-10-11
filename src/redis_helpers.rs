@@ -667,17 +667,15 @@ where
         // We ALWAYS wait the full linger period to accumulate
     }
 
-    if batch.is_empty() {
-        return Err(anyhow::anyhow!("No messages available"));
+    if !batch.is_empty() {
+        log::debug!(
+            "[REDIS_TIMING] pop_batch: {} msgs in {}ms total ({} reads, {}ms in XREADGROUP)",
+            batch.len(),
+            start.elapsed().as_millis(),
+            read_count,
+            total_read_time_ms
+        );
     }
-
-    log::debug!(
-        "[REDIS_TIMING] pop_batch: {} msgs in {}ms total ({} reads, {}ms in XREADGROUP)",
-        batch.len(),
-        start.elapsed().as_millis(),
-        read_count,
-        total_read_time_ms
-    );
 
     Ok(batch)
 }

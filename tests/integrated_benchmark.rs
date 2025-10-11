@@ -549,28 +549,27 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
         println!("  Status:                 ✅ VERIFIED");
     }
 
-    // Wait for verification worker to drain its queue before on-chain polling
-    println!("\n⏳ Waiting for verification worker to finish...");
-    let verify_stream = "ftrelay:sandbox:verify";
-    let verify_group = "ftrelay:sandbox:verify_workers";
-    let pending_set_key = "ftrelay:sandbox:pending_verification_txs";
+    // Wait for transfer worker to finish processing
+    println!("\n⏳ Waiting for transfer worker to finish...");
+    let xfer_stream = "ftrelay:sandbox:xfer";
+    let xfer_group = "ftrelay:sandbox:xfer_workers";
 
     for _ in 0..240 {
         // up to ~120s at 500ms interval
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // pending set cardinality
-        let pending_set: u64 = redis::cmd("SCARD")
-            .arg(pending_set_key)
+        // Check stream length (pending messages in stream)
+        let stream_len: u64 = redis::cmd("XLEN")
+            .arg(xfer_stream)
             .query_async(&mut redis_conn)
             .await
             .unwrap_or(0);
 
-        // group pending
+        // Check consumer group pending count
         let mut group_pending: u64 = 0;
         if let Ok(groups) = redis::cmd("XINFO")
             .arg("GROUPS")
-            .arg(verify_stream)
+            .arg(xfer_stream)
             .query_async::<redis::Value>(&mut redis_conn)
             .await
         {
@@ -597,7 +596,7 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
                             i += 2;
                         }
                         if let (Some(n), Some(p)) = (name, pending) {
-                            if n == verify_group {
+                            if n == xfer_group {
                                 group_pending = p;
                                 break;
                             }
@@ -607,8 +606,8 @@ async fn test_bounty_requirement_60k() -> Result<(), Box<dyn std::error::Error>>
             }
         }
 
-        if pending_set == 0 && group_pending == 0 {
-            println!("  ✅ Verification queue drained");
+        if stream_len == 0 && group_pending == 0 {
+            println!("  ✅ Transfer queue drained");
             break;
         }
     }

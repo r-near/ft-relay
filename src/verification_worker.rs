@@ -58,14 +58,13 @@ pub async fn verification_worker_loop(ctx: VerificationWorkerContext) -> Result<
         {
             Ok(b) => b,
             Err(e) => {
-                debug!("No verification messages available: {:?}", e);
+                warn!("Error popping verification batch: {:?}", e);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
         };
 
         if messages.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
 
