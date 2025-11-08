@@ -7,6 +7,7 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
 ## Features
 
 - **Transfer endpoints** – `POST /v1/transfer` to queue transfers, `GET /v1/transfer/:id` to check status and get tx_hash.
+- **Transfer audit log** – Every transfer persists its full event timeline (RECEIVED → QUEUED → SUBMITTED → COMPLETED/FAILED). `GET /v1/transfer/:id` returns the log for audit/compliance workflows.
 - **Signer pool** – rotate across multiple function-call access keys to avoid nonce contention.
 - **Micro-batching** – pack up to `BATCH_SIZE` transfers into a single transaction while respecting the 300 TGas ceiling.
 - **Async pipeline** – bounded queue + semaphore to backpressure inflight batches.
@@ -21,6 +22,7 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
 ![ft-relay architecture diagram](docs/diagrams/architecture.svg)
 
 - The HTTP handler writes each request to a Redis Stream and immediately returns a `transfer_id`.
+- Redis persists the transfer state plus an append-only event list so every status request returns a complete audit timeline (with timestamps, tx hashes, and failure reasons).
 - The async worker consumes from the stream’s consumer group, batches transfers, and submits NEAR transactions.
 - Gas accounting ensures we never exceed NEAR’s 300 TGas prepaid limit (`90` transfers × `40 TGas`).
 - The signer pool is backed by `near-api-rs` and can host multiple secret keys for high concurrency.
@@ -57,16 +59,27 @@ A Rust-powered HTTP relay that batches NEP-141 `ft_transfer` calls into NEAR tra
    The server listens on `0.0.0.0:8080` unless you set `BIND_ADDR`.
 
 3. **Send a transfer**
-```bash
-curl -X POST http://localhost:8080/v1/transfer \
-  -H 'Content-Type: application/json' \
-  -d '{"receiver_id":"alice.testnet","amount":"1000000000000000000"}'
-```
-Responses include a durable identifier you can poll later:
 
-```json
-{"status":"queued","transfer_id":"6b81f45e-5c7c-4c84-987d-3cf6c3e4232a"}
-```
+  ```bash
+  curl -X POST http://localhost:8080/v1/transfer \
+    -H 'Content-Type: application/json' \
+    -H 'X-Idempotency-Key: demo-transfer-0001' \
+    -d '{"receiver_id":"alice.testnet","amount":"1000000000000000000"}'
+  ```
+  Responses include a durable identifier (your idempotency key), the initial status, and timestamps:
+
+  ```json
+  {
+    "transfer_id": "demo-transfer-0001",
+    "status": "QUEUED_REGISTRATION",
+    "receiver_id": "alice.testnet",
+    "amount": "1000000000000000000",
+    "created_at": "2025-02-20T12:34:56.789Z",
+    "retry_count": 0
+  }
+  ```
+
+  When you later poll `GET /v1/transfer/{transfer_id}` the response contains the current status plus the complete audit log (`events`) describing every state transition, tx hash, and failure reason recorded so far.
 
 ---
 
@@ -96,34 +109,44 @@ All configuration except the FT contract ID comes from environment variables. Th
 
 ### `POST /v1/transfer`
 
+Queue a new FT transfer and receive an immediately auditable record for that transfer.
+
+**Headers**
+
+- `X-Idempotency-Key` (required) – becomes the `transfer_id` you poll later.
+
 **Body**
 
 ```json
 {
   "receiver_id": "alice.testnet",
-  "amount": "1000000000000000000",
-  "memo": "optional"
+  "amount": "1000000000000000000"
 }
 ```
 
-- `receiver_id` – NEAR account to receive tokens (must be registered).
+- `receiver_id` – NEAR account that will receive tokens. Unregistered accounts are registered automatically.
 - `amount` – Stringified yocto-token amount.
-- `memo` – Optional memo forwarded to the FT contract.
 
 **Response**
 
 ```json
 {
-  "status": "queued",
-  "transfer_id": "6b81f45e-5c7c-4c84-987d-3cf6c3e4232a"
+  "transfer_id": "demo-transfer-0001",
+  "status": "QUEUED_REGISTRATION",
+  "receiver_id": "alice.testnet",
+  "amount": "1000000000000000000",
+  "created_at": "2025-02-20T12:34:56.789Z",
+  "retry_count": 0
 }
 ```
 
-HTTP `503` signals the internal queue is saturated.
+- Status values come from the worker pipeline (`QUEUED_REGISTRATION`, `REGISTERED`, `QUEUED_TRANSFER`, etc.).
+- HTTP `400` is returned if the header/body validation fails.
+- HTTP `503` signals the internal queue is saturated.
 
 ### `GET /v1/transfer/:id`
 
-Query the status of a previously submitted transfer.
+Query the status of a previously submitted transfer and retrieve its full audit log.
 
 **Request**
 
@@ -131,26 +154,30 @@ Query the status of a previously submitted transfer.
 curl http://localhost:8080/v1/transfer/6b81f45e-5c7c-4c84-987d-3cf6c3e4232a
 ```
 
-**Response (pending)**
+**Response (completed + audit log)**
 
 ```json
 {
-  "transfer_id": "6b81f45e-5c7c-4c84-987d-3cf6c3e4232a",
-  "status": "pending"
+  "transfer_id": "demo-transfer-0001",
+  "status": "COMPLETED",
+  "receiver_id": "alice.testnet",
+  "amount": "1000000000000000000",
+  "tx_hash": "HMeo3DYSuAmXWxuTotFzWMac5bcePhHeRqfCDLRNBs9Y",
+  "created_at": "2025-02-20T12:34:56.789Z",
+  "completed_at": "2025-02-20T12:35:48.120Z",
+  "retry_count": 0,
+  "events": [
+    {"time": "2025-02-20T12:34:56.790Z", "event": "RECEIVED"},
+    {"time": "2025-02-20T12:34:56.792Z", "event": "QUEUED_REGISTRATION"},
+    {"time": "2025-02-20T12:35:10.001Z", "event": "QUEUED_TRANSFER"},
+    {"time": "2025-02-20T12:35:35.884Z", "event": "SUBMITTED", "tx_hash": "HMeo3DYSuAmXWxuTotFzWMac5bcePhHeRqfCDLRNBs9Y"},
+    {"time": "2025-02-20T12:35:48.120Z", "event": "COMPLETED"}
+  ]
 }
 ```
 
-**Response (completed)**
-
-```json
-{
-  "transfer_id": "6b81f45e-5c7c-4c84-987d-3cf6c3e4232a",
-  "status": "completed",
-  "tx_hash": "HMeo3DYSuAmXWxuTotFzWMac5bcePhHeRqfCDLRNBs9Y"
-}
-```
-
-Status records are stored in Redis for 24 hours after completion.
+- `events` is returned in chronological order and includes optional `tx_hash`/`reason` fields so you can trace failures or retries.
+- Transfer state plus its audit log remain in Redis for 24 hours after completion.
 
 ---
 
