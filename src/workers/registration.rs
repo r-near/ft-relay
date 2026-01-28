@@ -2,10 +2,10 @@ use ::redis::aio::ConnectionManager;
 use ::redis::AsyncCommands;
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
+use near_kit::{Gas, Near, NearToken, TxExecutionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::near::{AccessKeyPool, NearRpcClient, NonceManager};
 use crate::redis::{accounts, events, keys, state, streams, transfers};
 use crate::types::{AccountId, Event, RegistrationMessage, Status};
 
@@ -14,11 +14,14 @@ use super::shared;
 const MAX_RETRIES: u32 = 10;
 const MAX_REGISTRATIONS_PER_BATCH: usize = 50;
 
+// Gas per storage_deposit action
+const STORAGE_DEPOSIT_GAS: Gas = Gas::tgas(5);
+// Storage deposit amount (0.00125 NEAR = 1,250,000,000,000,000,000,000 yocto)
+const STORAGE_DEPOSIT_AMOUNT: NearToken = NearToken::yocto(1_250_000_000_000_000_000_000);
+
 pub struct RegistrationWorkerRuntime {
     pub redis_conn: ConnectionManager,
-    pub rpc_client: Arc<NearRpcClient>,
-    pub access_key_pool: Arc<AccessKeyPool>,
-    pub nonce_manager: NonceManager,
+    pub near: Arc<Near>,
     pub relay_account: AccountId,
     pub token: AccountId,
     pub env: String,
@@ -133,36 +136,49 @@ async fn process_registration_batch(
         accounts
     );
 
-    let leased_key = ctx.runtime.access_key_pool.lease().await?;
-    let nonce = ctx
-        .runtime
-        .nonce_manager
-        .clone()
-        .get_next_nonce(&leased_key.key_id)
-        .await?;
+    if accounts.is_empty() {
+        return Ok(());
+    }
 
-    let result = ctx
+    // Build a multi-action transaction with all storage_deposit calls
+    let mut call_builder = ctx
         .runtime
-        .rpc_client
-        .register_accounts_batch(
-            &ctx.runtime.relay_account,
-            &ctx.runtime.token,
-            accounts.clone(),
-            &leased_key.secret_key,
-            nonce,
-        )
+        .near
+        .transaction(&ctx.runtime.token)
+        .call("storage_deposit")
+        .args(serde_json::json!({
+            "account_id": &accounts[0],
+            "registration_only": true,
+        }))
+        .gas(STORAGE_DEPOSIT_GAS)
+        .deposit(STORAGE_DEPOSIT_AMOUNT);
+
+    for account in accounts.iter().skip(1) {
+        let args = serde_json::json!({
+            "account_id": account,
+            "registration_only": true,
+        });
+
+        call_builder = call_builder
+            .call("storage_deposit")
+            .args(args)
+            .gas(STORAGE_DEPOSIT_GAS)
+            .deposit(STORAGE_DEPOSIT_AMOUNT);
+    }
+
+    let result = call_builder
+        .wait_until(TxExecutionStatus::Final)
+        .send()
         .await;
 
-    drop(leased_key);
-
     match result {
-        Ok((tx_hash, outcome)) => {
-            let is_success = matches!(
-                outcome.status,
-                near_primitives::views::FinalExecutionStatus::SuccessValue(_)
-            );
+        Ok(outcome) => {
+            let tx_hash = outcome
+                .transaction_hash()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
 
-            if !is_success {
+            if !outcome.is_success() {
                 warn!("Registration batch tx {} failed - will retry", tx_hash);
                 return Err(anyhow!("Registration failed"));
             }
@@ -175,6 +191,7 @@ async fn process_registration_batch(
         }
         Err(e) => {
             let err_str = format!("{:?}", e);
+            // If accounts are already registered, that's fine (idempotent)
             if !err_str.contains("already") && !err_str.contains("exist") {
                 return Err(anyhow!("Failed to register accounts: {:?}", e));
             }

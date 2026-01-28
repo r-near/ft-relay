@@ -1,12 +1,7 @@
 use chrono::{DateTime, Utc};
-use near_crypto::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicU64;
 
 pub type AccountId = String;
-
-// Global RPC call counter for metrics
-pub static RPC_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -102,28 +97,9 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct AccessKey {
-    pub key_id: String,
-    pub secret_key: SecretKey,
-    pub public_key: PublicKey,
-}
-
-impl AccessKey {
-    pub fn from_secret_key(secret_key: SecretKey) -> Self {
-        let public_key = secret_key.public_key();
-        let key_id = format!("{}", public_key);
-        Self {
-            key_id,
-            secret_key,
-            public_key,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrationMessage {
-    pub account: String, // Account to register (not transfer_id!)
+    pub account: String,
     pub retry_count: u32,
 }
 

@@ -1,12 +1,12 @@
 [package]
 name = "ft-relay"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.100"
 axum = { version = "0.8.6", features = ["json"] }
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive"] }
 dotenv = "0.15.0"
 env_logger = "0.11.8"
@@ -25,12 +25,15 @@ tokio = { version = "1.47.1", features = ["full"] }
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
 rand = "0.9"
 
-# NEAR - using latest versions (0.18 jsonrpc-client with 0.31 primitives)
-near-jsonrpc-client = "0.18"
-near-jsonrpc-primitives = "0.31"
-near-primitives = "0.31"
-near-crypto = "0.31"
+# NEAR - using near-kit-rs for cleaner ergonomics
+near-kit = { path = "../near-kit-rs/crates/near-kit" }
 
 [dev-dependencies]
 near-sandbox = { version = "0.2.0", features = ["generate"] }
 reqwest = { version = "0.12.23", features = ["json"] }
+
+# For test setup that still needs low-level primitives
+near-jsonrpc-client = "0.18"
+near-jsonrpc-primitives = "0.31"
+near-primitives = "0.31"
+near-crypto = "0.31"

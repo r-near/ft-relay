@@ -284,13 +284,8 @@ async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> 
         Err(_) => "disconnected",
     };
 
-    let rpc_calls = crate::types::RPC_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-
     Json(json!({
         "status": "healthy",
-        "redis": redis_status,
-        "metrics": {
-            "rpc_calls_total": rpc_calls
-        }
+        "redis": redis_status
     }))
 }

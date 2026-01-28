@@ -1,9 +1,9 @@
 use ::redis::aio::ConnectionManager;
 use anyhow::{self, Result};
 use log::{debug, info, warn};
+use near_kit::{Gas, Near, NearToken, TxExecutionStatus};
 use std::sync::Arc;
 
-use crate::near::{AccessKeyPool, NearRpcClient, NonceManager};
 use crate::redis::{events, keys, state, streams, transfers, verification};
 use crate::types::{AccountId, Event, Status, TransferMessage, TransferState};
 
@@ -11,6 +11,11 @@ use super::shared;
 
 const MAX_RETRIES: u32 = 10;
 const MAX_BATCH_SIZE: usize = 100;
+
+// Gas per ft_transfer action
+const FT_TRANSFER_GAS: Gas = Gas::tgas(3);
+// 1 yocto deposit required for ft_transfer
+const FT_TRANSFER_DEPOSIT: NearToken = NearToken::yocto(1);
 
 struct TransferJob {
     stream_id: String,
@@ -26,9 +31,7 @@ impl TransferJob {
 
 pub struct TransferWorkerRuntime {
     pub redis_conn: ConnectionManager,
-    pub rpc_client: Arc<NearRpcClient>,
-    pub access_key_pool: Arc<AccessKeyPool>,
-    pub nonce_manager: NonceManager,
+    pub near: Arc<Near>,
     pub relay_account: AccountId,
     pub token: AccountId,
     pub env: String,
@@ -69,11 +72,6 @@ pub async fn transfer_worker_loop(ctx: TransferWorkerContext) -> Result<()> {
                     let pop_duration = pop_start.elapsed();
                     debug!(
                         "[METRIC] op=pop_batch duration_ms={} msg_count={}",
-                        pop_duration.as_millis(),
-                        b.len()
-                    );
-                    debug!(
-                        "[TIMING] pop_batch took {}ms for {} messages",
                         pop_duration.as_millis(),
                         b.len()
                     );
@@ -122,10 +120,10 @@ async fn process_batch(
         .collect();
     let states = state::get_transfer_states_batch(&mut conn, &transfer_ids).await?;
 
-    let mut transfers: Vec<TransferJob> = Vec::new();
+    let mut transfer_jobs: Vec<TransferJob> = Vec::new();
     for ((stream_id, msg), state) in batch.into_iter().zip(states.into_iter()) {
         match state {
-            Some(transfer) => transfers.push(TransferJob {
+            Some(transfer) => transfer_jobs.push(TransferJob {
                 stream_id,
                 message: msg,
                 state: transfer,
@@ -141,176 +139,126 @@ async fn process_batch(
     debug!(
         "[METRIC] op=fetch_states duration_ms={} count={}",
         fetch_duration.as_millis(),
-        transfers.len()
-    );
-    debug!(
-        "[TIMING] Fetched {} transfer states in {}ms (pipelined)",
-        transfers.len(),
-        fetch_duration.as_millis()
+        transfer_jobs.len()
     );
 
-    if transfers.is_empty() {
+    if transfer_jobs.is_empty() {
         return Ok(());
     }
 
-    debug!("Processing batch of {} transfers", transfers.len());
+    debug!("Processing batch of {} transfers", transfer_jobs.len());
     let build_transfers_duration = batch_start.elapsed();
     debug!(
         "[METRIC] op=build_transfers duration_ms={} count={}",
         build_transfers_duration.as_millis(),
-        transfers.len()
+        transfer_jobs.len()
     );
 
-    let lease_start = std::time::Instant::now();
-    let leased_key = match ctx.runtime.access_key_pool.lease().await {
-        Ok(key) => key,
-        Err(e) => {
-            warn!("Failed to lease access key: {:?}, will retry", e);
-            handle_lease_failure(&mut conn, ctx, stream_key, consumer_group, &transfers).await?;
-            return Ok(());
-        }
-    };
-
-    let lease_duration = lease_start.elapsed();
-    debug!(
-        "[METRIC] op=key_lease duration_ms={}",
-        lease_duration.as_millis()
-    );
-    debug!("[TIMING] Key lease took {}ms", lease_duration.as_millis());
-
-    let nonce = ctx
-        .runtime
-        .nonce_manager
-        .clone()
-        .get_next_nonce(&leased_key.key_id)
-        .await?;
-
-    let receivers: Vec<(AccountId, String)> = transfers
-        .iter()
-        .map(|job| (job.state.receiver_id.clone(), job.state.amount.clone()))
-        .collect();
-
+    // Build a multi-action transaction with all ft_transfer calls
     let rpc_start = std::time::Instant::now();
-    let result = ctx
+
+    let mut call_builder = ctx
         .runtime
-        .rpc_client
-        .submit_batch_transfer_with_hash(
-            &ctx.runtime.relay_account,
-            &ctx.runtime.token,
-            receivers,
-            &leased_key.secret_key,
-            nonce,
-        )
+        .near
+        .transaction(&ctx.runtime.token)
+        .call("ft_transfer")
+        .args(serde_json::json!({
+            "receiver_id": transfer_jobs[0].state.receiver_id,
+            "amount": transfer_jobs[0].state.amount,
+        }))
+        .gas(FT_TRANSFER_GAS)
+        .deposit(FT_TRANSFER_DEPOSIT);
+
+    for job in transfer_jobs.iter().skip(1) {
+        let args = serde_json::json!({
+            "receiver_id": job.state.receiver_id,
+            "amount": job.state.amount,
+        });
+
+        call_builder = call_builder
+            .call("ft_transfer")
+            .args(args)
+            .gas(FT_TRANSFER_GAS)
+            .deposit(FT_TRANSFER_DEPOSIT);
+    }
+
+    // Send with ExecutedOptimistic for faster response, verification worker handles confirmation
+    let result = call_builder
+        .wait_until(TxExecutionStatus::ExecutedOptimistic)
+        .send()
         .await;
+
     let rpc_duration = rpc_start.elapsed();
     debug!(
         "[METRIC] op=rpc_broadcast duration_ms={} batch_size={}",
         rpc_duration.as_millis(),
-        transfers.len()
+        transfer_jobs.len()
     );
-    debug!("[TIMING] RPC broadcast took {}ms", rpc_duration.as_millis());
-
-    drop(leased_key);
 
     match result {
-        Ok((tx_hash, outcome_result)) => {
-            let tx_hash_str = tx_hash.to_string();
+        Ok(outcome) => {
+            let tx_hash = outcome
+                .transaction_hash()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
 
-            match outcome_result {
-                Ok(outcome) => match outcome.status {
-                    near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
-                        info!(
-                            "Batch of {} transfers completed successfully, tx: {}",
-                            transfers.len(),
-                            tx_hash_str
-                        );
+            if outcome.is_success() {
+                info!(
+                    "Batch of {} transfers completed successfully, tx: {}",
+                    transfer_jobs.len(),
+                    tx_hash
+                );
 
-                        finalize_completed_batch(
-                            &mut conn,
-                            stream_key,
-                            consumer_group,
-                            &transfers,
-                            &tx_hash_str,
-                        )
-                        .await
-                    }
-                    _ => {
-                        warn!(
-                            "Batch tx {} finished with non-success status: {:?} - enqueuing for verification",
-                            tx_hash_str,
-                            outcome.status
-                        );
+                finalize_completed_batch(
+                    &mut conn,
+                    stream_key,
+                    consumer_group,
+                    &transfer_jobs,
+                    &tx_hash,
+                )
+                .await
+            } else {
+                warn!(
+                    "Batch tx {} finished with non-success status - enqueuing for verification",
+                    tx_hash
+                );
 
-                        finalize_submitted_batch(
-                            &mut conn,
-                            stream_key,
-                            consumer_group,
-                            &transfers,
-                            &tx_hash_str,
-                            None,
-                        )
-                        .await?;
-                        verification::enqueue_tx_verification_once(
-                            &mut conn,
-                            &ctx.runtime.env,
-                            &tx_hash_str,
-                            0,
-                        )
-                        .await?;
-                        Ok(())
-                    }
-                },
-                Err(broadcast_err) => {
-                    warn!(
-                        "Batch tx {} broadcast failed: {} - enqueuing for verification",
-                        tx_hash_str, broadcast_err
-                    );
-
-                    finalize_submitted_batch(
-                        &mut conn,
-                        stream_key,
-                        consumer_group,
-                        &transfers,
-                        &tx_hash_str,
-                        Some(&broadcast_err),
-                    )
-                    .await?;
-                    verification::enqueue_tx_verification_once(
-                        &mut conn,
-                        &ctx.runtime.env,
-                        &tx_hash_str,
-                        0,
-                    )
-                    .await?;
-                    Ok(())
-                }
+                finalize_submitted_batch(
+                    &mut conn,
+                    stream_key,
+                    consumer_group,
+                    &transfer_jobs,
+                    &tx_hash,
+                    outcome.failure_message().as_deref(),
+                )
+                .await?;
+                verification::enqueue_tx_verification_once(
+                    &mut conn,
+                    &ctx.runtime.env,
+                    &tx_hash,
+                    0,
+                )
+                .await?;
+                Ok(())
             }
         }
         Err(e) => {
-            warn!("Failed to build/submit batch: {:?}", e);
-            handle_submission_error(&mut conn, ctx, stream_key, consumer_group, &transfers, &e)
-                .await
+            let err_str = format!("{:?}", e);
+            warn!("Failed to submit batch: {}", err_str);
+
+            // Check if we got a tx hash from the error (for timeout cases)
+            // In that case, enqueue for verification rather than retrying
+            handle_submission_error(
+                &mut conn,
+                ctx,
+                stream_key,
+                consumer_group,
+                &transfer_jobs,
+                &e,
+            )
+            .await
         }
     }
-}
-
-async fn handle_lease_failure(
-    conn: &mut ConnectionManager,
-    ctx: &TransferWorkerContext,
-    stream_key: &str,
-    consumer_group: &str,
-    transfers: &[TransferJob],
-) -> Result<()> {
-    for job in transfers {
-        streams::ack_message(conn, stream_key, consumer_group, &job.stream_id).await?;
-
-        let retry_count = job.message.retry_count + 1;
-        if retry_count < MAX_RETRIES {
-            transfers::enqueue_transfer(conn, &ctx.runtime.env, job.id(), retry_count).await?;
-        }
-    }
-
-    Ok(())
 }
 
 async fn handle_submission_error(
@@ -318,12 +266,12 @@ async fn handle_submission_error(
     ctx: &TransferWorkerContext,
     stream_key: &str,
     consumer_group: &str,
-    transfers: &[TransferJob],
-    err: &anyhow::Error,
+    transfer_jobs: &[TransferJob],
+    err: &near_kit::Error,
 ) -> Result<()> {
     let err_debug = format!("{:?}", err);
 
-    for job in transfers {
+    for job in transfer_jobs {
         streams::ack_message(conn, stream_key, consumer_group, &job.stream_id).await?;
 
         let retry_count = job.message.retry_count + 1;
@@ -351,14 +299,14 @@ async fn finalize_completed_batch(
     conn: &mut ConnectionManager,
     stream_key: &str,
     consumer_group: &str,
-    transfers: &[TransferJob],
+    transfer_jobs: &[TransferJob],
     tx_hash: &str,
 ) -> Result<()> {
     let mut pipe = ::redis::pipe();
     pipe.atomic();
     let now = chrono::Utc::now().to_rfc3339();
 
-    for job in transfers {
+    for job in transfer_jobs {
         let transfer_key = keys::transfer_state(job.id());
         let event_key = keys::transfer_events(job.id());
 
@@ -389,7 +337,7 @@ async fn finalize_submitted_batch(
     conn: &mut ConnectionManager,
     stream_key: &str,
     consumer_group: &str,
-    transfers: &[TransferJob],
+    transfer_jobs: &[TransferJob],
     tx_hash: &str,
     reason: Option<&str>,
 ) -> Result<()> {
@@ -398,7 +346,7 @@ async fn finalize_submitted_batch(
     let now = chrono::Utc::now().to_rfc3339();
     let tx_transfers_key = keys::tx_transfers(tx_hash);
 
-    for job in transfers {
+    for job in transfer_jobs {
         let transfer_key = keys::transfer_state(job.id());
         let event_key = keys::transfer_events(job.id());
 
