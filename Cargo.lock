@@ -2247,7 +2247,7 @@ dependencies = [
 [[package]]
 name = "near-kit"
 version = "0.2.0"
-source = "git+https://github.com/r-near/near-kit-rs.git#87146d2653847644643c9ba72eba6d7e80c45e53"
+source = "git+https://github.com/r-near/near-kit-rs.git#36325707a1f446f5d39d0869c48643363f03169a"
 dependencies = [
  "base64 0.22.1",
  "bip39",
@@ -2276,7 +2276,7 @@ dependencies = [
 [[package]]
 name = "near-kit-macros"
 version = "0.2.0"
-source = "git+https://github.com/r-near/near-kit-rs.git#87146d2653847644643c9ba72eba6d7e80c45e53"
+source = "git+https://github.com/r-near/near-kit-rs.git#36325707a1f446f5d39d0869c48643363f03169a"
 dependencies = [
  "proc-macro2",
  "quote",
