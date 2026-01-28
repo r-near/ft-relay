@@ -26,7 +26,7 @@ uuid = { version = "1.10.0", features = ["v4", "serde"] }
 rand = "0.9"
 
 # NEAR - using near-kit-rs for cleaner ergonomics
-near-kit = { path = "../near-kit-rs/crates/near-kit" }
+near-kit = { git = "https://github.com/r-near/near-kit-rs.git" }
 
 [dev-dependencies]
 near-sandbox = { version = "0.2.0", features = ["generate"] }
