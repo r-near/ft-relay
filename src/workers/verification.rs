@@ -1,11 +1,9 @@
 use ::redis::aio::ConnectionManager;
 use anyhow::{self, Result};
 use log::{debug, info, warn};
-use near_primitives::hash::CryptoHash;
-use std::str::FromStr;
+use near_kit::{CryptoHash, ExecutionStatus, Near, TxExecutionStatus};
 use std::sync::Arc;
 
-use crate::near::{NearRpcClient, TxStatus};
 use crate::redis::{events, keys, state, streams, transfers, verification};
 use crate::types::{AccountId, Event, Status, VerificationTxMessage};
 
@@ -15,7 +13,7 @@ const MAX_VERIFICATION_RETRIES: u32 = 20;
 
 pub struct VerificationWorkerRuntime {
     pub redis_conn: ConnectionManager,
-    pub rpc_client: Arc<NearRpcClient>,
+    pub near: Arc<Near>,
     pub relay_account: AccountId,
     pub env: String,
 }
@@ -194,62 +192,104 @@ async fn verify_transaction(
         }
     }
 
-    let tx_hash = CryptoHash::from_str(&msg.tx_hash)
+    let tx_hash: CryptoHash = msg
+        .tx_hash
+        .parse()
         .map_err(|e| anyhow::anyhow!("Invalid tx hash: {:?}", e))?;
 
-    match ctx
+    let sender_id: near_kit::AccountId = ctx
         .runtime
-        .rpc_client
-        .check_tx_status(&tx_hash, &ctx.runtime.relay_account)
-        .await?
-    {
-        TxStatus::Success(_outcome) => {
-            info!("[VERIFY] Tx {} completed successfully", msg.tx_hash);
+        .relay_account
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid sender account: {:?}", e))?;
 
-            verification::set_tx_status(&mut conn, &msg.tx_hash, "completed").await?;
+    // Check transaction status using near-kit's RPC
+    let result = ctx
+        .runtime
+        .near
+        .rpc()
+        .tx_status(&tx_hash, &sender_id, TxExecutionStatus::Final)
+        .await;
 
-            let transfer_ids = transfers::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
-            info!(
-                "Updating {} transfers for tx {}",
-                transfer_ids.len(),
-                msg.tx_hash
-            );
+    match result {
+        Ok(outcome) => {
+            if outcome.is_success() {
+                info!("[VERIFY] Tx {} completed successfully", msg.tx_hash);
 
-            for transfer_id in transfer_ids {
-                state::update_transfer_status(&mut conn, &transfer_id, Status::Completed).await?;
-                events::log_event(&mut conn, &transfer_id, Event::new("COMPLETED")).await?;
-            }
+                verification::set_tx_status(&mut conn, &msg.tx_hash, "completed").await?;
 
-            verification::clear_tx_pending_verification(&mut conn, &ctx.runtime.env, &msg.tx_hash)
-                .await?;
+                let transfer_ids = transfers::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
+                info!(
+                    "Updating {} transfers for tx {}",
+                    transfer_ids.len(),
+                    msg.tx_hash
+                );
 
-            Ok(VerificationResult::Completed)
-        }
-        TxStatus::Failed(reason) => {
-            warn!("[VERIFY] Tx {} failed on-chain: {}", msg.tx_hash, reason);
+                for transfer_id in transfer_ids {
+                    state::update_transfer_status(&mut conn, &transfer_id, Status::Completed)
+                        .await?;
+                    events::log_event(&mut conn, &transfer_id, Event::new("COMPLETED")).await?;
+                }
 
-            verification::set_tx_status(&mut conn, &msg.tx_hash, "failed").await?;
-
-            let transfer_ids = transfers::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
-
-            for transfer_id in transfer_ids {
-                state::update_transfer_status(&mut conn, &transfer_id, Status::Failed).await?;
-                events::log_event(
+                verification::clear_tx_pending_verification(
                     &mut conn,
-                    &transfer_id,
-                    Event::new("FAILED").with_reason(reason.clone()),
+                    &ctx.runtime.env,
+                    &msg.tx_hash,
                 )
                 .await?;
-            }
 
-            verification::clear_tx_pending_verification(&mut conn, &ctx.runtime.env, &msg.tx_hash)
+                Ok(VerificationResult::Completed)
+            } else if outcome.is_failure() {
+                // Extract failure reason from status
+                let reason = match &outcome.status {
+                    Some(ExecutionStatus::Failure(val)) => format!("{}", val),
+                    _ => "Unknown failure".to_string(),
+                };
+                warn!("[VERIFY] Tx {} failed on-chain: {}", msg.tx_hash, reason);
+
+                verification::set_tx_status(&mut conn, &msg.tx_hash, "failed").await?;
+
+                let transfer_ids = transfers::get_tx_transfers(&mut conn, &msg.tx_hash).await?;
+
+                for transfer_id in transfer_ids {
+                    state::update_transfer_status(&mut conn, &transfer_id, Status::Failed).await?;
+                    events::log_event(
+                        &mut conn,
+                        &transfer_id,
+                        Event::new("FAILED").with_reason(reason.clone()),
+                    )
+                    .await?;
+                }
+
+                verification::clear_tx_pending_verification(
+                    &mut conn,
+                    &ctx.runtime.env,
+                    &msg.tx_hash,
+                )
                 .await?;
 
-            Ok(VerificationResult::Failed(reason))
+                Ok(VerificationResult::Failed(reason))
+            } else {
+                // Still pending/unknown
+                verification::set_tx_status(&mut conn, &msg.tx_hash, "pending").await?;
+                Ok(VerificationResult::Pending)
+            }
         }
-        TxStatus::Pending => {
-            verification::set_tx_status(&mut conn, &msg.tx_hash, "pending").await?;
-            Ok(VerificationResult::Pending)
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            if err_str.contains("UNKNOWN_TRANSACTION") || err_str.contains("does not exist") {
+                verification::set_tx_status(&mut conn, &msg.tx_hash, "pending").await?;
+                Ok(VerificationResult::Pending)
+            } else if err_str.contains("TimeoutError") || err_str.contains("TIMEOUT_ERROR") {
+                debug!("RPC timeout checking tx status - will retry");
+                verification::set_tx_status(&mut conn, &msg.tx_hash, "pending").await?;
+                Ok(VerificationResult::Pending)
+            } else {
+                Err(anyhow::anyhow!(
+                    "Failed to check transaction status: {:?}",
+                    e
+                ))
+            }
         }
     }
 }

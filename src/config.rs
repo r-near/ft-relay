@@ -5,15 +5,10 @@ use serde::Deserialize;
 
 use crate::types::AccountId;
 
-pub const FT_TRANSFER_DEPOSIT: u128 = 1;
-pub const STORAGE_DEPOSIT_AMOUNT: u128 = 1_250_000_000_000_000_000_000;
-pub const FT_TRANSFER_GAS_PER_ACTION: u64 = 3_000_000_000_000;
-pub const STORAGE_DEPOSIT_GAS_PER_ACTION: u64 = 5_000_000_000_000;
 pub const DEFAULT_BATCH_LINGER_MS: u64 = 20;
 pub const DEFAULT_TRANSFER_WORKERS: usize = 1;
 pub const DEFAULT_REGISTRATION_WORKERS: usize = 1;
 pub const DEFAULT_VERIFICATION_WORKERS: usize = 1;
-
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 
 #[derive(Debug, Clone)]
